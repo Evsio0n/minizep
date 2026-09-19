@@ -1,0 +1,71 @@
+{
+  "name": "minizep",
+  "version": "0.2.0",
+  "description": "Temporal knowledge-graph memory for AI agents: episodes, entities and facts with validity windows, hybrid retrieval (full-text + pgvector), exposed over MCP (stdio and HTTP).",
+  "type": "module",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "node": ">=20.11"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./server/http": {
+      "types": "./dist/server/http.d.ts",
+      "default": "./dist/server/http.js"
+    },
+    "./server/mcp": {
+      "types": "./dist/server/mcp.d.ts",
+      "default": "./dist/server/mcp.js"
+    },
+    "./store/postgres": {
+      "types": "./dist/store/postgres-store.d.ts",
+      "default": "./dist/store/postgres-store.js"
+    }
+  },
+  "bin": {
+    "minizep-serve": "dist/server/http.js",
+    "minizep-mcp": "dist/server/mcp.js",
+    "minizep-proxy": "dist/server/stdio-proxy.js",
+    "minizep-migrate": "dist/cli/migrate.js"
+  },
+  "files": [
+    "dist",
+    "infra",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepack": "npm run clean && npm run build",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "demo": "tsx demo/demo.ts",
+    "demo:real": "tsx demo/real-pipeline.ts",
+    "bench": "tsx demo/bench-embedders.ts",
+    "mcp": "tsx src/server/mcp.ts",
+    "mcp:proxy": "tsx src/server/stdio-proxy.ts",
+    "mcp:smoke": "tsx demo/mcp-smoke.ts",
+    "proxy:smoke": "tsx demo/proxy-smoke.ts",
+    "migrate": "tsx src/cli/migrate.ts",
+    "serve": "tsx src/server/http.ts",
+    "serve:dist": "node dist/server/http.js",
+    "http:smoke": "tsx demo/http-smoke.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "pg": "^8.23.0",
+    "zod": "^4.6.5"
+  }
+}
