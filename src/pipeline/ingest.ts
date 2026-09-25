@@ -734,7 +734,7 @@ class EpisodeRun {
     // same relationship described differently: it gains the evidence (and an
     // end the text states) instead of a second edge. For a record that has
     // ended, a new open edge would bring the relation back.
-    const same = restated.find((f) => !ended.includes(f) && (f.invalidAt || invalidAt));
+    const same = restated.find((f) => !ended.includes(f));
     if (same) return this.reinforce(same, invalidAt, text);
 
     // (`ended` is only filled when validAt is known)

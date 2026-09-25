@@ -1,6 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import type { Principal } from './auth.js';
+import { calendarDay, displayTimeZone } from '../util/time.js';
 import { shapes, type AddMemoryOutcome, type FactRow, type JobRow, type MemoryService } from './service.js';
 
 /** How the server introduces itself to MCP clients (stdio and HTTP). */
@@ -16,7 +17,8 @@ export interface ToolContext {
   principal: Principal;
 }
 
-const day = (iso: string | null) => (iso ? iso.slice(0, 10) : null);
+// calendar days in the zone the extraction LLM resolved them in
+const day = (iso: string | null) => (iso ? calendarDay(new Date(iso), displayTimeZone()) : null);
 
 /** Human-readable validity window, always showing the start when known. */
 export function validity(r: FactRow, now = Date.now()): string {

@@ -9,6 +9,7 @@ import type {
   KnownFact,
   LLMProvider,
 } from './interfaces.js';
+import { calendarDay, localTimeZone } from '../util/time.js';
 import { MockLLMProvider } from './mock-llm.js';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -363,19 +364,6 @@ export function buildExtractionPrompt(
 
 /** " (since 2026-03-01)": the calendar day in the zone the reference time is given in. */
 const since = (d: Date | undefined, timeZone: string) => (d ? ` (since ${calendarDay(d, timeZone)})` : '');
-
-function calendarDay(d: Date, timeZone: string): string {
-  const parts = Object.fromEntries(
-    new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' })
-      .formatToParts(d)
-      .map((p) => [p.type, p.value]),
-  );
-  return `${parts.year}-${parts.month}-${parts.day}`;
-}
-
-function localTimeZone(): string {
-  return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
-}
 
 /**
  * "2026-09-24T08:00:00+08:00 (Thursday)": the instant in the given zone, with
