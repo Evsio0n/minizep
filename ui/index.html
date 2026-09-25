@@ -248,7 +248,7 @@ table.tbl { width: 100%; border-collapse: separate; border-spacing: 0; font-size
 .stat { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px 16px; min-width: 0; }
 .stat-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; font-weight: 500; color: var(--text-3); }
 .stat-value { font-size: 22px; font-weight: 650; letter-spacing: -.01em; font-variant-numeric: tabular-nums; margin-top: 2px; }
-.stat-sub { font-size: 12px; color: var(--text-3); margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.stat-sub { font-size: 12px; color: var(--text-3); margin-top: 2px; overflow-wrap: anywhere; }
 .graph-card { position: relative; flex: 1; min-height: 320px; background-color: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
   background-image: radial-gradient(var(--grid-dot) 1px, transparent 1px); background-size: 22px 22px; container-type: inline-size; }
 .graph-card.busy::after { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: linear-gradient(90deg, transparent, var(--accent), transparent); background-size: 50% 100%; background-repeat: no-repeat; animation: busy 1s linear infinite; z-index: 5; }
@@ -536,13 +536,13 @@ const S = {
   connected: 'Connected',
   offline: 'Server unreachable',
   jobsRunning: (n) => `${n} job${n === 1 ? '' : 's'} running`,
-  statusTip: (s) => `store: ${s.store ?? '?'}\nllm: ${s.llm ?? '?'}`,
+  statusTip: (s) => `store: ${s.store ?? '?'}\nllm: ${s.llm ?? '?'}${s.timezone ? `\ndates in memories are read in ${s.timezone}` : ''}`,
   networkError: 'Cannot reach the minizep server',
   httpError: 'Request failed: HTTP',
   blockedTitle: 'This page cannot talk to the server',
   blockedText:
     'The server refused the UI’s request. Open the UI from the minizep server’s own address ' +
-    '(for example http://127.0.0.1:8787/ui/) with MINIZEP_UI_GROUPS set. A host name other than ' +
+    '(for example http://127.0.0.1:8787/ui) with MINIZEP_UI_GROUPS set. A host name other than ' +
     'an IP address or localhost has to be listed in MINIZEP_UI_HOSTS.',
   reload: 'Reload',
   loading: 'Loading…',
@@ -3914,6 +3914,7 @@ function openEpisode(group, id) {
 
 /* ---- 8.8 fact correction (end / retract) -------------------------------- */
 function openInvalidate(f, retract) {
+  const group = state.group; // the fact's group, even if the view changes behind the dialog
   const reason = h('textarea', { class: 'input', rows: 3, placeholder: S.reasonPh, required: true });
   const when = retract ? null : h('input', { class: 'input', type: 'datetime-local', value: toLocalInput(Date.now()) });
   let touched = false;
@@ -3941,11 +3942,11 @@ function openInvalidate(f, retract) {
       d.setError('');
       d.setBusy(true);
       try {
-        const r = await api('POST', `/facts/${encodeURIComponent(f.uuid)}/invalidate`, { body: payload, quiet: true });
-        if (r.fact && r.fact.uuid) cacheFacts([r.fact]);
+        const r = await api('POST', `/facts/${encodeURIComponent(f.uuid)}/invalidate`, { body: payload, group, quiet: true });
+        if (r.fact && r.fact.uuid && group === state.group) cacheFacts([r.fact]);
         d.close();
         toast(retract ? S.factRetracted : S.factEnded, 'ok');
-        emitData(state.group);
+        emitData(group);
       } catch (e) {
         d.setError(e.message); // 409 (already ended, before start, retracted) is shown here
       } finally {
