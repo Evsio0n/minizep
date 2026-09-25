@@ -19,6 +19,10 @@
       "types": "./dist/server/http.d.ts",
       "default": "./dist/server/http.js"
     },
+    "./server/app": {
+      "types": "./dist/server/app.d.ts",
+      "default": "./dist/server/app.js"
+    },
     "./server/mcp": {
       "types": "./dist/server/mcp.d.ts",
       "default": "./dist/server/mcp.js"

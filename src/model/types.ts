@@ -27,16 +27,23 @@ export interface EpisodicNode {
   validAt: Date;
   createdAt: Date;
   /**
-   * 'processed' once extraction succeeded. An episode whose extraction failed
-   * is still persisted (the raw text is the most valuable thing we hold) and
-   * marked 'failed' so it can be retried later instead of being lost.
+   * Lifecycle: saved as 'pending', then 'processed' once every entity and
+   * fact it produced has been written, or 'failed' when anything went wrong
+   * (the raw text is the most valuable thing we hold, so it is kept and can be
+   * retried in place). Undefined only on records written by older versions,
+   * which never persisted the final status; they are treated as processed.
    */
-  status?: 'processed' | 'failed';
+  status?: EpisodeStatus;
   /** failure reason when status === 'failed' */
   error?: string;
-  /** content fingerprint, used for ingestion idempotency */
+  /**
+   * Idempotency key: content fingerprint plus the UTC day of validAt, or the
+   * caller's explicit key. Stored in the content_hash column.
+   */
   contentHash?: string;
 }
+
+export type EpisodeStatus = 'pending' | 'processed' | 'failed';
 
 /** L1 — an extracted entity. */
 export interface EntityNode {
@@ -84,12 +91,40 @@ export interface FactWithContext {
   fact: EntityEdge;
   sourceName: string;
   targetName: string;
+  /** fused retrieval score (RRF), present on search results */
+  score?: number;
 }
 
-export function isFactActive(fact: EntityEdge, at?: Date): boolean {
+/**
+ * Bi-temporal validity: was `fact` true at valid time `at`, according to what
+ * the system knew at knowledge time `asOf`? Both default to now.
+ *
+ *   known      = createdAt <= asOf
+ *   endKnownAt = expiredAt ?? (invalidAt ? createdAt : undefined)
+ *   ended      = invalidAt && endKnownAt <= asOf && invalidAt <= at
+ *   active     = known && !(validAt > at) && !ended
+ *
+ * With asOf = now this is pure valid-time semantics: an end scheduled in the
+ * future keeps the fact active until then. A fact expired without any valid
+ * time end was retracted as a whole, so it is ended at every `at` once the
+ * retraction is known. PostgresStore's temporalPredicate mirrors this exactly.
+ */
+export function isFactActive(fact: EntityEdge, at?: Date, asOf?: Date): boolean {
   const t = at ?? new Date();
-  if (fact.expiredAt && fact.expiredAt <= t) return false;
-  if (fact.invalidAt && fact.invalidAt <= t) return false;
+  const known = asOf ?? new Date();
+  // records built without createdAt (tests, hand-made objects) count as known forever
+  if (fact.createdAt && fact.createdAt > known) return false;
   if (fact.validAt && fact.validAt > t) return false;
+  if (fact.invalidAt) {
+    const endKnownAt = fact.expiredAt ?? fact.createdAt;
+    if (fact.invalidAt <= t && (!endKnownAt || endKnownAt <= known)) return false;
+  } else if (fact.expiredAt && fact.expiredAt <= known) {
+    return false;
+  }
   return true;
+}
+
+/** Did the system know about `fact` at knowledge time `asOf` (default: always)? */
+export function isFactKnown(fact: EntityEdge, asOf?: Date): boolean {
+  return !asOf || !fact.createdAt || fact.createdAt <= asOf;
 }

@@ -15,7 +15,10 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import {
+  StreamableHTTPClientTransport,
+  StreamableHTTPError,
+} from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
@@ -34,13 +37,41 @@ if (!token && process.env.MINIZEP_ALLOW_ANONYMOUS !== '1') {
 
 const log = (...args: unknown[]) => console.error('[minizep-proxy]', ...args);
 
-const remote = new Client({ name: 'minizep-proxy', version: '1.0.0' });
-await remote.connect(
-  new StreamableHTTPClientTransport(new URL(url), {
-    requestInit: token ? { headers: { authorization: `Bearer ${token}` } } : {},
-  }),
-);
+async function connect(): Promise<Client> {
+  const client = new Client({ name: 'minizep-proxy', version: '1.0.0' });
+  await client.connect(
+    new StreamableHTTPClientTransport(new URL(url), {
+      requestInit: token ? { headers: { authorization: `Bearer ${token}` } } : {},
+    }),
+  );
+  return client;
+}
+
+let remote: Promise<Client> = connect();
+await remote;
 log(`connected to ${url}`);
+
+/**
+ * Forward one call. The server expires idle sessions (and forgets them when
+ * it restarts) and then answers 404: open a new session and send the call
+ * again, which is safe because a 404 means it was never handled.
+ */
+async function forward<T>(call: (client: Client) => Promise<T>): Promise<T> {
+  const current = remote;
+  const client = await current;
+  try {
+    return await call(client);
+  } catch (err) {
+    if (!(err instanceof StreamableHTTPError && err.code === 404)) throw err;
+    // concurrent calls that hit the same dead session share one reconnect
+    if (remote === current) {
+      log('session expired on the server; reconnecting');
+      remote = connect();
+      void client.close().catch(() => undefined);
+    }
+    return call(await remote);
+  }
+}
 
 const server = new Server(
   { name: 'minizep', version: '1.0.0' },
@@ -49,18 +80,18 @@ const server = new Server(
 
 // Forward verbatim: the HTTP server owns the tool definitions, so this shim
 // never needs updating when tools are added.
-server.setRequestHandler(ListToolsRequestSchema, () => remote.listTools());
-server.setRequestHandler(CallToolRequestSchema, (req) => remote.callTool(req.params));
-server.setRequestHandler(ListResourcesRequestSchema, () => remote.listResources());
-server.setRequestHandler(ReadResourceRequestSchema, (req) => remote.readResource(req.params));
-server.setRequestHandler(ListPromptsRequestSchema, () => remote.listPrompts());
-server.setRequestHandler(GetPromptRequestSchema, (req) => remote.getPrompt(req.params));
+server.setRequestHandler(ListToolsRequestSchema, () => forward((c) => c.listTools()));
+server.setRequestHandler(CallToolRequestSchema, (req) => forward((c) => c.callTool(req.params)));
+server.setRequestHandler(ListResourcesRequestSchema, () => forward((c) => c.listResources()));
+server.setRequestHandler(ReadResourceRequestSchema, (req) => forward((c) => c.readResource(req.params)));
+server.setRequestHandler(ListPromptsRequestSchema, () => forward((c) => c.listPrompts()));
+server.setRequestHandler(GetPromptRequestSchema, (req) => forward((c) => c.getPrompt(req.params)));
 
 await server.connect(new StdioServerTransport());
 log('stdio bridge ready');
 
 const shutdown = async () => {
-  await remote.close();
+  await remote.then((c) => c.close()).catch(() => undefined);
   await server.close();
   process.exit(0);
 };

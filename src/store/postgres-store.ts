@@ -1,6 +1,6 @@
 import { Pool, type PoolClient } from 'pg';
 import { isFactActive, type EntityEdge, type EntityNode, type EpisodicNode, type UUID } from '../model/types.js';
-import { tokenize } from '../search/retrieval.js';
+import { bm25TermScores, tokenize, type Bm25Corpus } from '../search/retrieval.js';
 import type { GraphStore } from './memory-store.js';
 
 export interface PostgresStoreOptions {
@@ -16,6 +16,15 @@ export interface PostgresStoreOptions {
 
 const DEFAULT_URL = process.env.MINIZEP_DATABASE_URL ?? 'postgres://minizep@127.0.0.1:5433/minizep';
 
+/** Most facts one keyword search re-ranks in Node (the best-covered ones win). */
+const KEYWORD_CANDIDATES = 1000;
+/**
+ * Most facts read for BM25's collection size and mean length. Up to this many
+ * the ranking equals the in-memory backend's; past it idf is computed as if
+ * the scope held this many facts, which keeps each search's cost bounded.
+ */
+const KEYWORD_STATS_SAMPLE = 10_000;
+
 /**
  * Postgres + pgvector backend.
  *
@@ -28,6 +37,13 @@ const DEFAULT_URL = process.env.MINIZEP_DATABASE_URL ?? 'postgres://minizep@127.
  */
 export class PostgresStore implements GraphStore {
   private pool: Pool;
+  /** set only on the view transaction() hands out: its queries share one connection */
+  private client?: PoolClient;
+
+  /** where data statements go: the transaction's connection, else the pool */
+  private get db(): Pick<Pool, 'query'> {
+    return this.client ?? this.pool;
+  }
   readonly embeddingDims: number;
   private ready: Promise<void> | null = null;
 
@@ -116,13 +132,7 @@ export class PostgresStore implements GraphStore {
           CREATE INDEX IF NOT EXISTS facts_fact_embedding_hnsw
             ON facts USING hnsw (fact_embedding vector_cosine_ops);
         `);
-        // keyword search index. 'simple' is deliberate: it needs no language
-        // dictionary, so it behaves predictably on mixed-language content.
-        // (CJK still tokenises poorly — see README, pg_bigm/zhparser required.)
-        await this.pool.query(`
-          CREATE INDEX IF NOT EXISTS facts_fts
-            ON facts USING gin (to_tsvector('simple', name || ' ' || fact));
-        `);
+        await this.migrateSearchText();
 
         // CREATE TABLE IF NOT EXISTS silently keeps an existing column's vector
         // dimension, so a model change would otherwise surface as a confusing
@@ -136,7 +146,12 @@ export class PostgresStore implements GraphStore {
               `(or DROP the tables to start empty).`,
           );
         }
-      })();
+      })().catch((err: unknown) => {
+        // a transient failure (a restart, a lock timeout) must not break this
+        // store for the life of the process: the next call tries again
+        this.ready = null;
+        throw err;
+      });
     }
     return this.ready;
   }
@@ -154,6 +169,111 @@ export class PostgresStore implements GraphStore {
     );
     const typmod = r.rows[0]?.atttypmod;
     return typmod == null || typmod < 0 ? null : Number(typmod);
+  }
+
+  /**
+   * Keyword search reads facts.search_text, tokenize()'s output (CJK bigrams,
+   * see retrieval.ts), because Postgres' own parser keeps a CJK sentence as
+   * one word. A GIN index on to_tsvector('simple', search_text) serves it;
+   * 'simple' needs no language dictionary and leaves the tokens alone.
+   *
+   * A usual start finds everything in place with two cheap reads and takes no
+   * lock. Otherwise the table is brought up to date: the column added, rows
+   * without search_text filled (facts from before the column, or written by
+   * an older build since), the indexes built and the old facts_fts index
+   * dropped. That runs on one connection holding an advisory lock, so
+   * processes starting together (a server and several stdio MCP clients)
+   * cannot race on the same DDL; the ones that waited re-check and find
+   * nothing left to do.
+   */
+  private async migrateSearchText(): Promise<void> {
+    if ((await this.searchTextState(this.pool)).ready) return;
+    const client = await this.pool.connect();
+    let broken = false;
+    try {
+      await client.query(`SELECT pg_advisory_lock(hashtext('minizep.migrate'), hashtext($1))`, [this.schema]);
+      try {
+        const state = await this.searchTextState(client);
+        if (state.ready) return;
+        // ADD COLUMN and DROP INDEX lock facts exclusively, and every other
+        // query on it queues behind a request waiting for that lock: give up
+        // after a few seconds (the next call retries) rather than stall the table
+        const exclusive = async (sql: string) => {
+          await client.query(`SET lock_timeout = '5s'`);
+          await client.query(sql);
+          await client.query('RESET lock_timeout');
+        };
+        if (!state.column) await exclusive('ALTER TABLE facts ADD COLUMN IF NOT EXISTS search_text TEXT');
+        // backfill first: the index builds faster over filled rows
+        await this.backfillSearchText(client);
+        await client.query(`
+          CREATE INDEX IF NOT EXISTS facts_search_text
+            ON facts USING gin (to_tsvector('simple', search_text))
+        `);
+        // keeps the "any row left to fill?" check at start an index probe;
+        // nearly empty, since only an older build writes such rows
+        await client.query(`
+          CREATE INDEX IF NOT EXISTS facts_search_text_missing
+            ON facts (uuid) WHERE search_text IS NULL
+        `);
+        // The old facts_fts index (on name || ' ' || fact) is no longer queried
+        // and only slowed down writes. Dropped by schema-qualified name, so a
+        // test schema can never reach an index in public. An older build that
+        // is rolled back to recreates it on start, which also tells the next
+        // start of this one to fill the rows that build wrote.
+        await exclusive(`DROP INDEX IF EXISTS ${this.schema}.facts_fts`);
+      } finally {
+        await client.query(`SELECT pg_advisory_unlock(hashtext('minizep.migrate'), hashtext($1))`, [this.schema]);
+      }
+    } catch (err) {
+      // closing the session also drops the lock if the unlock never ran
+      broken = true;
+      throw err;
+    } finally {
+      client.release(broken);
+    }
+  }
+
+  /** Whether search_text is complete; `column` says if it exists at all. */
+  private async searchTextState(db: Pool | PoolClient): Promise<{ ready: boolean; column: boolean }> {
+    const q = (name: string) => `${this.schema}.${name}`;
+    const r = await db.query(
+      `SELECT EXISTS (SELECT 1 FROM pg_attribute
+                       WHERE attrelid = to_regclass($1) AND attname = 'search_text'
+                         AND NOT attisdropped) AS has_column,
+              to_regclass($2) IS NOT NULL AND to_regclass($3) IS NOT NULL
+                AND to_regclass($4) IS NULL AS indexes_done`,
+      [q('facts'), q('facts_search_text'), q('facts_search_text_missing'), q('facts_fts')],
+    );
+    const column = r.rows[0].has_column === true;
+    if (!column || r.rows[0].indexes_done !== true) return { ready: false, column };
+    const missing = await db.query('SELECT 1 FROM facts WHERE search_text IS NULL LIMIT 1');
+    return { ready: missing.rows.length === 0, column };
+  }
+
+  /**
+   * Fill search_text where it is NULL, in batches. Keyset pagination on the
+   * primary key walks the table once. The IS NULL guard on the UPDATE keeps a
+   * value that a concurrent write stored in the meantime.
+   */
+  private async backfillSearchText(db: PoolClient, batchSize = 500): Promise<void> {
+    let after: string | null = null;
+    for (;;) {
+      const r = await db.query(
+        `SELECT uuid, name, fact FROM facts
+          WHERE search_text IS NULL AND ($1::uuid IS NULL OR uuid > $1::uuid)
+          ORDER BY uuid LIMIT $2`,
+        [after, batchSize],
+      );
+      if (r.rows.length === 0) return;
+      await db.query(
+        `UPDATE facts AS f SET search_text = v.search_text
+           FROM unnest($1::uuid[], $2::text[]) AS v(uuid, search_text)
+          WHERE f.uuid = v.uuid AND f.search_text IS NULL`,
+        [r.rows.map((row) => row.uuid), r.rows.map((row) => searchTextOf(row.name, row.fact))],
+      );
+      after = r.rows[r.rows.length - 1].uuid as string;
+    }
   }
 
   /** Server-side truth check, used by tests and health endpoints. */
@@ -185,9 +305,32 @@ export class PostgresStore implements GraphStore {
 
   /* ---------------- episodes ---------------- */
 
+  /**
+   * Writes in `fn` commit together: a view of this store bound to one
+   * connection inside BEGIN/COMMIT, rolled back when `fn` throws.
+   */
+  async transaction<T>(fn: (tx: GraphStore) => Promise<T>): Promise<T> {
+    if (this.client) return fn(this); // already inside one
+    await this.ensure();
+    const client = await this.pool.connect();
+    const tx = Object.create(this) as PostgresStore;
+    tx.client = client;
+    try {
+      await client.query('BEGIN');
+      const result = await fn(tx);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   async addEpisode(ep: EpisodicNode): Promise<void> {
     await this.ensure();
-    await this.pool.query(
+    await this.db.query(
       `INSERT INTO episodes (uuid, group_id, name, source, source_description, content,
                              valid_at, created_at, status, error, content_hash)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
@@ -210,24 +353,32 @@ export class PostgresStore implements GraphStore {
     );
   }
 
+  async getEpisode(uuid: UUID): Promise<EpisodicNode | undefined> {
+    // the column is UUID-typed: anything else would be a query error, not a miss
+    if (!UUID_RE.test(uuid)) return undefined;
+    await this.ensure();
+    const r = await this.db.query('SELECT * FROM episodes WHERE uuid=$1', [uuid]);
+    return r.rows[0] ? rowToEpisode(r.rows[0]) : undefined;
+  }
+
   async getEpisodes(groupId?: string): Promise<EpisodicNode[]> {
     await this.ensure();
     const r = groupId
-      ? await this.pool.query('SELECT * FROM episodes WHERE group_id=$1 ORDER BY created_at', [groupId])
-      : await this.pool.query('SELECT * FROM episodes ORDER BY created_at');
+      ? await this.db.query('SELECT * FROM episodes WHERE group_id=$1 ORDER BY created_at', [groupId])
+      : await this.db.query('SELECT * FROM episodes ORDER BY created_at');
     return r.rows.map(rowToEpisode);
   }
 
   async removeEpisode(uuid: UUID): Promise<void> {
     await this.ensure();
-    await this.pool.query('DELETE FROM episodes WHERE uuid=$1', [uuid]);
+    await this.db.query('DELETE FROM episodes WHERE uuid=$1', [uuid]);
   }
 
   /* ---------------- entities ---------------- */
 
   async upsertEntity(node: EntityNode): Promise<void> {
     await this.ensure();
-    await this.pool.query(
+    await this.db.query(
       `INSERT INTO entities (uuid, group_id, name, labels, summary, attributes, created_at, name_embedding)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        ON CONFLICT (group_id, lower(name)) DO UPDATE SET
@@ -248,13 +399,13 @@ export class PostgresStore implements GraphStore {
 
   async getEntity(uuid: UUID): Promise<EntityNode | undefined> {
     await this.ensure();
-    const r = await this.pool.query('SELECT * FROM entities WHERE uuid=$1', [uuid]);
+    const r = await this.db.query('SELECT * FROM entities WHERE uuid=$1', [uuid]);
     return r.rows[0] ? rowToEntity(r.rows[0]) : undefined;
   }
 
   async findEntityByName(groupId: string, name: string): Promise<EntityNode | undefined> {
     await this.ensure();
-    const r = await this.pool.query(
+    const r = await this.db.query(
       'SELECT * FROM entities WHERE group_id=$1 AND lower(name)=lower($2) LIMIT 1',
       [groupId, name],
     );
@@ -264,8 +415,8 @@ export class PostgresStore implements GraphStore {
   async getEntities(groupId?: string): Promise<EntityNode[]> {
     await this.ensure();
     const r = groupId
-      ? await this.pool.query('SELECT * FROM entities WHERE group_id=$1 ORDER BY created_at', [groupId])
-      : await this.pool.query('SELECT * FROM entities ORDER BY created_at');
+      ? await this.db.query('SELECT * FROM entities WHERE group_id=$1 ORDER BY created_at', [groupId])
+      : await this.db.query('SELECT * FROM entities ORDER BY created_at');
     return r.rows.map(rowToEntity);
   }
 
@@ -273,15 +424,17 @@ export class PostgresStore implements GraphStore {
 
   async addFact(edge: EntityEdge): Promise<void> {
     await this.ensure();
-    await this.pool.query(
+    await this.db.query(
       `INSERT INTO facts (uuid, group_id, source_node_uuid, target_node_uuid, name, fact, episodes,
-                          valid_at, invalid_at, created_at, expired_at, attributes, fact_embedding)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                          valid_at, invalid_at, created_at, expired_at, attributes, fact_embedding,
+                          search_text)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        ON CONFLICT (uuid) DO UPDATE SET
          name = EXCLUDED.name, fact = EXCLUDED.fact, episodes = EXCLUDED.episodes,
          valid_at = EXCLUDED.valid_at, invalid_at = EXCLUDED.invalid_at,
          expired_at = EXCLUDED.expired_at, attributes = EXCLUDED.attributes,
-         fact_embedding = EXCLUDED.fact_embedding`,
+         fact_embedding = EXCLUDED.fact_embedding,
+         search_text = EXCLUDED.search_text`,
       [
         edge.uuid,
         edge.groupId,
@@ -296,6 +449,7 @@ export class PostgresStore implements GraphStore {
         edge.expiredAt ?? null,
         JSON.stringify(edge.attributes ?? {}),
         this.vec(edge.factEmbedding),
+        searchTextOf(edge.name, edge.fact),
       ],
     );
   }
@@ -306,21 +460,21 @@ export class PostgresStore implements GraphStore {
 
   async getFact(uuid: UUID): Promise<EntityEdge | undefined> {
     await this.ensure();
-    const r = await this.pool.query('SELECT * FROM facts WHERE uuid=$1', [uuid]);
+    const r = await this.db.query('SELECT * FROM facts WHERE uuid=$1', [uuid]);
     return r.rows[0] ? rowToFact(r.rows[0]) : undefined;
   }
 
   async getFacts(groupId?: string): Promise<EntityEdge[]> {
     await this.ensure();
     const r = groupId
-      ? await this.pool.query('SELECT * FROM facts WHERE group_id=$1 ORDER BY created_at', [groupId])
-      : await this.pool.query('SELECT * FROM facts ORDER BY created_at');
+      ? await this.db.query('SELECT * FROM facts WHERE group_id=$1 ORDER BY created_at', [groupId])
+      : await this.db.query('SELECT * FROM facts ORDER BY created_at');
     return r.rows.map(rowToFact);
   }
 
   async getFactsForEntity(uuid: UUID): Promise<EntityEdge[]> {
     await this.ensure();
-    const r = await this.pool.query(
+    const r = await this.db.query(
       'SELECT * FROM facts WHERE source_node_uuid=$1 OR target_node_uuid=$1',
       [uuid],
     );
@@ -335,56 +489,134 @@ export class PostgresStore implements GraphStore {
   }
 
   /**
-   * Keyword search pushed down to Postgres full-text search instead of
-   * scoring every fact in Node.
+   * Keyword search. The GIN index finds the facts sharing a token with the
+   * query; Node then ranks them with the in-memory backend's BM25. Postgres'
+   * ts_rank has no idf, so common CJK bigrams (公司, 工作) would outrank the
+   * rare name a question is about, and the two backends would disagree.
    */
   async searchFactsByText(
     query: string,
-    opts: { groupId?: string; limit?: number; activeAt?: Date | null } = {},
+    opts: { groupId?: string; limit?: number; activeAt?: Date | null; asOf?: Date } = {},
   ): Promise<{ edge: EntityEdge; score: number }[]> {
     await this.ensure();
-    // websearch_to_tsquery("alice works at acme") means alice AND works AND at
-    // AND acme, which matches almost nothing (the document holds "WORKS_AT" as
-    // one token). Ranking on OR-ed terms is both far more useful and closer to
-    // what the in-process BM25 path does.
-    const terms = [...new Set(tokenize(query).filter((t) => t.length > 1))];
-    const tsQuery = terms.length > 0 ? terms.join(' OR ') : query;
-    const params: unknown[] = [tsQuery];
-    let sql = `
-      SELECT *, ts_rank_cd(to_tsvector('simple', name || ' ' || fact),
-                           websearch_to_tsquery('simple', $1)) AS score
-        FROM facts
-       WHERE to_tsvector('simple', name || ' ' || fact) @@ websearch_to_tsquery('simple', $1)`;
+    // The same tokenize() produced search_text, so CJK bigrams line up. Every
+    // token is kept, one letter or one CJK character included: idf decides
+    // what matters, and "B站" or "3月" have nothing else to match on. OR, not
+    // AND: "alice works at acme" must not require every word. A token is only
+    // letters and digits, so quoting it is enough; to_tsquery, because
+    // websearch_to_tsquery reads a query word "or" as an operator.
+    const qTerms = tokenize(query);
+    if (qTerms.length === 0) return [];
+    // one instant for both queries below: the candidates and the statistics
+    // must describe the same set of facts
+    const now = new Date();
+    const covered = {
+      groupId: opts.groupId,
+      activeAt: opts.activeAt === undefined ? now : opts.activeAt,
+      asOf: opts.asOf ?? (opts.activeAt === null ? undefined : now),
+    };
+    const params: unknown[] = [[...new Set(qTerms)].map((t) => `'${t}'`).join(' | ')];
+    const scope = this.keywordScope(params, covered);
+    params.push(KEYWORD_CANDIDATES);
+    // candidates in creation order, like getFacts(), so ties rank as in memory
+    const found = await this.db.query(
+      `SELECT uuid, search_text FROM (
+         SELECT uuid, search_text, created_at FROM facts
+          WHERE to_tsvector('simple', search_text) @@ to_tsquery('simple', $1)${scope}
+          ORDER BY ts_rank(to_tsvector('simple', search_text), to_tsquery('simple', $1)) DESC
+          LIMIT $${params.length}
+       ) AS matched
+       ORDER BY created_at, uuid`,
+      params,
+    );
+    if (found.rows.length === 0) return [];
+
+    const docs = found.rows.map((row) => ({ id: row.uuid as string, terms: (row.search_text as string).split(' ') }));
+    const scores = bm25TermScores(qTerms, docs, { corpus: await this.keywordCorpus(covered) });
+    const top = [...scores.entries()]
+      .filter(([, score]) => score > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, opts.limit ?? 20);
+    const edges = new Map((await this.getFactsByUuids(top.map(([id]) => id))).map((e) => [e.uuid, e]));
+    return top.flatMap(([id, score]) => {
+      const edge = edges.get(id);
+      return edge ? [{ edge, score }] : [];
+    });
+  }
+
+  /**
+   * BM25's collection statistics over the facts a search covers (group and
+   * time window), as the in-memory backend computes them over every fact it
+   * scores. Read from at most KEYWORD_STATS_SAMPLE rows.
+   */
+  private async keywordCorpus(opts: { groupId?: string; activeAt?: Date | null; asOf?: Date }): Promise<Bm25Corpus> {
+    const params: unknown[] = [];
+    const scope = this.keywordScope(params, opts);
+    params.push(KEYWORD_STATS_SAMPLE);
+    // search_text is tokens joined by single spaces: tokens = spaces + 1
+    const r = await this.db.query(
+      `SELECT count(*)::int AS size,
+              coalesce(avg(CASE WHEN search_text = '' THEN 0
+                                ELSE length(search_text) - length(replace(search_text, ' ', '')) + 1 END),
+                       0)::float8 AS avg_length
+         FROM (SELECT search_text FROM facts
+                WHERE search_text IS NOT NULL${scope}
+                LIMIT $${params.length}) AS covered`,
+      params,
+    );
+    return { size: Number(r.rows[0].size), avgLength: Number(r.rows[0].avg_length) };
+  }
+
+  /** Group and time-window predicates of a keyword search, each starting with AND. */
+  private keywordScope(params: unknown[], opts: { groupId?: string; activeAt?: Date | null; asOf?: Date }): string {
+    let sql = '';
     if (opts.groupId) {
       params.push(opts.groupId);
       sql += ` AND group_id = $${params.length}`;
     }
-    sql += this.temporalPredicate(params, opts.activeAt, ' AND ');
-    params.push(opts.limit ?? 20);
-    sql += ` ORDER BY score DESC LIMIT $${params.length}`;
-    const r = await this.pool.query(sql, params);
-    return r.rows.map((row) => ({ edge: rowToFact(row), score: Number(row.score) }));
+    return sql + this.temporalPredicate(params, opts.activeAt, ' AND ', opts.asOf);
   }
 
   /** Fetch a specific set of edges — used to materialise fused rankings. */
   async getFactsByUuids(uuids: UUID[]): Promise<EntityEdge[]> {
     if (uuids.length === 0) return [];
     await this.ensure();
-    const r = await this.pool.query('SELECT * FROM facts WHERE uuid = ANY($1::uuid[])', [uuids]);
+    const r = await this.db.query('SELECT * FROM facts WHERE uuid = ANY($1::uuid[])', [uuids]);
     return r.rows.map(rowToFact);
   }
 
-  /** Appends temporal-validity predicates, binding parameters as it goes. */
-  private temporalPredicate(params: unknown[], activeAt: Date | null | undefined, sep: string): string {
-    if (activeAt === null) return ''; // caller wants history too
-    const at = activeAt ?? new Date();
-    params.push(at);
-    let sql = `${sep}(expired_at IS NULL OR expired_at > $${params.length})`;
-    params.push(at);
-    sql += ` AND (invalid_at IS NULL OR invalid_at > $${params.length})`;
-    params.push(at);
-    sql += ` AND (valid_at IS NULL OR valid_at <= $${params.length})`;
-    return sql;
+  /**
+   * Appends the bi-temporal validity predicate, binding parameters as it goes.
+   * Mirrors isFactActive(fact, activeAt, asOf) exactly:
+   *   known  : created_at <= asOf
+   *   started: valid_at IS NULL OR valid_at <= at
+   *   ended  : invalid_at <= at, with the end known by asOf
+   *            (expired_at, or created_at when the end came with the fact),
+   *            or a retraction (expired, no invalid_at) known by asOf
+   * activeAt === null means "history too": only the knowledge-time cut applies.
+   */
+  private temporalPredicate(
+    params: unknown[],
+    activeAt: Date | null | undefined,
+    sep: string,
+    asOf?: Date,
+  ): string {
+    if (activeAt === null) {
+      if (!asOf) return ''; // caller wants all of history
+      params.push(asOf);
+      return `${sep}created_at <= $${params.length}`;
+    }
+    params.push(activeAt ?? new Date());
+    const at = `$${params.length}`;
+    params.push(asOf ?? new Date());
+    const known = `$${params.length}`;
+    return (
+      `${sep}created_at <= ${known}` +
+      ` AND (valid_at IS NULL OR valid_at <= ${at})` +
+      ` AND NOT (` +
+      `(invalid_at IS NOT NULL AND invalid_at <= ${at} AND COALESCE(expired_at, created_at) <= ${known})` +
+      ` OR (invalid_at IS NULL AND expired_at IS NOT NULL AND expired_at <= ${known}))`
+    );
   }
 
   /**
@@ -393,7 +625,7 @@ export class PostgresStore implements GraphStore {
    */
   async searchFactsByVector(
     embedding: number[],
-    opts: { groupId?: string; limit?: number; activeAt?: Date | null } = {},
+    opts: { groupId?: string; limit?: number; activeAt?: Date | null; asOf?: Date } = {},
   ): Promise<{ edge: EntityEdge; distance: number }[]> {
     await this.ensure();
     const params: unknown[] = [this.vec(embedding)];
@@ -402,15 +634,22 @@ export class PostgresStore implements GraphStore {
       params.push(opts.groupId);
       sql += ` AND group_id = $${params.length}`;
     }
-    sql += this.temporalPredicate(params, opts.activeAt, ' AND ');
+    sql += this.temporalPredicate(params, opts.activeAt, ' AND ', opts.asOf);
     params.push(opts.limit ?? 20);
     sql += ` ORDER BY fact_embedding <=> $1::vector LIMIT $${params.length}`;
-    const r = await this.pool.query(sql, params);
+    const r = await this.db.query(sql, params);
     return r.rows.map((row) => ({ edge: rowToFact(row), distance: Number(row.distance) }));
   }
 }
 
+/** The facts.search_text value: keyword tokens of the relation name and fact text. */
+function searchTextOf(name: string, fact: string): string {
+  return tokenize(`${name} ${fact}`).join(' ');
+}
+
 /* ---------------- row mapping ---------------- */
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function rowToEpisode(r: Record<string, unknown>): EpisodicNode {
   return {

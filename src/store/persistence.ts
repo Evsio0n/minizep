@@ -13,6 +13,9 @@ import { isSnapshotable } from './memory-store.js';
 export class FilePersistence {
   private timer: NodeJS.Timeout | null = null;
   private pending = false;
+  /** the last write started or queued, and a queued one that has not started */
+  private tail: Promise<void> = Promise.resolve();
+  private queued: Promise<void> | null = null;
 
   constructor(
     private path: string,
@@ -47,21 +50,39 @@ export class FilePersistence {
       this.timer = null;
       if (!this.pending) return;
       this.pending = false;
-      void this.save(zep);
+      this.save(zep).catch((err) => console.error('[minizep] snapshot write failed:', (err as Error).message));
     }, this.debounceMs);
     this.timer.unref?.();
   }
 
-  /** Write immediately. */
-  async save(zep: Minizep): Promise<void> {
-    if (!this.applicable(zep)) return;
+  /**
+   * Write now; resolves once the file holds at least the state of the moment
+   * of the call. Writes never overlap (they share the tmp file): a call during
+   * a write queues one more, and every call arriving before that one starts
+   * shares it, since it snapshots the graph when it runs.
+   */
+  save(zep: Minizep): Promise<void> {
+    if (!this.applicable(zep)) return Promise.resolve();
+    if (this.queued) return this.queued;
+    const run: Promise<void> = this.tail
+      .catch(() => undefined)
+      .then(() => {
+        if (this.queued === run) this.queued = null;
+        return this.write(zep);
+      });
+    this.queued = run;
+    this.tail = run;
+    return run;
+  }
+
+  private async write(zep: Minizep): Promise<void> {
     await mkdir(dirname(this.path), { recursive: true });
     const tmp = `${this.path}.tmp`;
     await writeFile(tmp, zep.snapshot(), 'utf8');
     await rename(tmp, this.path);
   }
 
-  /** Flush any pending write (call before exit). */
+  /** Flush any pending write and wait for one in progress (call before exit). */
   async flush(zep: Minizep): Promise<void> {
     if (this.timer) {
       clearTimeout(this.timer);
@@ -70,6 +91,9 @@ export class FilePersistence {
     if (this.pending) {
       this.pending = false;
       await this.save(zep);
+    } else {
+      // a write still running must land before exit; a failed one is retried
+      await this.tail.catch(() => this.save(zep));
     }
   }
 }

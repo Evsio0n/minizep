@@ -30,12 +30,15 @@ async function run(label: string, serialise: boolean) {
   } else {
     // reach past the public API to hit the unserialised code path
     const raw = pipeline as unknown as {
-      addEpisodeSerial(input: { groupId: string; content: string }, opts: object): Promise<unknown>;
+      saveLocked(input: { groupId: string; content: string }, opts: object): Promise<{ episode: unknown }>;
+      processLocked(episode: unknown): Promise<unknown>;
     };
-    await Promise.all(Array.from({ length: N }, (_, i) => raw.addEpisodeSerial(call(i), {})));
+    await Promise.all(
+      Array.from({ length: N }, async (_, i) => raw.processLocked((await raw.saveLocked(call(i), {})).episode)),
+    );
   }
 
-  const entities = store.getEntities('g');
+  const entities = await store.getEntities('g');
   const shared = entities.filter((e) => e.name === 'Shared').length;
   console.log(
     `${label.padEnd(26)} entities=${String(entities.length).padStart(3)}  ` +

@@ -11,6 +11,16 @@ export interface Job<T = unknown> {
   finishedAt?: Date;
   result?: T;
   error?: string;
+  /** memory group the job works in (jobs are only shown to callers of that group) */
+  group?: string;
+  /** the record the job works on, e.g. an episode uuid */
+  ref?: string;
+}
+
+/** Optional metadata attached to a job at submission. */
+export interface JobMeta {
+  group?: string;
+  ref?: string;
 }
 
 export interface JobQueueOptions {
@@ -27,9 +37,9 @@ export interface JobQueueOptions {
  * request open for it. Submitting returns a job id immediately and a later
  * status poll picks up the result.
  *
- * In-process means a restart loses queued work — acceptable now because the
- * episode text is persisted before queuing is attempted, and `retryFailed()`
- * can recover anything that was interrupted.
+ * In-process means a restart loses the queue itself, not the work: an episode
+ * is persisted as 'pending' before its job is queued, and servers re-enqueue
+ * pending episodes at startup (`recoverPending()`).
  */
 export class JobQueue {
   private jobs = new Map<string, Job>();
@@ -44,12 +54,14 @@ export class JobQueue {
     this.historyLimit = opts.historyLimit ?? 200;
   }
 
-  submit<T>(label: string, work: () => Promise<T>): Job<T> {
+  submit<T>(label: string, work: () => Promise<T>, meta: JobMeta = {}): Job<T> {
     const job: Job<T> = {
       id: uuid(),
       label,
       status: 'queued',
       createdAt: new Date(),
+      group: meta.group,
+      ref: meta.ref,
     };
     this.jobs.set(job.id, job);
     this.order.push(job.id);
@@ -106,27 +118,38 @@ export class JobQueue {
     return this.jobs.get(id);
   }
 
-  /** Newest first. */
-  list(limit = 20): Job[] {
+  /** Newest first, optionally only the jobs `filter` accepts. */
+  list(limit = 20, filter?: (job: Job) => boolean): Job[] {
     return [...this.order]
       .reverse()
-      .slice(0, limit)
       .map((id) => this.jobs.get(id))
-      .filter((j): j is Job => !!j);
+      .filter((j): j is Job => !!j && (!filter || filter(j)))
+      .slice(0, limit);
   }
 
   get stats(): { queued: number; running: number } {
-    const all = [...this.jobs.values()];
+    return this.statsFor();
+  }
+
+  /** Queued and running counts, optionally only over the jobs `filter` accepts. */
+  statsFor(filter?: (job: Job) => boolean): { queued: number; running: number } {
+    const all = [...this.jobs.values()].filter((j) => !filter || filter(j));
     return {
       queued: all.filter((j) => j.status === 'queued').length,
       running: all.filter((j) => j.status === 'running').length,
     };
   }
 
-  /** Resolves when nothing is queued or running (used by tests and shutdown). */
-  async drain(): Promise<void> {
+  /**
+   * Resolves when nothing is queued or running (used by tests and shutdown):
+   * true once idle, false when `timeoutMs` passed first.
+   */
+  async drain(timeoutMs = Infinity): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
     while (this.stats.queued > 0 || this.stats.running > 0) {
+      if (Date.now() >= deadline) return false;
       await new Promise((r) => setTimeout(r, 10));
     }
+    return true;
   }
 }

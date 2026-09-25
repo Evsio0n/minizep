@@ -1,11 +1,15 @@
 import type {
+  ContradictionCandidate,
+  ContradictionExisting,
   Embedder,
   ExtractedFact,
   ExtractedInvalidation,
   ExtractionResult,
+  ExtractOptions,
   KnownFact,
   LLMProvider,
 } from './interfaces.js';
+import { calendarDay, localTimeZone } from '../util/time.js';
 import { MockLLMProvider } from './mock-llm.js';
 import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -28,34 +32,106 @@ export interface LLMConfig {
   retries?: number;
   /** base backoff in ms, doubled per attempt (default 500) */
   backoffMs?: number;
+  /**
+   * IANA time zone the reference time is expressed in, so "yesterday" and
+   * "下周五" resolve to the writer's calendar days (default: MINIZEP_TIMEZONE,
+   * else this process's zone).
+   */
+  timeZone?: string;
 }
 
-const EXTRACTION_SYSTEM = `You extract a temporal knowledge graph from text.
+const EXTRACTION_SYSTEM = `You extract a temporal knowledge graph from one text.
 Return ONLY a JSON object, no prose, no markdown fences:
-{"entities":[{"name":"string","labels":["Person"|"Organization"|"Concept"|"Event"|"Location"|"Preference"],"summary":"one sentence"}],
- "facts":[{"sourceName":"string","targetName":"string","relation":"SCREAMING_SNAKE_CASE","fact":"<subject> --<RELATION>--> <object>","validAt":"ISO-8601 or null","invalidAt":"ISO-8601 or null"}],
+{"entities":[{"name":"string","labels":["Person"|"Organization"|"Product"|"Project"|"Role"|"Concept"|"Event"|"Location"|"Preference"],"summary":"string"}],
+ "facts":[{"sourceName":"string","targetName":"string","relation":"SCREAMING_SNAKE_CASE","fact":"self-contained sentence","validAt":"ISO-8601 or null","invalidAt":"ISO-8601 or null"}],
  "invalidations":[{"sourceName":"string","targetName":"string","relation":"SCREAMING_SNAKE_CASE or null","invalidAt":"ISO-8601 or null","reason":"short justification"}]}
 
-facts vs invalidations — this distinction is critical:
-- "facts" are relationships that hold (or start holding) from the text.
-- "invalidations" are relationships that the text says have ENDED or no longer hold.
-  An ending is NOT a new relationship. If the text says someone left, quit, resigned,
-  stopped, broke up, cancelled, or no longer does something, put it in "invalidations"
-  and reference the ORIGINAL relation it terminates — do NOT invent a LEFT/QUIT/ENDED fact.
-  Example: given active fact "Alice --WORKS_AT--> Acme", the text "Alice left Acme"
-  yields invalidations: [{"sourceName":"Alice","targetName":"Acme","relation":"WORKS_AT",
-  "invalidAt":"<date>","reason":"text states Alice left Acme"}] and NO new fact.
+Time — the message starts with a reference time: when the text was written, with its UTC offset and weekday.
+- Resolve every relative expression against the reference time, never against today's date:
+  "yesterday", "next Monday", "last month", "in two weeks", "昨天", "下周五", "上个月", "明年".
+  Put the absolute ISO-8601 result (with the reference offset) in validAt/invalidAt, and write the
+  absolute date into the fact sentence as well.
+- validAt is when the fact starts being true, which is not always when the text was written:
+  "appointed CFO yesterday, effective next Monday" starts on that Monday.
+- When only a month or a year is known, use its first day ("上个月" written on 2025-02-01 -> 2025-01-01).
+- Use null when the text gives no time for a fact; never guess.
+- Dates, times, weekdays and durations are NEVER entities, and entity names never contain time words:
+  "下周五", "next Monday", "last year" are times; "昨天的周会" is at most the entity "周会".
 
-Other rules:
-- entity names must be the canonical surface form, reused consistently
-- every fact must reference two entities that appear in "entities"
-- validAt = when the fact became true; invalidAt (inside facts) = when it stopped being true
-- if a relationship is terminated in the same sentence that introduces it, use invalidAt in facts
-- never invent facts that are not supported by the text
-- emit empty arrays when a category has no entries`;
+Language:
+- Keep entity names, summaries and fact sentences in the language of the text. Do not translate:
+  a Chinese text gets Chinese summaries and fact sentences.
+
+Entities:
+- Reuse the exact name of a known entity when the text refers to it, also by a shorter or longer form.
+- summary: one or two sentences on who or what the entity is. For a known entity return an UPDATED
+  summary that keeps everything its known summary says and adds what this text says; if the text
+  adds nothing about it, return "".
+
+Facts:
+- "fact" is one self-contained natural-language sentence that keeps every detail the text gives:
+  role, title, team, organisation, amounts, dates. Write "Alice Chen joined Globex as a Staff Engineer",
+  never "Alice Chen --WORKS_AT--> Globex".
+- relation is a short label such as WORKS_AT, HAS_ROLE, MEMBER_OF, LIVES_IN, REPORTS_TO, SCHEDULED_FOR.
+- Both endpoints must be entities of this text or known entities. When a statement is about one
+  entity's attribute (a date, a price, a status), connect it to the person, team, organisation or
+  event that owns or decided it, and keep the value in the sentence.
+- Never invent facts that the text does not support.
+
+facts vs invalidations — this distinction is critical:
+- "facts" are relationships that hold (or start holding) according to the text.
+- "invalidations" are relationships that the text says have ENDED or no longer hold.
+  An ending is NOT a new relationship. If the text says someone left, quit, resigned, moved away,
+  stopped, broke up, cancelled, or no longer does something, put it in "invalidations" and reference
+  the ORIGINAL relation it terminates — do NOT invent a LEFT/QUIT/ENDED fact.
+- Dependent relationships end with it: when a relationship ends, also invalidate every active
+  relationship that only held because of it — leaving a company ends the role, title, team
+  membership, manager and project relationships held there. Copy sourceName, targetName and
+  relation exactly from the "Active relationships" list.
+- A new value for a single-valued attribute (employer, title, role, team, home city, manager,
+  status) replaces the old one: emit the new fact and invalidate the old one.
+- invalidAt = when it ended, resolved against the reference time; null when the text gives no clue.
+- If a relationship both starts and ends within this text, put it in "facts" with invalidAt.
+- Emit empty arrays when a category has no entries.
+
+Example. Reference time 2026-03-02T09:00:00+00:00 (Monday). Active relationships:
+- Alice Chen --WORKS_AT--> Acme Corp: Alice Chen is a backend engineer at Acme Corp
+- Alice Chen --HAS_ROLE--> backend engineer: Alice Chen works as a backend engineer at Acme Corp
+- Alice Chen --MEMBER_OF--> payments team: Alice Chen is on the payments team at Acme Corp
+Text: "Alice Chen left Acme Corp last Friday and has joined Globex as a Staff Engineer."
+Output:
+{"entities":[{"name":"Alice Chen","labels":["Person"],"summary":"Alice Chen, formerly a backend engineer on Acme Corp's payments team, is a Staff Engineer at Globex."},
+  {"name":"Globex","labels":["Organization"],"summary":"Globex is a company that Alice Chen joined as a Staff Engineer."},
+  {"name":"Staff Engineer","labels":["Role"],"summary":"Staff Engineer is Alice Chen's role at Globex."}],
+ "facts":[{"sourceName":"Alice Chen","targetName":"Globex","relation":"WORKS_AT","fact":"Alice Chen joined Globex as a Staff Engineer after leaving Acme Corp on 2026-02-27","validAt":null,"invalidAt":null},
+  {"sourceName":"Alice Chen","targetName":"Staff Engineer","relation":"HAS_ROLE","fact":"Alice Chen is a Staff Engineer at Globex","validAt":null,"invalidAt":null}],
+ "invalidations":[{"sourceName":"Alice Chen","targetName":"Acme Corp","relation":"WORKS_AT","invalidAt":"2026-02-27T00:00:00+00:00","reason":"left Acme Corp last Friday"},
+  {"sourceName":"Alice Chen","targetName":"backend engineer","relation":"HAS_ROLE","invalidAt":"2026-02-27T00:00:00+00:00","reason":"the role ended with leaving Acme Corp"},
+  {"sourceName":"Alice Chen","targetName":"payments team","relation":"MEMBER_OF","invalidAt":"2026-02-27T00:00:00+00:00","reason":"the team membership ended with leaving Acme Corp"}]}`;
+
+const CONTRADICTION_SYSTEM = `You maintain a temporal knowledge graph. You get one NEW fact and a numbered
+list of EXISTING facts, and decide which existing facts stop being true once the new fact holds.
+An existing fact is ended when the new fact replaces it: another employer, title, role, team, manager,
+home, owner, status, date or value for the same thing; a reversal; an explicit update.
+It is NOT ended when both can hold at the same time (working at a company and owning shares in it;
+a role and a team membership; two hobbies), or when the new fact only adds detail to it.
+Dates in parentheses are when each fact started. The new fact may be OLDER than an existing one (a
+document added late): still list every existing fact it cannot hold together with; the order in time is
+taken from the dates.
+Return ONLY JSON: {"contradicts": true|false, "which": [numbers of the ended facts from the list]}`;
 
 export class OpenAICompatLLM implements LLMProvider {
-  constructor(private cfg: LLMConfig) {}
+  private readonly timeZone: string;
+
+  constructor(private cfg: LLMConfig) {
+    this.timeZone = cfg.timeZone ?? process.env.MINIZEP_TIMEZONE ?? localTimeZone();
+    // an unknown zone would fail every extraction; fail at construction instead
+    try {
+      formatReferenceTime(new Date(), this.timeZone);
+    } catch (err) {
+      throw new Error(`invalid time zone "${this.timeZone}" (MINIZEP_TIMEZONE): ${(err as Error).message}`);
+    }
+  }
 
   /**
    * One chat completion, with retries.
@@ -65,13 +141,13 @@ export class OpenAICompatLLM implements LLMProvider {
    *   - HTTP 429 / 5xx (rate limit, upstream hiccup)
    *   - empty `content` because the reasoning budget consumed all max_tokens
    */
-  private async chat(userPrompt: string, maxTokens: number): Promise<string> {
+  private async chat(system: string, userPrompt: string, maxTokens: number): Promise<string> {
     const attempts = this.cfg.retries ?? 3;
     let lastErr: Error | undefined;
 
     for (let i = 0; i < attempts; i++) {
       try {
-        return await this.chatOnce(userPrompt, maxTokens);
+        return await this.chatOnce(system, userPrompt, maxTokens);
       } catch (err) {
         lastErr = err as Error;
         const retryable = /empty content|HTTP (429|5\d\d)|fetch failed|timeout|aborted/i.test(lastErr.message);
@@ -84,7 +160,7 @@ export class OpenAICompatLLM implements LLMProvider {
     throw lastErr;
   }
 
-  private async chatOnce(userPrompt: string, maxTokens: number): Promise<string> {
+  private async chatOnce(system: string, userPrompt: string, maxTokens: number): Promise<string> {
     const res = await fetch(`${this.cfg.baseUrl.replace(/\/$/, '')}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -94,7 +170,7 @@ export class OpenAICompatLLM implements LLMProvider {
       body: JSON.stringify({
         model: this.cfg.model,
         messages: [
-          { role: 'system', content: EXTRACTION_SYSTEM },
+          { role: 'system', content: system },
           { role: 'user', content: userPrompt },
         ],
         temperature: 0,
@@ -122,15 +198,15 @@ export class OpenAICompatLLM implements LLMProvider {
     content: string,
     knownEntityNames: string[],
     knownFacts: KnownFact[] = [],
+    options: ExtractOptions = {},
   ): Promise<ExtractionResult> {
-    const known = knownEntityNames.length
-      ? `\nKnown entities already in the graph (reuse these exact names when they match): ${knownEntityNames.join(', ')}`
-      : '';
-    const active = knownFacts.length
-      ? `\nActive relationships currently in the graph (terminations must reference these):\n` +
-        knownFacts.map((f) => `- ${f.fact}`).join('\n')
-      : '';
-    const raw = await this.chat(`Text:\n${content}${known}${active}`, this.cfg.maxTokens ?? 8000);
+    // the pipeline always passes the episode's time; a direct caller gets now
+    const opts = { ...options, referenceTime: options.referenceTime ?? new Date() };
+    const raw = await this.chat(
+      EXTRACTION_SYSTEM,
+      buildExtractionPrompt(content, knownEntityNames, knownFacts, opts, this.timeZone),
+      this.cfg.maxTokens ?? 8000,
+    );
     const parsed = parseJsonObject(raw) as {
       entities?: { name: string; labels?: string[]; summary?: string }[];
       facts?: {
@@ -151,14 +227,15 @@ export class OpenAICompatLLM implements LLMProvider {
     };
 
     const entities = (parsed.entities ?? [])
-      .filter((e) => e && typeof e.name === 'string')
+      .filter((e) => e && typeof e.name === 'string' && e.name.trim())
       .map((e) => ({
         name: e.name.trim(),
-        labels: e.labels ?? [],
-        summary: e.summary ?? '',
+        labels: Array.isArray(e.labels) ? e.labels.filter((l) => typeof l === 'string') : [],
+        summary: typeof e.summary === 'string' ? e.summary.trim() : '',
       }));
 
-    // keep only facts whose endpoints were actually extracted as entities
+    // endpoints may be entities of this text or known ones; the pipeline
+    // resolves them against the graph and counts the ones it cannot resolve
     const names = new Set(entities.map((e) => e.name.toLowerCase()));
     const facts: ExtractedFact[] = (parsed.facts ?? [])
       .filter(
@@ -167,13 +244,13 @@ export class OpenAICompatLLM implements LLMProvider {
           typeof f.sourceName === 'string' &&
           typeof f.targetName === 'string' &&
           typeof f.fact === 'string' &&
-          names.has(f.sourceName.trim().toLowerCase()) &&
-          names.has(f.targetName.trim().toLowerCase()),
+          f.sourceName.trim() &&
+          f.targetName.trim(),
       )
       .map((f) => ({
         sourceName: f.sourceName.trim(),
         targetName: f.targetName.trim(),
-        relation: (f.relation ?? 'RELATES_TO').trim(),
+        relation: (typeof f.relation === 'string' && f.relation.trim()) || 'RELATES_TO',
         fact: f.fact.trim(),
         validAt: toDate(f.validAt),
         invalidAt: toDate(f.invalidAt),
@@ -199,11 +276,13 @@ export class OpenAICompatLLM implements LLMProvider {
       }));
 
     // safety net: an invalidation whose endpoints are absent from the graph
-    // would be silently dropped downstream, so make sure they exist
+    // would be silently dropped downstream, so make sure they exist. The
+    // summary stays empty: the pipeline keeps an existing entity's summary
+    // when the candidate's is empty, so this can never overwrite it.
     for (const iv of invalidations) {
       for (const n of [iv.sourceName, iv.targetName]) {
         if (!names.has(n.toLowerCase())) {
-          entities.push({ name: n, labels: [], summary: `Referenced by ${iv.reason ?? 'text'}` });
+          entities.push({ name: n, labels: [], summary: '' });
           names.add(n.toLowerCase());
         }
       }
@@ -213,20 +292,108 @@ export class OpenAICompatLLM implements LLMProvider {
   }
 
   async detectContradiction(
-    candidate: { sourceName: string; targetName: string; fact: string },
-    existing: { fact: string; validAt?: Date; invalidAt?: Date }[],
-  ): Promise<boolean> {
-    if (existing.length === 0) return false;
-    const list = existing.map((e, i) => `${i + 1}. ${e.fact}`).join('\n');
+    candidate: ContradictionCandidate,
+    existing: ContradictionExisting[],
+  ): Promise<number[]> {
+    if (existing.length === 0) return [];
+    const list = existing.map((e, i) => `${i + 1}. ${e.fact}${since(e.validAt, this.timeZone)}`).join('\n');
     const raw = await this.chat(
-      `New fact: ${candidate.fact}\nExisting facts about the same two entities:\n${list}\n\n` +
-        `Does the new fact make any existing fact no longer true (e.g. a job change, a reversal, an update)? ` +
-        `Answer ONLY JSON: {"contradicts": true|false, "which":[indexes]}`,
+      CONTRADICTION_SYSTEM,
+      `New fact: ${candidate.fact}${since(candidate.validAt, this.timeZone)}\n\nExisting facts:\n${list}`,
       this.cfg.maxTokens ?? 8000,
     );
-    const parsed = parseJsonObject(raw) as { contradicts?: boolean; which?: number[] };
-    return parsed.contradicts === true;
+    return parseContradiction(parseJsonObject(raw), existing.length);
   }
+}
+
+/**
+ * {"contradicts": true, "which": [1]} -> [0]. "which" is 1-based in the
+ * prompt; entries outside 1..count are ignored. Only a "contradicts": true
+ * without any "which" means all of them, like the old boolean contract: a list
+ * naming nothing usable (a 0-based [0], an out-of-range number) closes none,
+ * since closing every candidate is the most destructive misreading.
+ */
+export function parseContradiction(parsed: unknown, count: number): number[] {
+  const p = (parsed ?? {}) as { contradicts?: unknown; which?: unknown };
+  if (p.contradicts === false) return [];
+  if (p.which === undefined || p.which === null) {
+    return p.contradicts === true ? Array.from({ length: count }, (_, i) => i) : [];
+  }
+  const listed = Array.isArray(p.which) ? p.which : [p.which];
+  const which = [...new Set(listed.map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= count))].map(
+    (n) => n - 1,
+  );
+  if (which.length === 0 && p.contradicts === true) {
+    console.error(
+      `[minizep] contradiction answer names no fact of 1..${count} (which=${JSON.stringify(p.which).slice(0, 80)}); closing none`,
+    );
+  }
+  return which;
+}
+
+/** The user message of an extraction call. */
+export function buildExtractionPrompt(
+  content: string,
+  knownEntityNames: string[],
+  knownFacts: KnownFact[],
+  options: ExtractOptions,
+  timeZone = 'UTC',
+): string {
+  const parts: string[] = [];
+  if (options.referenceTime) {
+    parts.push(`Reference time: ${formatReferenceTime(options.referenceTime, timeZone)}`);
+  }
+  parts.push(`Text:\n${content}`);
+  const summaries = new Map((options.knownEntities ?? []).map((e) => [e.name, e.summary]));
+  if (knownEntityNames.length) {
+    parts.push(
+      'Known entities (reuse these exact names; the summary is what is already known):\n' +
+        knownEntityNames.map((n) => `- ${n}: ${summaries.get(n) || '(no summary yet)'}`).join('\n'),
+    );
+  }
+  if (knownFacts.length) {
+    parts.push(
+      'Active relationships (reference these exactly when the text ends one, or ends what they depend on):\n' +
+        knownFacts
+          .map((f) => `- ${f.sourceName} --${f.relation}--> ${f.targetName}: ${f.fact}${since(f.validAt, timeZone)}`)
+          .join('\n'),
+    );
+  }
+  return parts.join('\n\n');
+}
+
+/** " (since 2026-03-01)": the calendar day in the zone the reference time is given in. */
+const since = (d: Date | undefined, timeZone: string) => (d ? ` (since ${calendarDay(d, timeZone)})` : '');
+
+/**
+ * "2026-09-24T08:00:00+08:00 (Thursday)": the instant in the given zone, with
+ * its offset and weekday, which is what "next Monday" is computed from.
+ */
+export function formatReferenceTime(d: Date, timeZone = 'UTC'): string {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', {
+      timeZone,
+      hourCycle: 'h23',
+      weekday: 'long',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    })
+      .formatToParts(d)
+      .map((p) => [p.type, p.value]),
+  );
+  const wall = Date.UTC(+parts.year, +parts.month - 1, +parts.day, +parts.hour, +parts.minute, +parts.second);
+  const offset = Math.round((wall - Math.floor(d.getTime() / 1000) * 1000) / 60_000);
+  const abs = Math.abs(offset);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const zone = `${offset < 0 ? '-' : '+'}${pad(Math.floor(abs / 60))}:${pad(abs % 60)}`;
+  return (
+    `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}:${parts.second}${zone}` +
+    ` (${parts.weekday})`
+  );
 }
 
 /** Tolerates fenced code blocks and surrounding prose. */
@@ -256,9 +423,9 @@ function toDate(v: string | null | undefined): Date | undefined {
  * MINIZEP_REQUIRE_REAL_PROVIDERS=1 in production so a missing key is fatal.
  */
 export function buildLLM(): { llm: LLMProvider; label: string } {
+  let cfg: LLMConfig;
   try {
-    const cfg = loadLLMConfigSync();
-    return { llm: new OpenAICompatLLM(cfg), label: `${cfg.model} @ ${cfg.baseUrl}` };
+    cfg = loadLLMConfigSync();
   } catch (err) {
     const message = (err as Error).message;
     if (process.env.MINIZEP_REQUIRE_REAL_PROVIDERS === '1') {
@@ -276,6 +443,9 @@ export function buildLLM(): { llm: LLMProvider; label: string } {
     );
     return { llm: new MockLLMProvider(), label: `MockLLMProvider (${message})` };
   }
+  // an LLM is configured: a bad setting (e.g. an unknown MINIZEP_TIMEZONE) is
+  // an error to fix, never a reason to fall back to the mock extractor
+  return { llm: new OpenAICompatLLM(cfg), label: `${cfg.model} @ ${cfg.baseUrl}` };
 }
 
 /** Env-only config, so it works where the developer's dotfiles do not exist. */

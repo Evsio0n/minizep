@@ -2,11 +2,15 @@ import { Minizep, OllamaEmbedder, OpenAIEmbedder, FallbackEmbedder } from '../sr
 
 // 真实语义 embedding，优先使用集群上跑在 V100 上的 llama.cpp（OpenAI 兼容
 // /v1/embeddings，本地 11435），其次 ollama（11434），都不可用则降级 hashEmbed。
-// 端点由 MINIZEP_EMBED_URL 指定
-const embedder = new FallbackEmbedder([
-  new OpenAIEmbedder((process.env.MINIZEP_EMBED_URL ?? 'http://127.0.0.1:11435'), 'qwen3-embed'),
-  new OllamaEmbedder(),
-]);
+// 端点由 MINIZEP_EMBED_URL 指定。降级到 hash 必须显式开启（allowHash），
+// 服务端不开：hash 向量与模型向量不在同一个空间。
+const embedder = new FallbackEmbedder(
+  [
+    new OpenAIEmbedder((process.env.MINIZEP_EMBED_URL ?? 'http://127.0.0.1:11435'), 'qwen3-embed'),
+    new OllamaEmbedder(),
+  ],
+  { allowHash: true },
+);
 const zep = new Minizep({ embedder });
 
 console.log('=== 1. 摄取：Alice 加入 Acme ===');
@@ -22,14 +26,14 @@ await zep.ingest.addEpisode({
 });
 
 console.log('\n--- 当前活跃事实 (what is true NOW) ---');
-for (const f of zep.factsAbout('Alice', { groupId: 'demo' })) {
+for (const f of await zep.factsAbout('Alice', { groupId: 'demo' })) {
   console.log(
     `  [${f.fact.name}] ${f.sourceName} -> ${f.targetName} | "${f.fact.fact}" | valid: ${f.fact.validAt?.toISOString().slice(0, 10)}`,
   );
 }
 
 console.log('\n--- 含历史 (includeHistorical: 被 supersede 的事实也可见) ---');
-for (const f of zep.factsAbout('Alice', { groupId: 'demo', includeHistorical: true })) {
+for (const f of await zep.factsAbout('Alice', { groupId: 'demo', includeHistorical: true })) {
   console.log(
     `  [${f.fact.name}] "${f.fact.fact}" | expiredAt: ${f.fact.expiredAt?.toISOString().slice(0, 10) ?? '-'} invalidAt: ${f.fact.invalidAt?.toISOString().slice(0, 10) ?? '-'}`,
   );
@@ -44,7 +48,7 @@ await zep.ingest.addEpisode({
 });
 const mid2024 = new Date('2024-06-01');
 console.log(`--- 2024-06-01 时，Alice 的状态 ---`);
-for (const f of zep.factsAt(mid2024, 'demo')) {
+for (const f of await zep.factsAt(mid2024, 'demo')) {
   console.log(`  ${f.sourceName} --${f.fact.name}--> ${f.targetName}  (learned: ${f.fact.createdAt.toISOString().slice(0, 10)})`);
 }
 
@@ -64,4 +68,7 @@ console.log(snap.split('\n').slice(0, 40).join('\n'), '\n... (truncated)');
 console.log('\n=== 6. 快照重载 ===');
 const zep2 = new Minizep();
 zep2.load(snap);
-console.log(`  重载后: ${zep2.store.getEntities().length} 实体, ${zep2.store.getFacts().length} 事实, ${zep2.store.getEpisodes().length} episodes`);
+console.log(
+  `  重载后: ${(await zep2.store.getEntities()).length} 实体, ${(await zep2.store.getFacts()).length} 事实, ` +
+    `${(await zep2.store.getEpisodes()).length} episodes`,
+);
