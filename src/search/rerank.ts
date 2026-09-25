@@ -50,34 +50,47 @@ export interface SearchCandidate {
 }
 
 /**
- * Graph distance of each fact in `facts` from the entities `anchors`: 0 for a
- * fact touching an anchor, 1 for a fact touching a neighbour of one (an entity
- * linked to an anchor by a fact in `facts`). Facts further away are absent.
- * `facts` are the visible facts (the same time filter as the search), so a
- * relationship that ended does not make its entities neighbours.
+ * The neighbours of the entities `anchors`: the other endpoints of the facts
+ * in `facts` that touch an anchor. `facts` must be the visible facts (the
+ * search's time filter), all of those touching an anchor, so a relationship
+ * that ended does not make its entities neighbours.
  */
-export function graphDistances(anchors: ReadonlySet<string>, facts: readonly EntityEdge[]): Map<string, number> {
-  const distance = new Map<string, number>();
-  if (anchors.size === 0) return distance;
+export function neighboursOf(anchors: ReadonlySet<string>, facts: readonly EntityEdge[]): Set<string> {
   const neighbours = new Set<string>();
   for (const f of facts) {
     const fromSource = anchors.has(f.sourceNodeUuid);
     const fromTarget = anchors.has(f.targetNodeUuid);
-    if (!fromSource && !fromTarget) continue;
-    distance.set(f.uuid, 0);
-    if (!fromSource) neighbours.add(f.sourceNodeUuid);
-    if (!fromTarget) neighbours.add(f.targetNodeUuid);
+    if (fromSource && !fromTarget) neighbours.add(f.targetNodeUuid);
+    if (fromTarget && !fromSource) neighbours.add(f.sourceNodeUuid);
   }
+  return neighbours;
+}
+
+/**
+ * Graph distance of each fact in `facts` from the entities `anchors`: 0 for a
+ * fact touching an anchor, 1 for a fact touching one of their `neighbours`
+ * (neighboursOf). Facts further away are absent. It depends on nothing but
+ * each fact's endpoints, so any candidate can be scored, whichever retriever
+ * found it.
+ */
+export function graphDistances(
+  anchors: ReadonlySet<string>,
+  neighbours: ReadonlySet<string>,
+  facts: readonly EntityEdge[],
+): Map<string, number> {
+  const distance = new Map<string, number>();
   for (const f of facts) {
-    if (distance.has(f.uuid)) continue;
-    if (neighbours.has(f.sourceNodeUuid) || neighbours.has(f.targetNodeUuid)) distance.set(f.uuid, 1);
+    if (anchors.has(f.sourceNodeUuid) || anchors.has(f.targetNodeUuid)) distance.set(f.uuid, 0);
+    else if (neighbours.has(f.sourceNodeUuid) || neighbours.has(f.targetNodeUuid)) distance.set(f.uuid, 1);
   }
   return distance;
 }
 
 /**
  * Fused score for every candidate that passes the relevance cut, best first,
- * at most `limit`. Ties keep the candidates' order.
+ * at most `limit`. Equal scores go to the most recently learned fact, then by
+ * uuid: the backends list candidates in different orders (the database's
+ * neighbourhood comes newest first), and that must not change the result.
  */
 export function rerank(
   candidates: readonly SearchCandidate[],
@@ -93,5 +106,10 @@ export function rerank(
       (c.keywordRank ? 1 / (RRF_K + c.keywordRank) : 0) + (c.vectorRank ? 1 / (RRF_K + c.vectorRank) : 0) + bonus;
     scored.push({ edge: c.edge, score });
   }
-  return scored.sort((a, b) => b.score - a.score).slice(0, opts.limit);
+  return scored.sort((a, b) => b.score - a.score || newestFirst(a.edge, b.edge)).slice(0, opts.limit);
+}
+
+/** Most recently learned first, then by uuid (the database's ORDER BY created_at DESC, uuid). */
+function newestFirst(a: EntityEdge, b: EntityEdge): number {
+  return b.createdAt.getTime() - a.createdAt.getTime() || (a.uuid < b.uuid ? -1 : a.uuid > b.uuid ? 1 : 0);
 }

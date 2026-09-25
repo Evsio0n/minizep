@@ -1,7 +1,7 @@
 import { MemoryGraphStore, isSnapshotable, type GraphStore } from './store/memory-store.js';
 import { IngestPipeline, mentions } from './pipeline/ingest.js';
 import { bm25Scores, cosineSimilarity } from './search/retrieval.js';
-import { DEFAULT_MIN_COSINE, graphDistances, rerank, type SearchCandidate } from './search/rerank.js';
+import { DEFAULT_MIN_COSINE, graphDistances, neighboursOf, rerank, type SearchCandidate } from './search/rerank.js';
 import { HashEmbedder, MockLLMProvider, type Embedder, type LLMProvider } from './provider/index.js';
 import type { EntityEdge, EntityNode, FactWithContext } from './model/types.js';
 import { isFactActive, isFactKnown } from './model/types.js';
@@ -23,12 +23,21 @@ export interface SearchCapableStore extends GraphStore {
   getFactsByUuids(uuids: string[]): Promise<EntityEdge[]>;
   /**
    * Facts touching any of `entityUuids`, under the same group and time filter
-   * as the two searches, nearest to `embedding` first when one is given.
+   * as the two searches, the most recently learned first (created_at, then
+   * uuid: rerank's order for equal scores).
    */
   searchFactsByEntities(
     entityUuids: string[],
-    opts: { groupId?: string; limit?: number; activeAt?: Date | null; asOf?: Date; embedding?: number[] },
+    opts: { groupId?: string; limit?: number; activeAt?: Date | null; asOf?: Date },
   ): Promise<EntityEdge[]>;
+  /**
+   * Every entity linked to one of `entityUuids` by a fact visible under the
+   * same filter, without a limit (the list may include `entityUuids` too).
+   */
+  getNeighbourIds(
+    entityUuids: string[],
+    opts: { groupId?: string; activeAt?: Date | null; asOf?: Date },
+  ): Promise<string[]>;
 }
 
 function isSearchCapable(store: GraphStore): store is SearchCapableStore {
@@ -37,7 +46,8 @@ function isSearchCapable(store: GraphStore): store is SearchCapableStore {
     typeof s.searchFactsByVector === 'function' &&
     typeof s.searchFactsByText === 'function' &&
     typeof s.getFactsByUuids === 'function' &&
-    typeof s.searchFactsByEntities === 'function'
+    typeof s.searchFactsByEntities === 'function' &&
+    typeof s.getNeighbourIds === 'function'
   );
 }
 
@@ -178,8 +188,8 @@ export class Minizep {
 
     // every visible fact is a candidate here, so the whole graph around the
     // query's entities is in reach
-    const anchors = queryEntities(query, entities, queryVec);
-    const distance = graphDistances(new Set(anchors.map((e) => e.uuid)), facts);
+    const anchors = new Set(queryEntities(query, entities, queryVec).map((e) => e.uuid));
+    const distance = graphDistances(anchors, neighboursOf(anchors, facts), facts);
     const candidates = mergeCandidates(byText, byVector, facts, cosine);
     const ranked = rerank(candidates, distance, { limit, minCosine });
     return { results: withContext(ranked, nameOf), degraded: !queryVec };
@@ -217,31 +227,41 @@ export class Minizep {
       this.store.getEntities(groupId),
     ]);
 
-    // the neighbourhood: facts touching a query entity, then facts touching
-    // one of their other endpoints, the ones nearest the query first
+    // The neighbourhood: facts touching a query entity, then facts touching
+    // one of their neighbours, the most recently learned first (the order
+    // rerank gives equal scores). No vector is compared here: a hub entity
+    // touches most of its group. These facts are candidates too, as every
+    // visible fact is in memory; that matters when the embedder is down.
     const anchors = new Set(queryEntities(query, entities, queryVec).map((e) => e.uuid));
     const around: EntityEdge[] = [];
+    let neighbours = new Set<string>();
     if (anchors.size > 0) {
-      const near = { ...scope, embedding: queryVec };
-      around.push(...(await store.searchFactsByEntities([...anchors], { ...near, limit: MAX_NEIGHBOURHOOD_FACTS })));
-      const neighbours = new Set<string>();
-      for (const f of around) {
-        for (const id of [f.sourceNodeUuid, f.targetNodeUuid]) if (!anchors.has(id)) neighbours.add(id);
-      }
+      around.push(...(await store.searchFactsByEntities([...anchors], { ...scope, limit: MAX_NEIGHBOURHOOD_FACTS })));
       const room = MAX_NEIGHBOURHOOD_FACTS - around.length;
-      if (neighbours.size > 0 && room > 0) {
-        // the facts already found touch these neighbours too: ask for enough
-        // that `room` new ones are left once they are skipped
-        const seen = new Set(around.map((f) => f.uuid));
-        const next = await store.searchFactsByEntities([...neighbours], { ...near, limit: room + seen.size });
-        around.push(...next.filter((f) => !seen.has(f.uuid)).slice(0, room));
+      if (room > 0) {
+        // every fact touching an anchor is in `around`: its other endpoints
+        // are all the neighbours, at most one per fact
+        neighbours = neighboursOf(anchors, around);
+        if (neighbours.size > 0) {
+          // the facts already found touch these neighbours too: ask for
+          // enough that `room` new ones are left once they are skipped
+          const seen = new Set(around.map((f) => f.uuid));
+          const next = await store.searchFactsByEntities([...neighbours], { ...scope, limit: room + seen.size });
+          around.push(...next.filter((f) => !seen.has(f.uuid)).slice(0, room));
+        }
+      } else {
+        // the first hop was cut: the neighbours come from a query that is
+        // not, so that distance 1 is exact for every candidate
+        const ids = await store.getNeighbourIds([...anchors], scope);
+        neighbours = new Set(ids.filter((id) => !anchors.has(id)));
       }
     }
 
-    // pgvector returned the `depth` nearest facts; any other candidate is
-    // further away, so it ranks after them, by its own cosine
+    // pgvector returned the `depth` nearest facts; those with a positive
+    // cosine are ranked, as in memory. Any other candidate is further away,
+    // so it ranks after them, by its own cosine
     const cosine = new Map<string, number>(byVector.map((r) => [r.edge.uuid, 1 - r.distance]));
-    const vectorRanked = byVector.map((r) => r.edge);
+    const vectorRanked = byVector.filter((r) => 1 - r.distance > 0).map((r) => r.edge);
     if (queryVec) {
       const extra = [...byText.map((r) => r.edge), ...around].filter(
         (f) => !cosine.has(f.uuid) && f.factEmbedding?.length,
@@ -254,8 +274,10 @@ export class Minizep {
       );
     }
 
-    const distance = graphDistances(anchors, around);
-    const candidates = mergeCandidates(byText.map((r) => r.edge), vectorRanked, around, cosine);
+    // distances from each candidate's own endpoints, whichever search found it
+    const others = [...around, ...byVector.map((r) => r.edge)];
+    const candidates = mergeCandidates(byText.map((r) => r.edge), vectorRanked, others, cosine);
+    const distance = graphDistances(anchors, neighbours, candidates.map((c) => c.edge));
     const ranked = rerank(candidates, distance, { limit, minCosine });
     const nameOf = new Map(entities.map((e) => [e.uuid, e.name]));
     return { results: withContext(ranked, nameOf), degraded: !queryVec };
@@ -412,11 +434,7 @@ function queryEntities(query: string, entities: EntityNode[], queryVec?: number[
 /** Case- and width-insensitive form for name matching ("ＧＰＴ" is "gpt"). */
 const fold = (s: string) => s.normalize('NFKC').toLowerCase();
 
-/**
- * One candidate per fact, with its place in each ranking: keyword matches in
- * keyword order first, then the rest in vector order, then the others, so
- * equal scores keep the order the rankings gave.
- */
+/** One candidate per fact, with its place in each ranking. */
 function mergeCandidates(
   byText: EntityEdge[],
   byVector: EntityEdge[],
