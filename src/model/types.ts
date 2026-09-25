@@ -91,7 +91,11 @@ export interface FactWithContext {
   fact: EntityEdge;
   sourceName: string;
   targetName: string;
-  /** fused retrieval score (RRF), present on search results */
+  /**
+   * retrieval score on search results: the keyword and vector ranks fused
+   * with RRF, plus a bonus when the fact is on or next to an entity the query
+   * names (see search/rerank.ts)
+   */
   score?: number;
 }
 

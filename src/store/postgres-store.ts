@@ -648,6 +648,38 @@ export class PostgresStore implements GraphStore {
     const r = await this.db.query(sql, params);
     return r.rows.map((row) => ({ edge: rowToFact(row), distance: Number(row.distance) }));
   }
+
+  /**
+   * Facts touching any of `entityUuids` (the graph neighbourhood a search adds
+   * to its candidates), under the same group and time filter as the searches.
+   * Nearest to `embedding` first when one is given (facts without a vector
+   * last), else the most recently learned first.
+   */
+  async searchFactsByEntities(
+    entityUuids: UUID[],
+    opts: { groupId?: string; limit?: number; activeAt?: Date | null; asOf?: Date; embedding?: number[] } = {},
+  ): Promise<EntityEdge[]> {
+    const ids = entityUuids.filter((id) => UUID_RE.test(id));
+    if (ids.length === 0) return [];
+    await this.ensure();
+    const params: unknown[] = [ids];
+    let sql = `SELECT * FROM facts WHERE (source_node_uuid = ANY($1::uuid[]) OR target_node_uuid = ANY($1::uuid[]))`;
+    if (opts.groupId) {
+      params.push(opts.groupId);
+      sql += ` AND group_id = $${params.length}`;
+    }
+    sql += this.temporalPredicate(params, opts.activeAt, ' AND ', opts.asOf);
+    if (opts.embedding?.length) {
+      params.push(this.vec(opts.embedding));
+      sql += ` ORDER BY fact_embedding <=> $${params.length}::vector`;
+    } else {
+      sql += ' ORDER BY created_at DESC, uuid';
+    }
+    params.push(opts.limit ?? 200);
+    sql += ` LIMIT $${params.length}`;
+    const r = await this.db.query(sql, params);
+    return r.rows.map(rowToFact);
+  }
 }
 
 /** The facts.search_text value: keyword tokens of the relation name and fact text. */

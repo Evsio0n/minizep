@@ -240,7 +240,10 @@ another group is 404.
 
 ### POST /v1/search
 
-Hybrid search (keyword BM25 + embeddings, rank fusion) over facts.
+Hybrid search (keyword BM25 + embeddings, rank fusion) over facts. Facts on an entity the query
+names, or one hop from it, get a small boost. A fact that shares no keyword with the query, is not
+near an entity it names and whose embedding is not similar enough (`MINIZEP_SEARCH_MIN_COSINE`,
+default 0.4) is left out, so `facts` can be empty.
 
 | Field                | Type    | Notes |
 |----------------------|---------|-------|
