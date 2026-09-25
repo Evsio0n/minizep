@@ -21,13 +21,17 @@ const SCRIPT_RUNS = new RegExp(`[${CJK}]+|[^${CJK}]+`, 'gu');
  * ("阿里巴巴" -> 阿里 里巴 巴巴); a one-character run stays as it is. Queries
  * and documents go through this same function, so matching stays symmetric.
  * NFKC folds the full-width letters and digits common in CJK text ("ＧＰＴ４")
- * into their ASCII forms.
+ * into their ASCII forms. Combining marks NFKC could not compose, including
+ * the variation selectors that pick a glyph variant of a kanji (葛 + U+E0100),
+ * are dropped rather than treated as punctuation: as a space they would cut a
+ * CJK run in two and lose the bigram across them.
  */
 export function tokenize(text: string): string[] {
   const tokens: string[] = [];
   const words = text
     .normalize('NFKC')
     .toLowerCase()
+    .replace(/\p{M}/gu, '')
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .split(/\s+/);
   for (const word of words) {
@@ -62,22 +66,46 @@ export interface Bm25Doc {
 }
 
 export function bm25Scores(query: string, docs: Bm25Doc[], k1 = 1.2, b = 0.75): Map<string, number> {
-  const qTerms = tokenize(query);
-  const N = docs.length;
-  const scores = new Map<string, number>();
-  if (N === 0) return scores;
+  return bm25TermScores(
+    tokenize(query),
+    docs.map((d) => ({ id: d.id, terms: tokenize(d.text) })),
+    { k1, b },
+  );
+}
 
-  const docTerms = docs.map((d) => tokenize(d.text));
-  const avgLen = docTerms.reduce((s, t) => s + t.length, 0) / N;
+/** Size and mean length (in tokens) of the collection BM25 scores against. */
+export interface Bm25Corpus {
+  size: number;
+  avgLength: number;
+}
+
+/**
+ * BM25 over already-tokenized documents. By default `docs` is the whole
+ * collection. A caller that only holds the documents matching some query term
+ * (a database pre-filter) passes the full collection's `corpus` statistics;
+ * document frequencies still come from `docs`, which is exact because a
+ * document without any query term adds nothing to them.
+ */
+export function bm25TermScores(
+  qTerms: string[],
+  docs: Array<{ id: string; terms: string[] }>,
+  opts: { k1?: number; b?: number; corpus?: Bm25Corpus } = {},
+): Map<string, number> {
+  const { k1 = 1.2, b = 0.75, corpus } = opts;
+  const scores = new Map<string, number>();
+  if (docs.length === 0) return scores;
+  const N = Math.max(corpus?.size ?? 0, docs.length);
+  const ownAvg = docs.reduce((s, d) => s + d.terms.length, 0) / docs.length;
+  const avgLen = corpus && corpus.avgLength > 0 ? corpus.avgLength : ownAvg;
 
   // document frequency per query term
   const df = new Map<string, number>();
   for (const term of qTerms) {
-    df.set(term, docTerms.filter((terms) => terms.includes(term)).length);
+    df.set(term, docs.filter((d) => d.terms.includes(term)).length);
   }
 
-  docs.forEach((doc, i) => {
-    const terms = docTerms[i];
+  docs.forEach((doc) => {
+    const terms = doc.terms;
     const tf = new Map<string, number>();
     for (const t of terms) tf.set(t, (tf.get(t) ?? 0) + 1);
     let score = 0;

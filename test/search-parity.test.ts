@@ -61,6 +61,8 @@ const ZH_CORPUS = [
   zh('李娜在腾讯做产品经理，负责微信支付', '李娜', '腾讯', 'WORKS_AT', ['Organization']),
   zh('王芳喜欢吃四川火锅', '王芳', '四川火锅', 'LIKES', ['Concept']),
   zh('陈明在Google做机器学习工程师', '陈明', 'Google', 'WORKS_AT', ['Organization']),
+  zh('赵磊每天在B站看视频', '赵磊', 'B站', 'WATCHES', ['Organization']),
+  zh('孙丽2024年3月入职字节跳动', '孙丽', '字节跳动', 'WORKS_AT', ['Organization']),
 ];
 
 /** Chinese (and mixed) queries with the fact each must return first. */
@@ -70,10 +72,25 @@ const ZH_QUERIES: Array<[query: string, expected: string]> = [
   ['微信支付', '李娜在腾讯做产品经理，负责微信支付'],
   ['火锅', '王芳喜欢吃四川火锅'],
   ['Google 机器学习', '陈明在Google做机器学习工程师'],
+  // a letter or digit next to one CJK character: the only token that can match
+  ['B站', '赵磊每天在B站看视频'],
+  ['3月', '孙丽2024年3月入职字节跳动'],
 ];
 
+/**
+ * A question whose common bigrams (公司, 工作) fill the other facts while the
+ * rare one (the name 张伟) is in the fact it asks about. Ranking without idf
+ * put that fact last.
+ */
+const NAME_CORPUS = [
+  zh('张伟在阿里巴巴做高级产品经理', '张伟', '阿里巴巴', 'WORKS_AT', ['Organization']),
+  zh('李娜在腾讯公司工作，公司总部在深圳', '李娜', '腾讯', 'WORKS_AT', ['Organization']),
+  zh('王芳在华为公司工作', '王芳', '华为', 'WORKS_AT', ['Organization']),
+];
+const NAME_QUERY = '张伟在哪家公司工作';
+
 function makeZep(store: MemoryGraphStore | PostgresStore, embedder = new HashEmbedder(DIMS)) {
-  const byContent = new Map([...CORPUS, ...ZH_CORPUS].map((c) => [c.content, c.result]));
+  const byContent = new Map([...CORPUS, ...ZH_CORPUS, ...NAME_CORPUS].map((c) => [c.content, c.result]));
   const llm = new ScriptedLLM(
     (content) => byContent.get(content) ?? { entities: [], facts: [], invalidations: [] },
     false,
@@ -104,6 +121,10 @@ test('search parity: memory backend finds words inside Chinese sentences', async
     const hits = await zep.searchFacts(query, { groupId: 'zh' });
     assert.equal(hits[0]?.fact.fact, expected, `wrong top hit for "${query}"`);
   }
+
+  await seed(zep, 'zh-names', NAME_CORPUS);
+  const hits = await zep.searchFacts(NAME_QUERY, { groupId: 'zh-names' });
+  assert.equal(hits[0]?.fact.fact, NAME_CORPUS[0].content);
 });
 
 if (!URL) {
@@ -164,6 +185,27 @@ if (!URL) {
     }
   });
 
+  test('search parity: postgres weighs a rare name over common bigrams, as memory does', async () => {
+    const mem = makeZep(new MemoryGraphStore());
+    await seed(mem, 'zh-names', NAME_CORPUS);
+
+    const pg = new PostgresStore({ connectionString: URL, embeddingDims: DIMS, schema: TEST_SCHEMA });
+    await pg.reset();
+    try {
+      const dbz = makeZep(pg);
+      await seed(dbz, 'zh-names', NAME_CORPUS);
+      const expected = NAME_CORPUS[0].content;
+
+      // ts_rank_cd (occurrences, no idf) put this fact last on the keyword path
+      const byText = await pg.searchFactsByText(NAME_QUERY, { groupId: 'zh-names' });
+      assert.equal(byText[0]?.edge.fact, expected);
+      assert.equal((await mem.searchFacts(NAME_QUERY, { groupId: 'zh-names' }))[0]?.fact.fact, expected);
+      assert.equal((await dbz.searchFacts(NAME_QUERY, { groupId: 'zh-names' }))[0]?.fact.fact, expected);
+    } finally {
+      await pg.close();
+    }
+  });
+
   test('search_text: updating a fact re-indexes its new text', async () => {
     const pg = new PostgresStore({ connectionString: URL, embeddingDims: DIMS, schema: TEST_SCHEMA });
     await pg.reset();
@@ -180,50 +222,96 @@ if (!URL) {
     }
   });
 
-  test('search_text: a table from before the column existed is upgraded and backfilled', async () => {
-    const raw = new Pool({ connectionString: URL, options: `-c search_path=${TEST_SCHEMA},public` });
+  /**
+   * Rewind TEST_SCHEMA to the schema before search_text: the Chinese corpus,
+   * no search_text column (its indexes go with it), the old expression index
+   * back, and more legacy rows than one backfill batch holds.
+   */
+  async function rewindToOldSchema(raw: Pool): Promise<void> {
     const old = new PostgresStore({ connectionString: URL, embeddingDims: DIMS, schema: TEST_SCHEMA });
     try {
       await old.reset();
       await seed(makeZep(old), 'zh', ZH_CORPUS);
-      // rewind to the previous schema: no search_text column (its index goes
-      // with it), the old expression index back, and more legacy rows than one
-      // backfill batch holds
-      await raw.query(`
-        ALTER TABLE facts DROP COLUMN search_text;
-        CREATE INDEX IF NOT EXISTS facts_fts ON facts USING gin (to_tsvector('simple', name || ' ' || fact));
-      `);
-      const entityUuid = (await raw.query('SELECT uuid FROM entities LIMIT 1')).rows[0].uuid;
-      await raw.query(
-        `INSERT INTO facts (uuid, group_id, source_node_uuid, target_node_uuid, name, fact, created_at)
-         SELECT md5('legacy' || i)::uuid, 'legacy', $1, $1, 'NOTE', '第' || i || '条会议纪要',
-                timestamptz '2020-01-01 00:00:00+00'
-           FROM generate_series(1, 1200) AS i`,
-        [entityUuid],
-      );
     } finally {
       await old.close();
     }
+    await raw.query(`
+      ALTER TABLE facts DROP COLUMN search_text;
+      CREATE INDEX IF NOT EXISTS facts_fts ON facts USING gin (to_tsvector('simple', name || ' ' || fact));
+    `);
+    const entityUuid = (await raw.query('SELECT uuid FROM entities LIMIT 1')).rows[0].uuid;
+    await raw.query(
+      `INSERT INTO facts (uuid, group_id, source_node_uuid, target_node_uuid, name, fact, created_at)
+       SELECT md5('legacy' || i)::uuid, 'legacy', $1, $1, 'NOTE', '第' || i || '条会议纪要',
+              timestamptz '2020-01-01 00:00:00+00'
+         FROM generate_series(1, 1200) AS i`,
+      [entityUuid],
+    );
+  }
 
-    // a new process starting against the old table
-    const upgraded = new PostgresStore({ connectionString: URL, embeddingDims: DIMS, schema: TEST_SCHEMA });
+  /** Every row filled, the new indexes present and the old one gone. */
+  async function assertUpgraded(raw: Pool): Promise<void> {
+    const missing = await raw.query('SELECT count(*)::int AS n FROM facts WHERE search_text IS NULL');
+    assert.equal(missing.rows[0].n, 0, 'every row is backfilled, across several batches');
+
+    const indexes = await raw.query(
+      `SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = 'facts'`,
+      [TEST_SCHEMA],
+    );
+    const names = indexes.rows.map((r) => r.indexname as string);
+    assert.ok(names.includes('facts_search_text'), 'the search_text index is created');
+    assert.ok(names.includes('facts_search_text_missing'), 'the index behind the start-up check is created');
+    assert.ok(!names.includes('facts_fts'), 'the unused expression index is dropped');
+  }
+
+  test('search_text: a table from before the column existed is upgraded and backfilled', async () => {
+    const raw = new Pool({ connectionString: URL, options: `-c search_path=${TEST_SCHEMA},public` });
     try {
-      const hits = await upgraded.searchFactsByText('阿里巴巴', { groupId: 'zh' });
-      assert.equal(hits[0]?.edge.fact, '张伟在阿里巴巴做高级产品经理');
-      assert.equal((await upgraded.searchFactsByText('会议纪要', { groupId: 'legacy', limit: 5 })).length, 5);
+      await rewindToOldSchema(raw);
+      // a new process starting against the old table
+      const upgraded = new PostgresStore({ connectionString: URL, embeddingDims: DIMS, schema: TEST_SCHEMA });
+      try {
+        const hits = await upgraded.searchFactsByText('阿里巴巴', { groupId: 'zh' });
+        assert.equal(hits[0]?.edge.fact, '张伟在阿里巴巴做高级产品经理');
+        assert.equal((await upgraded.searchFactsByText('会议纪要', { groupId: 'legacy', limit: 5 })).length, 5);
+        await assertUpgraded(raw);
+      } finally {
+        await upgraded.close();
+      }
 
-      const missing = await raw.query('SELECT count(*)::int AS n FROM facts WHERE search_text IS NULL');
-      assert.equal(missing.rows[0].n, 0, 'every row is backfilled, across several batches');
-
-      const indexes = await raw.query(
-        `SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND tablename = 'facts'`,
-        [TEST_SCHEMA],
+      // an older build writes a fact without search_text; the next start fills it
+      const entityUuid = (await raw.query('SELECT uuid FROM entities LIMIT 1')).rows[0].uuid;
+      await raw.query(
+        `INSERT INTO facts (uuid, group_id, source_node_uuid, target_node_uuid, name, fact, created_at)
+         VALUES (md5('old-build')::uuid, 'legacy', $1, $1, 'NOTE', '旧版写入的纪要', now())`,
+        [entityUuid],
       );
-      const names = indexes.rows.map((r) => r.indexname as string);
-      assert.ok(names.includes('facts_search_text'), 'the search_text index is created');
-      assert.ok(!names.includes('facts_fts'), 'the unused expression index is dropped');
+      const restarted = new PostgresStore({ connectionString: URL, embeddingDims: DIMS, schema: TEST_SCHEMA });
+      try {
+        const hits = await restarted.searchFactsByText('旧版写入', { groupId: 'legacy' });
+        assert.equal(hits[0]?.edge.fact, '旧版写入的纪要');
+      } finally {
+        await restarted.close();
+      }
     } finally {
-      await upgraded.close();
+      await raw.end();
+    }
+  });
+
+  test('search_text: processes starting together on an old table all come up (regression: CREATE INDEX race)', async () => {
+    const raw = new Pool({ connectionString: URL, options: `-c search_path=${TEST_SCHEMA},public` });
+    const stores = Array.from(
+      { length: 3 },
+      () => new PostgresStore({ connectionString: URL, embeddingDims: DIMS, schema: TEST_SCHEMA }),
+    );
+    try {
+      await rewindToOldSchema(raw);
+      // before the advisory lock, the second CREATE INDEX IF NOT EXISTS failed
+      // on pg_class_relname_nsp_index and that process's store stayed broken
+      await Promise.all(stores.map((s) => s.searchFactsByText('阿里巴巴', { groupId: 'zh' })));
+      await assertUpgraded(raw);
+    } finally {
+      await Promise.all(stores.map((s) => s.close()));
       await raw.end();
     }
   });

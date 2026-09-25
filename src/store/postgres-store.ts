@@ -1,6 +1,6 @@
 import { Pool, type PoolClient } from 'pg';
 import { isFactActive, type EntityEdge, type EntityNode, type EpisodicNode, type UUID } from '../model/types.js';
-import { isCjkToken, tokenize } from '../search/retrieval.js';
+import { bm25TermScores, tokenize, type Bm25Corpus } from '../search/retrieval.js';
 import type { GraphStore } from './memory-store.js';
 
 export interface PostgresStoreOptions {
@@ -15,6 +15,15 @@ export interface PostgresStoreOptions {
 }
 
 const DEFAULT_URL = process.env.MINIZEP_DATABASE_URL ?? 'postgres://minizep@127.0.0.1:5433/minizep';
+
+/** Most facts one keyword search re-ranks in Node (the best-covered ones win). */
+const KEYWORD_CANDIDATES = 1000;
+/**
+ * Most facts read for BM25's collection size and mean length. Up to this many
+ * the ranking equals the in-memory backend's; past it idf is computed as if
+ * the scope held this many facts, which keeps each search's cost bounded.
+ */
+const KEYWORD_STATS_SAMPLE = 10_000;
 
 /**
  * Postgres + pgvector backend.
@@ -116,23 +125,7 @@ export class PostgresStore implements GraphStore {
           CREATE INDEX IF NOT EXISTS facts_fact_embedding_hnsw
             ON facts USING hnsw (fact_embedding vector_cosine_ops);
         `);
-        // keyword search. Postgres' parser keeps a CJK sentence as one word, so
-        // the store writes tokenize()'s output (CJK bigrams, see retrieval.ts)
-        // to search_text and indexes that. 'simple' is deliberate: it needs no
-        // language dictionary and leaves the pre-split tokens alone.
-        // Separate statements: the ALTER's exclusive lock must not be held
-        // while the index builds, and backfilling first makes the build cheaper.
-        await this.pool.query('ALTER TABLE facts ADD COLUMN IF NOT EXISTS search_text TEXT');
-        await this.backfillSearchText();
-        await this.pool.query(`
-          CREATE INDEX IF NOT EXISTS facts_search_text
-            ON facts USING gin (to_tsvector('simple', search_text))
-        `);
-        // The old facts_fts index (on name || ' ' || fact) is no longer queried
-        // and only slowed down writes. Dropped by schema-qualified name, so a
-        // test schema can never reach an index in public; an older build that
-        // is rolled back to recreates it on start (CREATE INDEX IF NOT EXISTS).
-        await this.pool.query(`DROP INDEX IF EXISTS ${this.schema}.facts_fts`);
+        await this.migrateSearchText();
 
         // CREATE TABLE IF NOT EXISTS silently keeps an existing column's vector
         // dimension, so a model change would otherwise surface as a confusing
@@ -146,7 +139,12 @@ export class PostgresStore implements GraphStore {
               `(or DROP the tables to start empty).`,
           );
         }
-      })();
+      })().catch((err: unknown) => {
+        // a transient failure (a restart, a lock timeout) must not break this
+        // store for the life of the process: the next call tries again
+        this.ready = null;
+        throw err;
+      });
     }
     return this.ready;
   }
@@ -167,22 +165,101 @@ export class PostgresStore implements GraphStore {
   }
 
   /**
-   * Fill search_text for facts written before the column existed, in batches.
-   * Keyset pagination on the primary key keeps every batch a range scan, and
-   * the IS NULL guard makes a rerun, or several processes starting at once,
-   * harmless.
+   * Keyword search reads facts.search_text, tokenize()'s output (CJK bigrams,
+   * see retrieval.ts), because Postgres' own parser keeps a CJK sentence as
+   * one word. A GIN index on to_tsvector('simple', search_text) serves it;
+   * 'simple' needs no language dictionary and leaves the tokens alone.
+   *
+   * A usual start finds everything in place with two cheap reads and takes no
+   * lock. Otherwise the table is brought up to date: the column added, rows
+   * without search_text filled (facts from before the column, or written by
+   * an older build since), the indexes built and the old facts_fts index
+   * dropped. That runs on one connection holding an advisory lock, so
+   * processes starting together (a server and several stdio MCP clients)
+   * cannot race on the same DDL; the ones that waited re-check and find
+   * nothing left to do.
    */
-  private async backfillSearchText(batchSize = 500): Promise<void> {
+  private async migrateSearchText(): Promise<void> {
+    if ((await this.searchTextState(this.pool)).ready) return;
+    const client = await this.pool.connect();
+    let broken = false;
+    try {
+      await client.query(`SELECT pg_advisory_lock(hashtext('minizep.migrate'), hashtext($1))`, [this.schema]);
+      try {
+        const state = await this.searchTextState(client);
+        if (state.ready) return;
+        // ADD COLUMN and DROP INDEX lock facts exclusively, and every other
+        // query on it queues behind a request waiting for that lock: give up
+        // after a few seconds (the next call retries) rather than stall the table
+        const exclusive = async (sql: string) => {
+          await client.query(`SET lock_timeout = '5s'`);
+          await client.query(sql);
+          await client.query('RESET lock_timeout');
+        };
+        if (!state.column) await exclusive('ALTER TABLE facts ADD COLUMN IF NOT EXISTS search_text TEXT');
+        // backfill first: the index builds faster over filled rows
+        await this.backfillSearchText(client);
+        await client.query(`
+          CREATE INDEX IF NOT EXISTS facts_search_text
+            ON facts USING gin (to_tsvector('simple', search_text))
+        `);
+        // keeps the "any row left to fill?" check at start an index probe;
+        // nearly empty, since only an older build writes such rows
+        await client.query(`
+          CREATE INDEX IF NOT EXISTS facts_search_text_missing
+            ON facts (uuid) WHERE search_text IS NULL
+        `);
+        // The old facts_fts index (on name || ' ' || fact) is no longer queried
+        // and only slowed down writes. Dropped by schema-qualified name, so a
+        // test schema can never reach an index in public. An older build that
+        // is rolled back to recreates it on start, which also tells the next
+        // start of this one to fill the rows that build wrote.
+        await exclusive(`DROP INDEX IF EXISTS ${this.schema}.facts_fts`);
+      } finally {
+        await client.query(`SELECT pg_advisory_unlock(hashtext('minizep.migrate'), hashtext($1))`, [this.schema]);
+      }
+    } catch (err) {
+      // closing the session also drops the lock if the unlock never ran
+      broken = true;
+      throw err;
+    } finally {
+      client.release(broken);
+    }
+  }
+
+  /** Whether search_text is complete; `column` says if it exists at all. */
+  private async searchTextState(db: Pool | PoolClient): Promise<{ ready: boolean; column: boolean }> {
+    const q = (name: string) => `${this.schema}.${name}`;
+    const r = await db.query(
+      `SELECT EXISTS (SELECT 1 FROM pg_attribute
+                       WHERE attrelid = to_regclass($1) AND attname = 'search_text'
+                         AND NOT attisdropped) AS has_column,
+              to_regclass($2) IS NOT NULL AND to_regclass($3) IS NOT NULL
+                AND to_regclass($4) IS NULL AS indexes_done`,
+      [q('facts'), q('facts_search_text'), q('facts_search_text_missing'), q('facts_fts')],
+    );
+    const column = r.rows[0].has_column === true;
+    if (!column || r.rows[0].indexes_done !== true) return { ready: false, column };
+    const missing = await db.query('SELECT 1 FROM facts WHERE search_text IS NULL LIMIT 1');
+    return { ready: missing.rows.length === 0, column };
+  }
+
+  /**
+   * Fill search_text where it is NULL, in batches. Keyset pagination on the
+   * primary key walks the table once. The IS NULL guard on the UPDATE keeps a
+   * value that a concurrent write stored in the meantime.
+   */
+  private async backfillSearchText(db: PoolClient, batchSize = 500): Promise<void> {
     let after: string | null = null;
     for (;;) {
-      const r = await this.pool.query(
+      const r = await db.query(
         `SELECT uuid, name, fact FROM facts
           WHERE search_text IS NULL AND ($1::uuid IS NULL OR uuid > $1::uuid)
           ORDER BY uuid LIMIT $2`,
         [after, batchSize],
       );
       if (r.rows.length === 0) return;
-      await this.pool.query(
+      await db.query(
         `UPDATE facts AS f SET search_text = v.search_text
            FROM unnest($1::uuid[], $2::text[]) AS v(uuid, search_text)
           WHERE f.uuid = v.uuid AND f.search_text IS NULL`,
@@ -374,40 +451,87 @@ export class PostgresStore implements GraphStore {
   }
 
   /**
-   * Keyword search pushed down to Postgres full-text search instead of
-   * scoring every fact in Node.
+   * Keyword search. The GIN index finds the facts sharing a token with the
+   * query; Node then ranks them with the in-memory backend's BM25. Postgres'
+   * ts_rank has no idf, so common CJK bigrams (公司, 工作) would outrank the
+   * rare name a question is about, and the two backends would disagree.
    */
   async searchFactsByText(
     query: string,
     opts: { groupId?: string; limit?: number; activeAt?: Date | null } = {},
   ): Promise<{ edge: EntityEdge; score: number }[]> {
     await this.ensure();
-    // websearch_to_tsquery("alice works at acme") means alice AND works AND at
-    // AND acme, which matches almost nothing (the document holds "WORKS_AT" as
-    // one token). Ranking on OR-ed terms is both far more useful and closer to
-    // what the in-process BM25 path does. The query is split by the same
-    // tokenize() that produced search_text, so CJK bigrams line up.
-    const tokens = [...new Set(tokenize(query))];
-    // one-letter Latin tokens ("a") are noise without BM25's idf; a single
-    // CJK character is a word in its own right
-    const terms = tokens.filter((t) => t.length > 1 || isCjkToken(t));
-    const chosen = terms.length > 0 ? terms : tokens;
-    if (chosen.length === 0) return [];
-    const params: unknown[] = [chosen.join(' OR ')];
-    let sql = `
-      SELECT *, ts_rank_cd(to_tsvector('simple', search_text),
-                           websearch_to_tsquery('simple', $1)) AS score
-        FROM facts
-       WHERE to_tsvector('simple', search_text) @@ websearch_to_tsquery('simple', $1)`;
+    // The same tokenize() produced search_text, so CJK bigrams line up. Every
+    // token is kept, one letter or one CJK character included: idf decides
+    // what matters, and "B站" or "3月" have nothing else to match on. OR, not
+    // AND: "alice works at acme" must not require every word. A token is only
+    // letters and digits, so quoting it is enough; to_tsquery, because
+    // websearch_to_tsquery reads a query word "or" as an operator.
+    const qTerms = tokenize(query);
+    if (qTerms.length === 0) return [];
+    // one instant for both queries below: the candidates and the statistics
+    // must describe the same set of facts
+    const covered = { groupId: opts.groupId, activeAt: opts.activeAt === undefined ? new Date() : opts.activeAt };
+    const params: unknown[] = [[...new Set(qTerms)].map((t) => `'${t}'`).join(' | ')];
+    const scope = this.keywordScope(params, covered);
+    params.push(KEYWORD_CANDIDATES);
+    // candidates in creation order, like getFacts(), so ties rank as in memory
+    const found = await this.pool.query(
+      `SELECT uuid, search_text FROM (
+         SELECT uuid, search_text, created_at FROM facts
+          WHERE to_tsvector('simple', search_text) @@ to_tsquery('simple', $1)${scope}
+          ORDER BY ts_rank(to_tsvector('simple', search_text), to_tsquery('simple', $1)) DESC
+          LIMIT $${params.length}
+       ) AS matched
+       ORDER BY created_at, uuid`,
+      params,
+    );
+    if (found.rows.length === 0) return [];
+
+    const docs = found.rows.map((row) => ({ id: row.uuid as string, terms: (row.search_text as string).split(' ') }));
+    const scores = bm25TermScores(qTerms, docs, { corpus: await this.keywordCorpus(covered) });
+    const top = [...scores.entries()]
+      .filter(([, score]) => score > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, opts.limit ?? 20);
+    const edges = new Map((await this.getFactsByUuids(top.map(([id]) => id))).map((e) => [e.uuid, e]));
+    return top.flatMap(([id, score]) => {
+      const edge = edges.get(id);
+      return edge ? [{ edge, score }] : [];
+    });
+  }
+
+  /**
+   * BM25's collection statistics over the facts a search covers (group and
+   * time window), as the in-memory backend computes them over every fact it
+   * scores. Read from at most KEYWORD_STATS_SAMPLE rows.
+   */
+  private async keywordCorpus(opts: { groupId?: string; activeAt?: Date | null }): Promise<Bm25Corpus> {
+    const params: unknown[] = [];
+    const scope = this.keywordScope(params, opts);
+    params.push(KEYWORD_STATS_SAMPLE);
+    // search_text is tokens joined by single spaces: tokens = spaces + 1
+    const r = await this.pool.query(
+      `SELECT count(*)::int AS size,
+              coalesce(avg(CASE WHEN search_text = '' THEN 0
+                                ELSE length(search_text) - length(replace(search_text, ' ', '')) + 1 END),
+                       0)::float8 AS avg_length
+         FROM (SELECT search_text FROM facts
+                WHERE search_text IS NOT NULL${scope}
+                LIMIT $${params.length}) AS covered`,
+      params,
+    );
+    return { size: Number(r.rows[0].size), avgLength: Number(r.rows[0].avg_length) };
+  }
+
+  /** Group and time-window predicates of a keyword search, each starting with AND. */
+  private keywordScope(params: unknown[], opts: { groupId?: string; activeAt?: Date | null }): string {
+    let sql = '';
     if (opts.groupId) {
       params.push(opts.groupId);
       sql += ` AND group_id = $${params.length}`;
     }
-    sql += this.temporalPredicate(params, opts.activeAt, ' AND ');
-    params.push(opts.limit ?? 20);
-    sql += ` ORDER BY score DESC LIMIT $${params.length}`;
-    const r = await this.pool.query(sql, params);
-    return r.rows.map((row) => ({ edge: rowToFact(row), score: Number(row.score) }));
+    return sql + this.temporalPredicate(params, opts.activeAt, ' AND ');
   }
 
   /** Fetch a specific set of edges — used to materialise fused rankings. */

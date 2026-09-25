@@ -135,6 +135,19 @@ test('tokenize: kana, Hangul and supplementary-plane ideographs are CJK too', ()
   assert.deepEqual(tokenize('𠮷野家'), ['𠮷野', '野家']);
 });
 
+test('tokenize: variation selectors and combining marks do not cut a CJK run', () => {
+  // an ideographic variation selector picks a glyph variant of the kanji before
+  // it; read as punctuation it split the run and lost the bigram across it
+  assert.deepEqual(tokenize('葛\u{E0100}城市'), ['葛城', '城市']);
+  assert.deepEqual(tokenize('葛\u{E0100}城市在奈良县'), tokenize('葛城市在奈良县'));
+  assert.deepEqual(tokenize('神\uFE00戸'), ['神戸']);
+  // a combining mark NFKC cannot compose onto its base (Ainu small katakana)
+  assert.deepEqual(tokenize('ㇷ\u309Aヌ'), ['ㇷヌ']);
+  // marks NFKC can compose stay on their letter
+  assert.deepEqual(tokenize('Cafe\u0301'), ['café']);
+  assert.ok((bm25Scores('神戸', [{ id: 'kobe', text: '住在神\uFE00戸' }]).get('kobe') ?? 0) > 0);
+});
+
 test('bm25: a word inside a Chinese sentence matches (regression: CJK run was one token)', () => {
   const docs = [
     { id: 'zhang', text: '张伟在阿里巴巴做高级产品经理' },
