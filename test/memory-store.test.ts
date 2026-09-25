@@ -53,3 +53,15 @@ test('[memory] a loaded snapshot pins the dimension it was written with', async 
   assert.equal(s.embeddingDims, 3);
   await assert.rejects(s.upsertEntity(node('Bob', [1, 0])), /dimension mismatch/);
 });
+
+test('[memory] a snapshot holding mixed vector lengths pins the most common one', async () => {
+  const snapshot = JSON.stringify({
+    episodes: [],
+    // a legacy record comes first; the majority decides
+    entities: [node('Legacy', [1, 0]), node('Alice', [1, 0, 0]), node('Acme', [0, 1, 0])],
+    facts: [],
+  });
+  const s = new MemoryGraphStore();
+  s.loadJSON(snapshot);
+  assert.equal(s.embeddingDims, 3);
+});

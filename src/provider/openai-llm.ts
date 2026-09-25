@@ -114,6 +114,9 @@ An existing fact is ended when the new fact replaces it: another employer, title
 home, owner, status, date or value for the same thing; a reversal; an explicit update.
 It is NOT ended when both can hold at the same time (working at a company and owning shares in it;
 a role and a team membership; two hobbies), or when the new fact only adds detail to it.
+Dates in parentheses are when each fact started. The new fact may be OLDER than an existing one (a
+document added late): still list every existing fact it cannot hold together with; the order in time is
+taken from the dates.
 Return ONLY JSON: {"contradicts": true|false, "which": [numbers of the ended facts from the list]}`;
 
 export class OpenAICompatLLM implements LLMProvider {
@@ -122,7 +125,11 @@ export class OpenAICompatLLM implements LLMProvider {
   constructor(private cfg: LLMConfig) {
     this.timeZone = cfg.timeZone ?? process.env.MINIZEP_TIMEZONE ?? localTimeZone();
     // an unknown zone would fail every extraction; fail at construction instead
-    formatReferenceTime(new Date(), this.timeZone);
+    try {
+      formatReferenceTime(new Date(), this.timeZone);
+    } catch (err) {
+      throw new Error(`invalid time zone "${this.timeZone}" (MINIZEP_TIMEZONE): ${(err as Error).message}`);
+    }
   }
 
   /**
@@ -288,10 +295,10 @@ export class OpenAICompatLLM implements LLMProvider {
     existing: ContradictionExisting[],
   ): Promise<number[]> {
     if (existing.length === 0) return [];
-    const list = existing.map((e, i) => `${i + 1}. ${e.fact}${since(e.validAt)}`).join('\n');
+    const list = existing.map((e, i) => `${i + 1}. ${e.fact}${since(e.validAt, this.timeZone)}`).join('\n');
     const raw = await this.chat(
       CONTRADICTION_SYSTEM,
-      `New fact: ${candidate.fact}${since(candidate.validAt)}\n\nExisting facts:\n${list}`,
+      `New fact: ${candidate.fact}${since(candidate.validAt, this.timeZone)}\n\nExisting facts:\n${list}`,
       this.cfg.maxTokens ?? 8000,
     );
     return parseContradiction(parseJsonObject(raw), existing.length);
@@ -300,17 +307,27 @@ export class OpenAICompatLLM implements LLMProvider {
 
 /**
  * {"contradicts": true, "which": [1]} -> [0]. "which" is 1-based in the
- * prompt; out-of-range entries are ignored. A bare "contradicts": true
- * (no usable "which") means all of them, like the old boolean contract.
+ * prompt; entries outside 1..count are ignored. Only a "contradicts": true
+ * without any "which" means all of them, like the old boolean contract: a list
+ * naming nothing usable (a 0-based [0], an out-of-range number) closes none,
+ * since closing every candidate is the most destructive misreading.
  */
 export function parseContradiction(parsed: unknown, count: number): number[] {
   const p = (parsed ?? {}) as { contradicts?: unknown; which?: unknown };
   if (p.contradicts === false) return [];
-  const which = Array.isArray(p.which)
-    ? [...new Set(p.which.map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= count))].map((n) => n - 1)
-    : [];
-  if (which.length > 0) return which;
-  return p.contradicts === true ? Array.from({ length: count }, (_, i) => i) : [];
+  if (p.which === undefined || p.which === null) {
+    return p.contradicts === true ? Array.from({ length: count }, (_, i) => i) : [];
+  }
+  const listed = Array.isArray(p.which) ? p.which : [p.which];
+  const which = [...new Set(listed.map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= count))].map(
+    (n) => n - 1,
+  );
+  if (which.length === 0 && p.contradicts === true) {
+    console.error(
+      `[minizep] contradiction answer names no fact of 1..${count} (which=${JSON.stringify(p.which).slice(0, 80)}); closing none`,
+    );
+  }
+  return which;
 }
 
 /** The user message of an extraction call. */
@@ -337,14 +354,24 @@ export function buildExtractionPrompt(
     parts.push(
       'Active relationships (reference these exactly when the text ends one, or ends what they depend on):\n' +
         knownFacts
-          .map((f) => `- ${f.sourceName} --${f.relation}--> ${f.targetName}: ${f.fact}${since(f.validAt)}`)
+          .map((f) => `- ${f.sourceName} --${f.relation}--> ${f.targetName}: ${f.fact}${since(f.validAt, timeZone)}`)
           .join('\n'),
     );
   }
   return parts.join('\n\n');
 }
 
-const since = (d?: Date) => (d ? ` (since ${d.toISOString().slice(0, 10)})` : '');
+/** " (since 2026-03-01)": the calendar day in the zone the reference time is given in. */
+const since = (d: Date | undefined, timeZone: string) => (d ? ` (since ${calendarDay(d, timeZone)})` : '');
+
+function calendarDay(d: Date, timeZone: string): string {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' })
+      .formatToParts(d)
+      .map((p) => [p.type, p.value]),
+  );
+  return `${parts.year}-${parts.month}-${parts.day}`;
+}
 
 function localTimeZone(): string {
   return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
@@ -408,9 +435,9 @@ function toDate(v: string | null | undefined): Date | undefined {
  * MINIZEP_REQUIRE_REAL_PROVIDERS=1 in production so a missing key is fatal.
  */
 export function buildLLM(): { llm: LLMProvider; label: string } {
+  let cfg: LLMConfig;
   try {
-    const cfg = loadLLMConfigSync();
-    return { llm: new OpenAICompatLLM(cfg), label: `${cfg.model} @ ${cfg.baseUrl}` };
+    cfg = loadLLMConfigSync();
   } catch (err) {
     const message = (err as Error).message;
     if (process.env.MINIZEP_REQUIRE_REAL_PROVIDERS === '1') {
@@ -428,6 +455,9 @@ export function buildLLM(): { llm: LLMProvider; label: string } {
     );
     return { llm: new MockLLMProvider(), label: `MockLLMProvider (${message})` };
   }
+  // an LLM is configured: a bad setting (e.g. an unknown MINIZEP_TIMEZONE) is
+  // an error to fix, never a reason to fall back to the mock extractor
+  return { llm: new OpenAICompatLLM(cfg), label: `${cfg.model} @ ${cfg.baseUrl}` };
 }
 
 /** Env-only config, so it works where the developer's dotfiles do not exist. */

@@ -182,7 +182,9 @@ export class Minizep {
    * Entities a (possibly partial) name refers to, best first: exact
    * case-insensitive matches, then names starting with it (or with a word
    * starting with it), then names containing it, then the nearest names by
-   * embedding (cosine >= 0.75).
+   * embedding (cosine >= 0.75). The embedding tier costs a call to the
+   * embedding service, so it only runs when no name matches exactly: an exact
+   * lookup stays a pure store read, and fast while that service is down.
    */
   async findEntities(name: string, opts: { groupId?: string; limit?: number } = {}): Promise<EntityNode[]> {
     const limit = opts.limit ?? 10;
@@ -202,7 +204,8 @@ export class Minizep {
       .filter((r) => r.t < 3)
       .sort((a, b) => a.t - b.t || a.e.name.length - b.e.name.length)
       .map((r) => r.e);
-    if (lexical.length >= limit) return lexical.slice(0, limit);
+    const exact = lexical.length > 0 && tier(lexical[0]) === 0;
+    if (lexical.length >= limit || exact) return lexical.slice(0, limit);
 
     // semantic tier: other spellings, transliterations, abbreviations
     const rest = all.filter((e) => e.nameEmbedding?.length && !lexical.includes(e));

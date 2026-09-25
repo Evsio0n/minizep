@@ -79,6 +79,25 @@ test('query: findEntities falls back to the nearest name embeddings', async () =
   assert.deepEqual(names, ['腾讯'], 'cosine 0.6 (Alibaba) is below the 0.75 threshold');
 });
 
+test('query: an exact name match is a pure store read (no embedding call)', async () => {
+  let calls = 0;
+  const base = deterministicEmbedder();
+  const embedder: Embedder = {
+    async embed(text: string) {
+      calls++;
+      return base.embed(text);
+    },
+  };
+  const zep = build(PEOPLE, embedder);
+  for (const content of Object.keys(PEOPLE)) await zep.ingest.addEpisode({ groupId: 'g', content });
+
+  calls = 0;
+  assert.equal((await zep.factsAbout('alice chen', { groupId: 'g' })).length, 1);
+  assert.equal(calls, 0, 'no wait on the embedding service for an exact name');
+  await zep.findEntities('Alice', { groupId: 'g' });
+  assert.equal(calls, 1, 'a partial name still consults the name embeddings');
+});
+
 test('query: factsAbout lists newest facts first and honours at/asOf/includeHistorical', async () => {
   const pair = [entity('Alice'), entity('Acme', ['Organization'])];
   const zep = build({

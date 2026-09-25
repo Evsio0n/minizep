@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { Minizep } from '../src/index.js';
 import { isFactActive } from '../src/model/types.js';
 import { ScriptedLLM, deterministicEmbedder, entity, fact, invalidation } from './helpers.js';
+import type { LLMProvider } from '../src/provider/interfaces.js';
 
 /** Build a Minizep instance driven by a scripted extraction per content string. */
 function build(script: Record<string, ReturnType<typeof scenario>>, contradictions = false) {
@@ -273,22 +274,43 @@ test('temporal: leaving a company ends the facts that depended on it (dependent 
 
 test('temporal: an older statement that contradicts a newer fact is stored already closed', async () => {
   const pair = [entity('Alice'), entity('Acme', ['Organization'])];
-  const { zep } = scripted(
-    {
-      'Alice became CTO of Acme': scenario(pair, [says('Alice', 'Acme', 'HAS_TITLE', 'Alice is CTO of Acme')]),
-      'Alice is a junior engineer at Acme': scenario(pair, [says('Alice', 'Acme', 'HAS_TITLE', 'Alice is a junior engineer at Acme')]),
-    },
-    true,
-  );
-  await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice became CTO of Acme', validAt: d('2022-01-01') });
-  const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice is a junior engineer at Acme', validAt: d('2020-01-01') });
+  // a model may also judge the older statement not to end the newer one: an
+  // earlier record of the same (source, relation, target) still ends there
+  for (const contradicts of [true, false]) {
+    const { zep } = scripted(
+      {
+        'Alice became CTO of Acme': scenario(pair, [says('Alice', 'Acme', 'HAS_TITLE', 'Alice is CTO of Acme')]),
+        'Alice is a junior engineer at Acme': scenario(pair, [says('Alice', 'Acme', 'HAS_TITLE', 'Alice is a junior engineer at Acme')]),
+      },
+      contradicts,
+    );
+    await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice became CTO of Acme', validAt: d('2022-01-01') });
+    const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice is a junior engineer at Acme', validAt: d('2020-01-01') });
 
-  assert.equal(res.invalidated.length, 0, 'an older episode cannot end a newer fact');
-  const [junior] = res.facts;
-  assert.equal(junior.validAt?.getTime(), d('2020-01-01').getTime());
-  assert.equal(junior.invalidAt?.getTime(), d('2022-01-01').getTime(), 'it ends where the newer fact begins');
-  assert.deepEqual((await zep.factsAt(new Date(), 'g')).map((r) => r.fact.fact), ['Alice is CTO of Acme']);
-  assert.deepEqual((await zep.factsAt(d('2021-01-01'), 'g')).map((r) => r.fact.fact), ['Alice is a junior engineer at Acme']);
+    assert.equal(res.invalidated.length, 0, 'an older episode cannot end a newer fact');
+    const [junior] = res.facts;
+    assert.equal(junior.validAt?.getTime(), d('2020-01-01').getTime());
+    assert.equal(junior.invalidAt?.getTime(), d('2022-01-01').getTime(), `it ends where the newer fact begins (contradicts: ${contradicts})`);
+    assert.deepEqual((await zep.factsAt(new Date(), 'g')).map((r) => r.fact.fact), ['Alice is CTO of Acme']);
+    assert.deepEqual((await zep.factsAt(d('2021-01-01'), 'g')).map((r) => r.fact.fact), ['Alice is a junior engineer at Acme']);
+  }
+});
+
+test('temporal: an older, differently worded statement before an ended stint does not reopen the relation', async () => {
+  const people = [entity('Bob'), entity('Initech', ['Organization'])];
+  const { zep } = scripted({
+    'Bob works at Initech': scenario(people, [says('Bob', 'Initech', 'WORKS_AT', 'Bob works at Initech')]),
+    'Bob left Initech': scenario([], [], [invalidation('Bob', 'Initech', 'WORKS_AT', d('2025-06-01'))]),
+    'Bob is a senior developer at Initech': scenario(people, [says('Bob', 'Initech', 'WORKS_AT', 'Bob is a senior developer at Initech')]),
+  });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob works at Initech', validAt: d('2025-01-01') });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob left Initech', validAt: d('2025-07-01') });
+  // older than anything known, and not covered by the ended record
+  const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob is a senior developer at Initech', validAt: d('2024-06-01') });
+
+  assert.equal(res.facts[0].invalidAt?.getTime(), d('2025-01-01').getTime(), 'it runs into the later record');
+  assert.equal((await zep.factsAt(new Date(), 'g')).length, 0, 'Bob is not at Initech today');
+  assert.equal((await zep.factsAt(d('2024-09-01'), 'g')).length, 1);
 });
 
 test('temporal: an older mention of the same fact extends its start back instead of adding an edge', async () => {
@@ -371,6 +393,345 @@ test('temporal: paraphrases between the same endpoints reinforce one edge (embed
   assert.equal(res.reinforced.length, 1);
   assert.equal(res.facts.length, 0);
   assert.equal((await zep.store.getFacts('g')).length, 1);
+});
+
+test('temporal: regression R1 — a backfilled document worded differently does not resurrect the relation either', async () => {
+  const people = [entity('Bob'), entity('Initech', ['Organization'])];
+  // whether the model says the new wording ends the old one or not, Bob is not at Initech today
+  for (const contradicts of [false, true]) {
+    const { zep, llm } = scripted(
+      {
+        'Bob works at Initech': scenario(people, [says('Bob', 'Initech', 'WORKS_AT', 'Bob works at Initech')]),
+        'Bob left Initech in Feb 2025': scenario([], [], [invalidation('Bob', 'Initech', 'WORKS_AT', d('2025-02-01'))]),
+        // the prompt asks for detailed sentences, so a later mention rarely repeats the words
+        'Bob is a senior developer at Initech': scenario(people, [says('Bob', 'Initech', 'WORKS_AT', 'Bob is a senior developer at Initech')]),
+      },
+      contradicts,
+    );
+    await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob works at Initech', validAt: d('2024-01-15') });
+    await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob left Initech in Feb 2025', validAt: d('2025-03-01') });
+    const backfill = await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob is a senior developer at Initech', validAt: d('2024-06-01') });
+
+    assert.deepEqual(llm.contradictionCalls.map((c) => c.existing.map((e) => e.fact)), [['Bob works at Initech']], 'the ended record is checked');
+    assert.equal((await zep.factsAt(new Date(), 'g')).length, 0, `Bob is not at Initech today (contradicts: ${contradicts})`);
+    assert.equal((await zep.factsAt(d('2024-09-01'), 'g')).length, 1, 'he was in 2024');
+    const windows = (await zep.store.getFacts('g')).map((f) => [f.fact, f.validAt?.toISOString().slice(0, 10), f.invalidAt?.toISOString().slice(0, 10)]);
+    if (contradicts) {
+      // the new wording took over from the old one, within its known end
+      assert.deepEqual(windows, [
+        ['Bob works at Initech', '2024-01-15', '2024-06-01'],
+        ['Bob is a senior developer at Initech', '2024-06-01', '2025-02-01'],
+      ]);
+    } else {
+      // the same relationship, described differently: more evidence for it
+      assert.deepEqual(windows, [['Bob works at Initech', '2024-01-15', '2025-02-01']]);
+      assert.equal(backfill.reinforced.length, 1);
+    }
+  }
+});
+
+test('temporal: a statement dated only by an episode written the day a relation ended reinforces it; an explicit start there is a new stint', async () => {
+  const people = [entity('Bob'), entity('Initech', ['Organization'])];
+  const works = scenario(people, [says('Bob', 'Initech', 'WORKS_AT', 'Bob works at Initech')]);
+  const { zep, llm } = scripted(
+    {
+      'Bob works at Initech': works,
+      'Bob left Initech': scenario([], [], [invalidation('Bob', 'Initech', 'WORKS_AT', d('2025-02-01'))]),
+      'email signed "Bob, Initech"': works,
+      'email signed "Bob, senior developer, Initech"': scenario(people, [
+        says('Bob', 'Initech', 'WORKS_AT', 'Bob is a senior developer at Initech'),
+      ]),
+      'Bob rejoined Initech on 2025-02-01': scenario(people, [says('Bob', 'Initech', 'WORKS_AT', 'Bob works at Initech', { validAt: d('2025-02-01') })]),
+    },
+    true,
+  );
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob works at Initech', validAt: d('2024-01-15') });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob left Initech', validAt: d('2025-03-01') });
+
+  // date-only episode time, the day he left: still the relationship that ended,
+  // however it is worded (and it had already ended: nothing to check against)
+  for (const content of ['email signed "Bob, Initech"', 'email signed "Bob, senior developer, Initech"']) {
+    const email = await zep.ingest.addEpisode({ groupId: 'g', content, validAt: d('2025-02-01') });
+    assert.equal(email.reinforced.length, 1, content);
+    assert.equal(email.facts.length, 0);
+    assert.equal((await zep.factsAt(new Date(), 'g')).length, 0, 'not resurrected');
+  }
+  assert.equal(llm.contradictionCalls.length, 0);
+
+  // the text itself says a stint starts at that instant: windows are half-open, so it is a new one
+  const rejoined = await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob rejoined Initech on 2025-02-01', validAt: d('2025-06-01') });
+  assert.equal(rejoined.facts.length, 1);
+  const windows = (await zep.store.getFacts('g')).map((f) => [f.validAt?.toISOString().slice(0, 10), f.invalidAt?.toISOString().slice(0, 10)]);
+  assert.deepEqual(windows, [
+    ['2024-01-15', '2025-02-01'],
+    ['2025-02-01', undefined],
+  ]);
+});
+
+test('temporal: a window whose end does not follow its start is never stored open-ended', async () => {
+  const { zep } = scripted({
+    // "joined Acme in 2020 and left later that year": year precision collapses both dates
+    'Alice joined Acme in 2020 and left later that year': scenario(
+      [entity('Alice'), entity('Acme', ['Organization'])],
+      [says('Alice', 'Acme', 'WORKS_AT', 'Alice worked at Acme in 2020', { validAt: d('2020-01-01'), invalidAt: d('2020-01-01') })],
+    ),
+    // a model mixing up the two dates
+    'Alice worked at Globex': scenario(
+      [entity('Alice'), entity('Globex', ['Organization'])],
+      [says('Alice', 'Globex', 'WORKS_AT', 'Alice worked at Globex', { validAt: d('2022-06-01'), invalidAt: d('2021-01-01') })],
+    ),
+  });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice joined Acme in 2020 and left later that year', validAt: d('2024-05-01') });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice worked at Globex', validAt: d('2024-05-02') });
+
+  const [acme, globex] = await zep.store.getFacts('g');
+  assert.deepEqual([acme.validAt?.toISOString(), acme.invalidAt?.toISOString()], ['2020-01-01T00:00:00.000Z', '2020-01-02T00:00:00.000Z'], 'the same instant: that day');
+  assert.deepEqual([globex.validAt, globex.invalidAt?.toISOString()], [undefined, '2021-01-01T00:00:00.000Z'], 'inverted: the end is kept');
+  assert.equal((await zep.factsAt(new Date(), 'g')).length, 0, 'neither is current');
+  assert.equal((await zep.factsAt(d('2020-01-01T12:00:00Z'), 'g')).length, 2);
+});
+
+test('temporal: when coarse dates give the old and the new value the same start, the old one keeps a non-empty window', async () => {
+  // month precision: "in March 2024" is 2024-03-01 for both
+  const { zep } = scripted(
+    {
+      'Alice joined Acme as an engineer in March': scenario(
+        [entity('Alice'), entity('engineer', ['Role'])],
+        [says('Alice', 'engineer', 'HAS_ROLE', 'Alice joined Acme as an engineer', { validAt: d('2024-03-01') })],
+      ),
+      'Alice was promoted to senior engineer in March': scenario(
+        [entity('Alice'), entity('senior engineer', ['Role'])],
+        [says('Alice', 'senior engineer', 'HAS_ROLE', 'Alice was promoted to senior engineer', { validAt: d('2024-03-01') })],
+      ),
+    },
+    true,
+  );
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice joined Acme as an engineer in March', validAt: d('2024-03-05') });
+  const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice was promoted to senior engineer in March', validAt: d('2024-03-28') });
+
+  assert.equal(res.invalidated[0].invalidAt?.getTime(), d('2024-03-28').getTime(), 'the change had happened when it was written');
+  const roles = async (at: Date) => (await zep.factsAt(at, 'g')).map((r) => r.targetName).sort();
+  assert.deepEqual(await roles(d('2024-03-10')), ['engineer', 'senior engineer'], 'the engineer role still existed');
+  assert.deepEqual(await roles(d('2024-04-01')), ['senior engineer']);
+  for (const f of await zep.store.getFacts('g')) assert.ok(!f.invalidAt || f.invalidAt > f.validAt!, `non-empty window: ${f.fact}`);
+});
+
+test('temporal: two same-day notes (nothing later known) still leave the old value a non-empty window', async () => {
+  const { zep } = scripted(
+    {
+      'Alice lives in Paris': scenario([entity('Alice'), entity('Paris', ['Location'])], [says('Alice', 'Paris', 'LIVES_IN', 'Alice lives in Paris')]),
+      'Alice lives in Berlin': scenario([entity('Alice'), entity('Berlin', ['Location'])], [says('Alice', 'Berlin', 'LIVES_IN', 'Alice lives in Berlin')]),
+    },
+    true,
+  );
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice lives in Paris', validAt: d('2025-01-01') });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice lives in Berlin', validAt: d('2025-01-01') });
+
+  const paris = (await zep.store.getFacts('g')).find((f) => f.fact.includes('Paris'))!;
+  assert.ok(paris.invalidAt! > paris.validAt!, 'not an empty (retracted) window');
+  assert.ok((await zep.factsAt(d('2025-01-01'), 'g')).some((r) => r.targetName === 'Paris'), 'Paris is still in history');
+  assert.deepEqual((await zep.factsAt(new Date(), 'g')).map((r) => r.targetName), ['Berlin']);
+});
+
+test('temporal: an invalidation dated at the start of a fact (coarse dates) ends it when it was written', async () => {
+  const { zep } = scripted({
+    'Alice joined Acme in March': scenario(
+      [entity('Alice'), entity('Acme', ['Organization'])],
+      [says('Alice', 'Acme', 'WORKS_AT', 'Alice joined Acme', { validAt: d('2024-03-01') })],
+    ),
+    'Alice left Acme in March': scenario([], [], [invalidation('Alice', 'Acme', 'WORKS_AT', d('2024-03-01'))]),
+  });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice joined Acme in March', validAt: d('2024-03-05') });
+  const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice left Acme in March', validAt: d('2024-04-02') });
+
+  assert.equal(res.invalidated[0].invalidAt?.getTime(), d('2024-04-02').getTime());
+  assert.equal((await zep.factsAt(d('2024-03-10'), 'g')).length, 1, 'not erased from history');
+  assert.equal((await zep.factsAt(new Date(), 'g')).length, 0);
+});
+
+test('temporal: a backfilled value is checked against the value that held then, not only against the live ones', async () => {
+  const roles = (title: string) => scenario([entity('Alice'), entity(title, ['Role'])], [says('Alice', title, 'HAS_ROLE', `Alice is ${title} at Acme`)]);
+  const { zep, llm } = scripted(
+    { junior: roles('junior engineer'), cto: roles('CTO'), senior: roles('senior engineer') },
+    true,
+  );
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'junior', validAt: d('2020-01-01') });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'cto', validAt: d('2022-01-01') });
+  // an older document, ingested last: in 2021 Alice was a senior engineer
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'senior', validAt: d('2021-01-01') });
+
+  assert.deepEqual(
+    llm.contradictionCalls.at(-1)!.existing.map((e) => e.fact).sort(),
+    ['Alice is CTO at Acme', 'Alice is junior engineer at Acme'],
+    'the (already ended) role that held in 2021 is a candidate too',
+  );
+  const at = async (t: string) => (await zep.factsAt(d(t), 'g')).map((r) => r.targetName);
+  assert.deepEqual(await at('2020-06-01'), ['junior engineer']);
+  assert.deepEqual(await at('2021-06-01'), ['senior engineer'], 'exactly one role in mid-2021');
+  assert.deepEqual(await at('2023-06-01'), ['CTO']);
+});
+
+test('temporal: a fact that starts in the future is a contradiction candidate', async () => {
+  const soon = new Date(Date.now() + 30 * 86_400_000);
+  const { zep, llm } = scripted(
+    {
+      'Alice will join Globex next month': scenario(
+        [entity('Alice'), entity('Globex', ['Organization'])],
+        [says('Alice', 'Globex', 'WORKS_AT', 'Alice will join Globex', { validAt: soon })],
+      ),
+      'Alice works at Acme': scenario([entity('Alice'), entity('Acme', ['Organization'])], [says('Alice', 'Acme', 'WORKS_AT', 'Alice works at Acme')]),
+    },
+    true,
+  );
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice will join Globex next month' });
+  const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice works at Acme', validAt: d('2024-01-01') });
+
+  assert.deepEqual(llm.contradictionCalls[0].existing.map((e) => e.fact), ['Alice will join Globex']);
+  assert.equal(res.facts[0].invalidAt?.getTime(), soon.getTime(), 'Acme ends when Globex begins');
+  assert.equal(res.invalidated.length, 0, 'an older statement does not end the newer fact');
+});
+
+test('temporal: an invalidation never moves an end that is already known', async () => {
+  const { zep } = scripted({
+    'Bob works at Initech': scenario([entity('Bob'), entity('Initech', ['Organization'])], [says('Bob', 'Initech', 'WORKS_AT', 'Bob works at Initech')]),
+    'Bob left Initech in February': scenario([], [], [invalidation('Bob', 'Initech', 'WORKS_AT', d('2025-02-01'))]),
+    'Bob no longer works at Initech': scenario([], [], [invalidation('Bob', 'Initech', 'WORKS_AT', d('2025-06-01'))]),
+  });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob works at Initech', validAt: d('2024-01-15') });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob left Initech in February', validAt: d('2025-03-01') });
+  const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob no longer works at Initech', validAt: d('2025-07-01') });
+
+  assert.equal(res.invalidated.length, 0);
+  const [f] = await zep.store.getFacts('g');
+  assert.equal(f.invalidAt?.getTime(), d('2025-02-01').getTime(), 'the earlier end stands');
+});
+
+test('temporal: an earlier mention separated from a later stint by a transition is its own edge', async () => {
+  const works = (org: string, text: string) => scenario([entity('Bob'), entity(org, ['Organization'])], [says('Bob', org, 'WORKS_AT', text)]);
+  const { zep } = scripted({
+    'Bob works at Globex': works('Globex', 'Bob works at Globex'),
+    'Bob left Globex': scenario([], [], [invalidation('Bob', 'Globex', 'WORKS_AT', d('2023-12-01'))]),
+    'Bob works at Initech (2024)': works('Initech', 'Bob works at Initech'),
+    'Bob works at Initech (2022)': works('Initech', 'Bob works at Initech'),
+  });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob works at Globex', validAt: d('2023-01-01') });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob left Globex', validAt: d('2023-12-15') });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob works at Initech (2024)', validAt: d('2024-01-01') });
+  // Bob was at Initech in 2022 too, but he worked elsewhere in between
+  const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob works at Initech (2022)', validAt: d('2022-06-01') });
+
+  assert.equal(res.reinforced.length, 0);
+  const initech = (await zep.store.getFacts('g')).filter((f) => f.fact.includes('Initech'));
+  assert.deepEqual(
+    initech.map((f) => [f.validAt?.toISOString().slice(0, 10), f.invalidAt?.toISOString().slice(0, 10)]),
+    [
+      ['2024-01-01', undefined],
+      ['2022-06-01', '2024-01-01'],
+    ],
+    'the 2024 stint keeps its start',
+  );
+});
+
+test('temporal: a provider answering with the old boolean `true` ends every candidate', async () => {
+  const pair = [entity('Alice'), entity('Acme', ['Organization'])];
+  const script: Record<string, ReturnType<typeof scenario>> = {
+    one: scenario(pair, [says('Alice', 'Acme', 'HAS_TITLE', 'Alice is a senior engineer at Acme'), says('Alice', 'Acme', 'OWNS_SHARES_IN', 'Alice owns shares in Acme')]),
+    two: scenario(pair, [says('Alice', 'Acme', 'HAS_TITLE', 'Alice was promoted to CTO of Acme')]),
+  };
+  const legacy: LLMProvider = {
+    async extract(content: string) {
+      return script[content];
+    },
+    // written against the old contract: a bare boolean
+    async detectContradiction() {
+      return true as unknown as number[];
+    },
+  };
+  const zep = new Minizep({ llm: legacy, embedder: deterministicEmbedder() });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'one', validAt: d('2024-01-01') });
+  const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'two', validAt: d('2025-01-01') });
+
+  assert.deepEqual(res.invalidated.map((f) => f.name).sort(), ['HAS_TITLE', 'OWNS_SHARES_IN']);
+});
+
+test('temporal: a statement giving the end of an open relationship closes it', async () => {
+  const people = [entity('Bob'), entity('Initech', ['Organization'])];
+  for (const text of ['Bob works at Initech', 'Bob worked at Initech as a developer until February 2025']) {
+    const { zep } = scripted({
+      'Bob works at Initech': scenario(people, [says('Bob', 'Initech', 'WORKS_AT', 'Bob works at Initech')]),
+      // "worked there until February": an end and no start
+      until: scenario(people, [says('Bob', 'Initech', 'WORKS_AT', text, { invalidAt: d('2025-02-01') })]),
+    });
+    await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob works at Initech', validAt: d('2024-01-15') });
+    const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'until', validAt: d('2025-03-01') });
+
+    assert.equal(res.facts.length, 0, `no second edge (${text})`);
+    assert.equal(res.invalidated.length, 1);
+    const all = await zep.store.getFacts('g');
+    assert.equal(all.length, 1);
+    assert.equal(all[0].invalidAt?.getTime(), d('2025-02-01').getTime());
+    assert.equal((await zep.factsAt(new Date(), 'g')).length, 0);
+  }
+});
+
+test('temporal: a contradiction never extends a fact that ends before the new one starts', async () => {
+  const day = 86_400_000;
+  const vpEnds = new Date(Date.now() + 10 * day);
+  const cfoStarts = new Date(Date.now() + 20 * day);
+  const { zep } = scripted(
+    {
+      'Tom is VP Finance until the end of next week': scenario(
+        [entity('Tom'), entity('VP Finance', ['Role'])],
+        [says('Tom', 'VP Finance', 'HAS_ROLE', 'Tom is VP Finance', { validAt: d('2025-01-01'), invalidAt: vpEnds })],
+      ),
+      'Tom will be CFO': scenario([entity('Tom'), entity('CFO', ['Role'])], [says('Tom', 'CFO', 'HAS_ROLE', 'Tom will be CFO', { validAt: cfoStarts })]),
+    },
+    true,
+  );
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Tom is VP Finance until the end of next week' });
+  const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'Tom will be CFO' });
+
+  assert.equal(res.invalidated.length, 0);
+  const vp = (await zep.store.getFacts('g')).find((f) => f.name === 'HAS_ROLE' && f.fact.includes('VP'))!;
+  assert.equal(vp.invalidAt?.getTime(), vpEnds.getTime());
+});
+
+test('temporal: an invalidation of the relation the same text introduces does not erase it', async () => {
+  const { zep } = scripted({
+    // a model listing the new relation among the ones that ended
+    'Alice joined Globex': {
+      entities: [entity('Alice'), entity('Globex', ['Organization'])],
+      facts: [says('Alice', 'Globex', 'WORKS_AT', 'Alice joined Globex')],
+      invalidations: [invalidation('Alice', 'Globex', 'WORKS_AT')],
+    },
+    'Alice worked at Initech from 2020 and left last month': {
+      entities: [entity('Alice'), entity('Initech', ['Organization'])],
+      facts: [says('Alice', 'Initech', 'WORKS_AT', 'Alice worked at Initech', { validAt: d('2020-01-01') })],
+      invalidations: [invalidation('Alice', 'Initech', 'WORKS_AT', d('2026-08-01'))],
+    },
+  });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice joined Globex', validAt: d('2026-09-01') });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice worked at Initech from 2020 and left last month', validAt: d('2026-09-02') });
+
+  const byOrg = new Map((await zep.store.getFacts('g')).map((f) => [f.fact, f]));
+  assert.equal(byOrg.get('Alice joined Globex')?.invalidAt, undefined, 'a relation that begins with this text does not end with it');
+  assert.equal(byOrg.get('Alice worked at Initech')?.invalidAt?.getTime(), d('2026-08-01').getTime(), 'one that began earlier does');
+});
+
+test('temporal: a retracted fact is not revived by a later mention of the same statement', async () => {
+  const people = [entity('Alice'), entity('Acme', ['Organization'])];
+  const { zep } = scripted({
+    one: scenario(people, [says('Alice', 'Acme', 'WORKS_AT', 'Alice works at Acme')]),
+    two: scenario(people, [says('Alice', 'Acme', 'WORKS_AT', 'Alice works at Acme')]),
+  });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'one', validAt: d('2025-01-01') });
+  // retracted as a whole (it was never true): expired without a valid-time end
+  const [wrong] = await zep.store.getFacts('g');
+  await zep.store.updateFact({ ...wrong, expiredAt: new Date() });
+
+  const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'two', validAt: d('2025-06-01') });
+  assert.equal(res.reinforced.length, 0, 'the retraction stands');
+  assert.equal(res.facts.length, 1, 'the new statement is its own fact');
 });
 
 /* ---------------- bi-temporal queries ---------------- */

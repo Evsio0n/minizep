@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Minizep, OpenAICompatLLM, FallbackEmbedder, MockLLMProvider } from '../src/index.js';
-import { formatReferenceTime, parseContradiction } from '../src/provider/openai-llm.js';
+import { buildExtractionPrompt, buildLLM, formatReferenceTime, parseContradiction } from '../src/provider/openai-llm.js';
 import { HashEmbedder, type Embedder } from '../src/provider/interfaces.js';
 
 /**
@@ -98,6 +98,49 @@ test('provider: the reference time is rendered in the configured zone with its o
   assert.throws(() => new OpenAICompatLLM({ baseUrl: 'http://llm.invalid', apiKey: 'x', model: 'm', timeZone: 'Not/AZone' }));
 });
 
+test('provider: start dates are shown as calendar days of the configured zone, like the reference time', async () => {
+  // midnight in Shanghai is the previous day in UTC
+  const start = new Date('2026-03-01T00:00:00+08:00');
+  const prompt = buildExtractionPrompt(
+    'text',
+    [],
+    [{ sourceName: 'Alice', targetName: 'Acme', relation: 'WORKS_AT', fact: 'Alice works at Acme', validAt: start }],
+    { referenceTime: new Date('2026-03-02T01:00:00Z') },
+    'Asia/Shanghai',
+  );
+  assert.match(prompt, /Alice works at Acme \(since 2026-03-01\)/);
+
+  await withChatStub(
+    () => ({ contradicts: false, which: [] }),
+    async (requests) => {
+      const llm = new OpenAICompatLLM({ baseUrl: 'http://llm.invalid', apiKey: 'test', model: 'stub', timeZone: 'Asia/Shanghai', retries: 1 });
+      await llm.detectContradiction({ sourceName: 'Alice', targetName: 'Globex', fact: 'Alice joined Globex', validAt: start }, [
+        { fact: 'Alice works at Acme', validAt: start },
+      ]);
+      assert.equal(userOf(requests[0]).match(/\(since 2026-03-01\)/g)?.length, 2);
+    },
+  );
+});
+
+test('provider: buildLLM fails on an invalid MINIZEP_TIMEZONE instead of falling back to the mock extractor', () => {
+  const keys = ['MINIZEP_LLM_API_KEY', 'MINIZEP_LLM_BASE_URL', 'MINIZEP_TIMEZONE', 'MINIZEP_REQUIRE_REAL_PROVIDERS'] as const;
+  const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
+  try {
+    process.env.MINIZEP_LLM_API_KEY = 'test';
+    process.env.MINIZEP_LLM_BASE_URL = 'http://llm.invalid';
+    delete process.env.MINIZEP_REQUIRE_REAL_PROVIDERS;
+    process.env.MINIZEP_TIMEZONE = 'Asia/Shanghia';
+    assert.throws(() => buildLLM(), /invalid time zone "Asia\/Shanghia"/);
+    process.env.MINIZEP_TIMEZONE = 'Asia/Shanghai';
+    assert.ok(buildLLM().llm instanceof OpenAICompatLLM);
+  } finally {
+    for (const k of keys) {
+      if (saved[k] === undefined) delete process.env[k];
+      else process.env[k] = saved[k];
+    }
+  }
+});
+
 test('provider: facts may reference known entities that the reply did not list again', async () => {
   await withChatStub(
     () => ({
@@ -134,8 +177,13 @@ test('provider: detectContradiction uses its own prompt and returns the indexes 
 test('provider: parseContradiction tolerates the shapes models actually return', () => {
   assert.deepEqual(parseContradiction({ contradicts: true, which: [1] }, 3), [0]);
   assert.deepEqual(parseContradiction({ contradicts: true, which: ['3', 1, 1] }, 3), [2, 0]);
-  assert.deepEqual(parseContradiction({ contradicts: true, which: [0, 9] }, 3), [0, 1, 2], 'no usable index: all, like the old boolean');
-  assert.deepEqual(parseContradiction({ contradicts: true }, 2), [0, 1]);
+  assert.deepEqual(parseContradiction({ contradicts: true, which: 2 }, 3), [1], 'a bare number');
+  // an off-by-one (0-based) or out-of-range answer must not close every candidate
+  assert.deepEqual(parseContradiction({ contradicts: true, which: [0] }, 3), [], 'no usable index: none');
+  assert.deepEqual(parseContradiction({ contradicts: true, which: [0, 9] }, 3), []);
+  assert.deepEqual(parseContradiction({ contradicts: true, which: [] }, 3), []);
+  assert.deepEqual(parseContradiction({ contradicts: true }, 2), [0, 1], 'no list at all: the old boolean contract');
+  assert.deepEqual(parseContradiction({ contradicts: true, which: null }, 2), [0, 1]);
   assert.deepEqual(parseContradiction({ contradicts: false, which: [1] }, 2), []);
   assert.deepEqual(parseContradiction({ which: [2] }, 2), [1]);
   assert.deepEqual(parseContradiction({}, 2), []);

@@ -242,6 +242,7 @@ npx minizep-serve            # 缺 token 时会明确拒绝启动
 | `MINIZEP_REQUIRE_REAL_PROVIDERS=1` | 建议 | 缺少 LLM 时**直接启动失败**，而不是静默降级成 mock 抽取器 |
 | `MINIZEP_DATABASE_URL` | 建议 | 不设则用进程内内存图 |
 | `MINIZEP_EMBED_URL` / `MINIZEP_EMBED_DIMS` | 建议 | 维度必须与实际模型一致 |
+| `MINIZEP_TIMEZONE` | 可选 | 解析“昨天”“下周五”等相对时间用的 IANA 时区（如 `Asia/Shanghai`），默认取进程时区；写错时启动失败，不会降级成 mock 抽取器 |
 
 不设 `MINIZEP_REQUIRE_REAL_PROVIDERS` 时会打出醒目告警后回退到 `MockLLMProvider`
 （规则抽取器，产出的数据没有意义）—— 生产环境务必打开这个开关。

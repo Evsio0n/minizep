@@ -182,10 +182,13 @@ export class MemoryGraphStore implements GraphStore, Snapshotable {
     this.byName.clear();
     this.byEntity.clear();
     // a snapshot pins the dimension it was written with (not re-validated:
-    // an old snapshot must still load, even if it holds mixed vectors)
-    this.dims =
-      (data.facts ?? []).find((f) => f.factEmbedding?.length)?.factEmbedding?.length ??
-      (data.entities ?? []).find((n) => n.nameEmbedding?.length)?.nameEmbedding?.length;
+    // an old snapshot must still load, even if it holds mixed vectors — then
+    // the most common length wins, and the ingest pipeline re-embeds the odd
+    // records it touches)
+    this.dims = mostCommon([
+      ...(data.facts ?? []).map((f) => f.factEmbedding?.length),
+      ...(data.entities ?? []).map((n) => n.nameEmbedding?.length),
+    ]);
     for (const ep of data.episodes ?? []) this.episodes.set(ep.uuid, ep);
     for (const n of data.entities ?? []) {
       this.entities.set(n.uuid, n);
@@ -204,4 +207,13 @@ const DATE_KEYS = new Set(['validAt', 'invalidAt', 'expiredAt', 'createdAt']);
 function reviveDates(k: string, v: unknown): unknown {
   if (typeof v === 'string' && DATE_KEYS.has(k)) return new Date(v);
   return v;
+}
+
+/** The most frequent positive length (first seen wins a tie), if any. */
+function mostCommon(lengths: (number | undefined)[]): number | undefined {
+  const counts = new Map<number, number>();
+  for (const n of lengths) if (n) counts.set(n, (counts.get(n) ?? 0) + 1);
+  let best: number | undefined;
+  for (const [n, c] of counts) if (best === undefined || c > counts.get(best)!) best = n;
+  return best;
 }

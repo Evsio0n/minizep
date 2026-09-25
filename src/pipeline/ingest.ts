@@ -279,8 +279,10 @@ function validDate(d: unknown): Date | undefined {
 /**
  * Does the text name the entity? Latin-script names must match whole words
  * ("AI" is not in "said"); scripts written without spaces (CJK) match anywhere.
+ * Only Latin letters and digits continue a Latin word, so "Alice在Acme工作"
+ * names both Alice and Acme.
  */
-function mentions(text: string, name: string): boolean {
+export function mentions(text: string, name: string): boolean {
   if (name.length < 2) return false;
   if (!/^[\p{Script=Latin}\p{N}\p{P}\s]+$/u.test(name)) return text.includes(name);
   for (let i = text.indexOf(name); i !== -1; i = text.indexOf(name, i + 1)) {
@@ -289,12 +291,14 @@ function mentions(text: string, name: string): boolean {
   return false;
 }
 
-const isWordChar = (c: string | undefined) => !!c && /[\p{L}\p{N}_]/u.test(c);
+const isWordChar = (c: string | undefined) => !!c && /[\p{Script=Latin}\p{M}\p{N}_]/u.test(c);
 
 /** Does the fact's (half-open) window contain instant t? */
 function covers(f: EntityEdge, t: Date): boolean {
   return (!f.validAt || f.validAt <= t) && (!f.invalidAt || t < f.invalidAt);
 }
+
+const DAY_MS = 86_400_000;
 
 /** An empty window, or expired without any valid-time end: never true. */
 function isRetracted(f: EntityEdge): boolean {
@@ -398,6 +402,7 @@ class EpisodeRun {
     for (const plan of plans) await this.resolveFact(plan);
     for (const inv of extraction.invalidations ?? []) await this.applyInvalidation(inv);
 
+    await this.repairStaleVectors();
     await this.write();
     return {
       entities: this.touched,
@@ -551,55 +556,61 @@ class EpisodeRun {
   }
 
   /**
-   * The candidate's validity window. A start is only unknown when the text
-   * gives an end that precedes the episode ("worked there until 2023").
-   * Inconsistent explicit windows keep their start and lose the end, so an
-   * inverted window is never written.
+   * The candidate's validity window, and whether its start is only the
+   * episode's date (the text gave none). A window never ends before it starts:
+   *   - an end at or before the episode with no start given leaves the start
+   *     unknown ("worked there until 2023")
+   *   - a start and end on the same instant (dates at day, month or year
+   *     precision collapse) held on at least that day
+   *   - an end before an explicit start is contradictory: the end is kept, so
+   *     a relationship the text says is over is never taken for a current one
    */
-  private window(cand: ExtractedFact): { validAt?: Date; invalidAt?: Date } {
-    const explicitStart = validDate(cand.validAt);
-    let validAt: Date | undefined = explicitStart ?? this.episode.validAt;
-    let invalidAt = validDate(cand.invalidAt);
-    if (invalidAt && invalidAt <= validAt) {
-      if (explicitStart) invalidAt = undefined;
-      else validAt = undefined;
+  private window(cand: ExtractedFact): { validAt?: Date; invalidAt?: Date; datedByEpisode: boolean } {
+    const start = validDate(cand.validAt);
+    const end = validDate(cand.invalidAt);
+    if (!start) {
+      if (end && end <= this.episode.validAt) return { invalidAt: end, datedByEpisode: false };
+      return { validAt: this.episode.validAt, invalidAt: end, datedByEpisode: true };
     }
-    return { validAt, invalidAt };
+    if (end && end.getTime() === start.getTime()) {
+      return { validAt: start, invalidAt: new Date(start.getTime() + DAY_MS), datedByEpisode: false };
+    }
+    if (end && end < start) return { invalidAt: end, datedByEpisode: false };
+    return { validAt: start, invalidAt: end, datedByEpisode: false };
   }
 
   private async resolveFact(plan: FactPlan): Promise<void> {
     const { src, tgt, relation, text } = plan;
-    const { validAt, invalidAt } = this.window(plan.cand);
+    const { validAt, invalidAt, datedByEpisode } = this.window(plan.cand);
     const vec = this.vectors.get(text)!;
     // the instant this statement speaks about
     const t = validAt ?? new Date(invalidAt!.getTime() - 1);
 
     const pool = await this.factsOf(src);
     const sameSlot = (f: EntityEdge) => f.sourceNodeUuid === src.uuid && sameRelation(f, relation);
+    // every record of this (source, relation, target), active or historical
+    const records = pool.filter((f) => sameSlot(f) && f.targetNodeUuid === tgt.uuid && !isRetracted(f));
+    // the same statement: identical text, or a close paraphrase
+    const isSame = (f: EntityEdge) =>
+      f.fact === text || (!!f.factEmbedding?.length && cosineSimilarity(f.factEmbedding, vec) >= PARAPHRASE_COSINE);
+    // does the record hold at t? A statement dated only by its episode, made
+    // on the day the relationship ended, still describes that relationship
+    const holds = (f: EntityEdge) =>
+      covers(f, t) || (datedByEpisode && !!f.invalidAt && f.invalidAt.getTime() === t.getTime());
 
-    // a. the same statement, active or historical: identical text, or a
-    //    paraphrase between the same endpoints with the same relation
-    const paraphrases = pool.filter(
-      (f) =>
-        sameSlot(f) &&
-        f.targetNodeUuid === tgt.uuid &&
-        !isRetracted(f) &&
-        (f.fact === text ||
-          (!!f.factEmbedding?.length && cosineSimilarity(f.factEmbedding, vec) >= PARAPHRASE_COSINE)),
-    );
-    // an edge whose window already contains t just gains this episode as
-    // evidence — this is what keeps an older, backfilled document from
-    // resurrecting a relation that has since ended
-    const covering = paraphrases.find((f) => covers(f, t));
+    // a. the same statement over t just gains this episode as evidence — this
+    //    is what keeps an older, backfilled document from resurrecting a
+    //    relation that has since ended
+    const covering = records.find((f) => isSame(f) && holds(f));
     if (covering) return this.reinforce(covering, invalidAt, text);
 
-    // the nearest later record of the same statement
+    // the nearest later record of this relationship
     const later = validAt
-      ? paraphrases
+      ? records
           .filter((f) => f.validAt && f.validAt > validAt)
           .sort((a, b) => a.validAt!.getTime() - b.validAt!.getTime())[0]
       : undefined;
-    if (later && validAt && !(invalidAt && invalidAt < later.validAt!)) {
+    if (later && validAt && isSame(later) && !(invalidAt && invalidAt < later.validAt!)) {
       // evidence that `later` really began at its validAt: something in the
       // same slot ended in between (a transition)
       const transition = pool.some(
@@ -615,16 +626,26 @@ class EpisodeRun {
     // a new edge; an earlier stint must not overlap the later record
     let end = earliest(invalidAt, later?.validAt);
 
-    // b. contradictions: the live facts between the same pair, plus the live
-    //    facts in the same slot with another target (functional attributes
-    //    such as WORKS_AT, HAS_ROLE, LIVES_IN change target, not endpoints).
-    //    A closed fact with an unknown start cannot end anything.
+    // records of this relationship over t that say something else ("Bob is a
+    // senior developer at Initech" vs "Bob works at Initech"). They are
+    // contradiction candidates below, except one that ended exactly at t: it
+    // is over already, so this statement can only be more evidence for it.
+    const restated = records.filter((f) => !this.created.has(f) && !isSame(f) && holds(f));
+
+    // b. contradictions: the facts between the same pair, plus the facts in
+    //    the same slot with another target (functional attributes such as
+    //    WORKS_AT, HAS_ROLE, LIVES_IN change target, not endpoints), that are
+    //    live now or held at validAt (a backfilled statement can replace a
+    //    value that has since ended). A statement with an unknown start
+    //    cannot end anything.
+    let ended: EntityEdge[] = [];
     if (validAt) {
       const candidates = pool.filter(
         (f) =>
           !this.created.has(f) &&
-          !paraphrases.includes(f) &&
-          isLive(f, this.now) &&
+          !isRetracted(f) &&
+          !(records.includes(f) && isSame(f)) &&
+          (isLive(f, this.now) || covers(f, validAt)) &&
           (connects(f, src, tgt) || (sameSlot(f) && f.targetNodeUuid !== tgt.uuid)),
       );
       if (candidates.length > 0) {
@@ -632,15 +653,30 @@ class EpisodeRun {
           { sourceName: src.name, targetName: tgt.name, fact: text, relation, validAt },
           candidates.map((f) => ({ fact: f.fact, validAt: f.validAt, invalidAt: f.invalidAt })),
         );
-        for (const old of pickContradicted(answer, candidates)) {
-          if (old.validAt && old.validAt > validAt) {
-            // an older statement cannot end a newer fact: it ends where that one begins
-            end = earliest(end, old.validAt);
-          } else if (!old.invalidAt || old.invalidAt > validAt) {
-            this.close(old, validAt, `superseded by: ${text}`);
-          }
-        }
+        ended = pickContradicted(answer, candidates);
       }
+    }
+
+    // a record of this relationship that the statement does not end is the
+    // same relationship described differently: it gains the evidence (and an
+    // end the text states) instead of a second edge. For a record that has
+    // ended, a new open edge would bring the relation back.
+    const same = restated.find((f) => !ended.includes(f) && (f.invalidAt || invalidAt));
+    if (same) return this.reinforce(same, invalidAt, text);
+
+    // (`ended` is only filled when validAt is known)
+    for (const old of ended) {
+      if (old.validAt && old.validAt > validAt!) {
+        // an older statement cannot end a newer fact: it ends where that one begins
+        end = earliest(end, old.validAt);
+        continue;
+      }
+      const at = this.endFor(old, validAt!);
+      if (!at) continue;
+      // the new fact takes over from the old one, so it cannot outlive the
+      // old one's known end either
+      end = earliest(end, old.invalidAt);
+      this.close(old, at, `superseded by: ${text}`);
     }
 
     const edge: EntityEdge = {
@@ -675,8 +711,26 @@ class EpisodeRun {
   }
 
   /**
+   * Where a change dated `at` ends fact f, or undefined when it cannot: f
+   * started after `at` (an older statement cannot end a newer fact) or had
+   * already ended by then. When f starts exactly at `at` — coarse dates
+   * collide: "March 2024" is 2024-03-01 for both the old and the new value — it
+   * ends when this episode was written (the change had happened by then), or
+   * failing that right after its start, so it keeps a non-empty window and
+   * stays in history instead of vanishing.
+   */
+  private endFor(f: EntityEdge, at: Date): Date | undefined {
+    if (f.invalidAt && f.invalidAt <= at) return undefined;
+    if (!f.validAt || f.validAt < at) return at;
+    if (f.validAt > at) return undefined;
+    const written = this.episode.validAt;
+    const end = written > f.validAt ? written : new Date(f.validAt.getTime() + 1);
+    return f.invalidAt && f.invalidAt <= end ? undefined : end;
+  }
+
+  /**
    * End a fact at `at` (real-world time; never the wall clock). Callers make
-   * sure the fact did not start after `at`. A fact created by this same
+   * sure the window stays non-empty (see endFor). A fact created by this same
    * episode simply carries its end; an existing one is also expired now.
    */
   private close(f: EntityEdge, at: Date, reason: string): void {
@@ -705,13 +759,12 @@ class EpisodeRun {
     const relation = inv.relation ? normaliseRelation(inv.relation) : undefined;
     for (const f of await this.factsOf(src)) {
       if (!connects(f, src, tgt) || (relation && !sameRelation(f, relation)) || isRetracted(f)) continue;
-      // only a fact that was still true at `end` can end there: an older
-      // episode cannot end a newer fact, and an earlier end is kept
-      if (f.validAt && f.validAt > end) continue;
-      if (f.invalidAt && f.invalidAt <= end) continue;
       // an edge this text just introduced ends only if it began strictly before
       if (this.created.has(f) && !(f.validAt && f.validAt < end)) continue;
-      this.close(f, end, inv.reason ?? this.episode.content.slice(0, 120));
+      // only a fact that was still true at `end` can end there: an older
+      // episode cannot end a newer fact, and an earlier end is kept
+      const at = this.endFor(f, end);
+      if (at) this.close(f, at, inv.reason ?? this.episode.content.slice(0, 120));
     }
   }
 
@@ -727,11 +780,36 @@ class EpisodeRun {
     return v;
   }
 
+  /**
+   * Records written under another embedding model (or by the old hash
+   * fallback) carry vectors of another length, which the store would reject
+   * halfway through the writes, on this and every retry. Whatever this episode
+   * rewrites is re-embedded with the current model instead, which also
+   * repairs the index one record at a time.
+   */
+  private async repairStaleVectors(): Promise<void> {
+    const dims = this.store.embeddingDims ?? this.vectors.values().next().value?.length;
+    if (!dims) return;
+    for (const node of this.dirtyEntities) {
+      if (node.nameEmbedding?.length && node.nameEmbedding.length !== dims) {
+        node.nameEmbedding = await this.vector(node.name);
+      }
+    }
+    for (const f of this.dirtyFacts) {
+      if (f.factEmbedding?.length && f.factEmbedding.length !== dims) f.factEmbedding = await this.vector(f.fact);
+    }
+  }
+
   private async write(): Promise<void> {
     // a wrong-length vector would be rejected halfway through the writes;
     // refuse the whole episode up front instead
+    const outgoing = [
+      ...[...this.dirtyEntities].map((n) => n.nameEmbedding),
+      ...[...this.created, ...this.dirtyFacts].map((f) => f.factEmbedding),
+    ];
     let dims = this.store.embeddingDims;
-    for (const v of this.vectors.values()) {
+    for (const v of outgoing) {
+      if (!v?.length) continue;
       dims ??= v.length;
       if (v.length !== dims) {
         throw new Error(
