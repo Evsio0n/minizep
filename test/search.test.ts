@@ -93,6 +93,56 @@ test('search: historical facts stay out of default results but are reachable', a
   assert.equal(withHistory.length, 1);
 });
 
+test('search: a fact one hop from the entity the query names outranks a nearer unrelated vector match', async () => {
+  // Neither fact shares a word with the query; by vector alone the unrelated
+  // one comes first. The query names Nova, Nova uses Orion, and the other
+  // fact is about Orion: graph proximity puts it ahead.
+  const vectors: Record<string, number[]> = {
+    'where is nova deployed': [1, 1, 0, 0],
+    'Nova uses the Orion service': [1, 0, 0, 0],
+    'Orion runs on gpu7': [0.3, 1, 1, 0],
+    'Vega runs on Lyra': [0.5, 1, 0.5, 0],
+  };
+  const embedder: Embedder = { embed: async (text) => vectors[text] ?? [0, 0, 0, 1] };
+  const edges: Record<string, [string, string, string]> = {
+    'Nova uses the Orion service': ['Nova', 'Orion', 'USES'],
+    'Orion runs on gpu7': ['Orion', 'gpu7', 'RUNS_ON'],
+    'Vega runs on Lyra': ['Vega', 'Lyra', 'RUNS_ON'],
+  };
+  const llm = new ScriptedLLM((content) => {
+    const [source, target, relation] = edges[content];
+    return {
+      entities: [entity(source, ['Product']), entity(target, ['Product'])],
+      facts: [{ ...fact(source, target, relation), fact: content }],
+      invalidations: [],
+    };
+  });
+  const zep = new Minizep({ llm, embedder });
+  for (const content of Object.keys(edges)) await zep.ingest.addEpisode({ groupId: 'g', content });
+
+  const hits = await zep.searchFacts('where is nova deployed', { groupId: 'g' });
+  assert.deepEqual(
+    hits.map((h) => h.fact.fact),
+    ['Nova uses the Orion service', 'Orion runs on gpu7', 'Vega runs on Lyra'],
+  );
+});
+
+test('search: a query about nothing in the graph returns no facts (relevance cut)', async () => {
+  const llm = new ScriptedLLM(() => ({
+    entities: [entity('Alice'), entity('Acme', ['Organization'])],
+    facts: [fact('Alice', 'Acme', 'WORKS_AT')],
+    invalidations: [],
+  }));
+  const zep = new Minizep({ llm, embedder: new HashEmbedder(64) });
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'alice works at acme' });
+
+  // no shared word, no entity named, a low cosine: an empty answer is the right one
+  assert.deepEqual(await zep.searchFacts('weather forecast for paris', { groupId: 'g' }), []);
+  // the cut is what removed the fact: without the floor it comes back
+  const unfiltered = await zep.searchFacts('weather forecast for paris', { groupId: 'g', minCosine: -1 });
+  assert.equal(unfiltered.length, 1);
+});
+
 test('bm25: rarer terms weigh more and matching docs outrank non-matching ones', () => {
   const docs = [
     { id: 'a', text: 'Alice works at Acme' },
