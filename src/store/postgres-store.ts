@@ -481,6 +481,14 @@ export class PostgresStore implements GraphStore {
     return r.rows.map(rowToFact);
   }
 
+  async listGroups(): Promise<string[]> {
+    await this.ensure();
+    const r = await this.db.query(
+      'SELECT group_id FROM episodes UNION SELECT group_id FROM entities ORDER BY group_id',
+    );
+    return r.rows.map((row: { group_id: string }) => row.group_id);
+  }
+
   async getFactsBetween(a: UUID, b: UUID): Promise<EntityEdge[]> {
     // same contract as the in-memory backend: only currently-true facts
     return (await this.getFactsForEntity(a)).filter(

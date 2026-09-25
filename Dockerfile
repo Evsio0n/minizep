@@ -13,6 +13,8 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
+# the web UI page (served on /ui only when MINIZEP_UI_GROUPS is set)
+COPY ui ./ui
 
 # run unprivileged
 USER node

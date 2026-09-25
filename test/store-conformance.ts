@@ -213,6 +213,12 @@ export function runStoreConformance(name: string, makeStore: () => Promise<Graph
       assert.equal((await s.getFacts('g2')).length, 0);
       assert.equal((await s.getEntities('g1')).length, 2);
       assert.equal((await s.getEntities('g2')).length, 1);
+
+      // groups holding an entity or only an episode, each once
+      await s.addEpisode(episode({ groupId: 'g3' }));
+      await s.addEpisode(episode({ groupId: 'g3' }));
+      assert.ok(s.listGroups, 'both backends list their groups');
+      assert.deepEqual((await s.listGroups()).sort(), ['g1', 'g2', 'g3']);
     });
   });
 

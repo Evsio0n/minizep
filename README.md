@@ -59,8 +59,8 @@ sudo deploy/install.sh --user minizep     # 启用、重启、等 /health 就绪
 ```
 
 - [docs/DEPLOY.md](docs/DEPLOY.md)：拓扑、只在 VPN 上暴露、token 与 group、轮换 token、接入 MCP 客户端、
-  REST 快速上手、测试数据库、升级与回滚、embedding 换班
-- [docs/API.md](docs/API.md)：MCP 工具与 REST（`/v1`）接口
+  REST 快速上手、Web UI、测试数据库、升级与回滚、embedding 换班
+- [docs/API.md](docs/API.md)：MCP 工具与 REST（`/v1`）接口，以及可选的 Web UI（`/ui`，`MINIZEP_UI_GROUPS`）
 
 ## 生产化状态
 
