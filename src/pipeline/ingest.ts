@@ -93,7 +93,7 @@ export interface IngestOptions {
 
 /** same endpoints + relation and fact texts at least this similar: one fact */
 const PARAPHRASE_COSINE = 0.92;
-/** one reply, same source and target, fact texts at least this similar: one fact whatever the relation */
+/** one reply, same source and target, other relation, same dates, fact texts at least this similar: one fact */
 const REPEAT_COSINE = 0.95;
 /** known entities sent to the LLM beyond the ones named in the text */
 const MAX_RANKED_ENTITIES = 50;
@@ -114,9 +114,9 @@ const RANKING_TEXT_CHARS = 2000;
  *      value (an address, a number) that no fact uses is not an entity
  *   4. every embedding (entity names + facts) is computed
  *   5. edge resolution, still in memory:
- *        a. paraphrase dedupe: within the reply (one statement under several
- *           relations), then against the graph, including out-of-order
- *           (older) episodes
+ *        a. paraphrase dedupe: within the reply (one statement with the same
+ *           dates under several relations), then against the graph,
+ *           including out-of-order (older) episodes
  *        b. contradiction detection -> temporal supersede
  *           (old fact gets invalidAt/expiredAt, NEVER deleted)
  *        c. explicit invalidations -> close the named relation, no new edge
@@ -365,6 +365,8 @@ const sameRelation = (f: EntityEdge, relation: string) => normaliseRelation(f.na
 function validDate(d: unknown): Date | undefined {
   return d instanceof Date && !Number.isNaN(d.getTime()) ? d : undefined;
 }
+
+const sameInstant = (a: Date | undefined, b: Date | undefined) => a?.getTime() === b?.getTime();
 
 /**
  * Does the text name the entity? Latin-script names must match whole words
@@ -673,18 +675,23 @@ class EpisodeRun {
   /**
    * One reply can state the same thing twice between the same pair, under two
    * relation names. Between the same source and target, an identical or
-   * near-identical sentence is one fact: the first one is kept.
+   * near-identical sentence under another relation with the same validity
+   * window is one fact: the first one is kept. Sentences that differ in their
+   * dates ("from 2015 to 2017", "from 2019 to 2021") stay separate facts, and
+   * repeats under the same relation are left to resolveFact, which merges
+   * them in time.
    */
   private collapseRepeats(plans: FactPlan[]): FactPlan[] {
     const kept: FactPlan[] = [];
     for (const plan of plans) {
       const vec = this.vectors.get(plan.text)!;
-      const repeat = kept.some(
-        (k) =>
-          k.src === plan.src &&
-          k.tgt === plan.tgt &&
-          (k.text === plan.text || cosineSimilarity(this.vectors.get(k.text)!, vec) >= REPEAT_COSINE),
-      );
+      const { validAt, invalidAt } = this.window(plan.cand);
+      const repeat = kept.some((k) => {
+        if (k.src !== plan.src || k.tgt !== plan.tgt || k.relation === plan.relation) return false;
+        const w = this.window(k.cand);
+        if (!sameInstant(w.validAt, validAt) || !sameInstant(w.invalidAt, invalidAt)) return false;
+        return k.text === plan.text || cosineSimilarity(this.vectors.get(k.text)!, vec) >= REPEAT_COSINE;
+      });
       if (!repeat) kept.push(plan);
     }
     return kept;
