@@ -159,6 +159,20 @@ test('security: /health says only ok; details need a token', async () => {
     assert.equal(status.body.store, 'memory');
     assert.equal(status.body.llm, 'mock');
     assert.deepEqual(status.body.groups, ['teamA']);
+    assert.deepEqual(status.body.episodes, { failed: 0, given_up: 0 });
+
+    // the UI polls it: the store counts, no episode is loaded, and a store that
+    // cannot count leaves the counts out instead of failing the status
+    const store = srv.zep.store;
+    store.getEpisodes = async () => {
+      throw new Error('a status must not load the episodes');
+    };
+    assert.deepEqual((await api(srv.base, 'GET', '/v1/status', { token: 'tokA' })).body.episodes, { failed: 0, given_up: 0 });
+    store.countFailedEpisodes = async () => {
+      throw new Error('database down');
+    };
+    const down = await api(srv.base, 'GET', '/v1/status', { token: 'tokA' });
+    assert.deepEqual([down.status, down.body.episodes], [200, null]);
   } finally {
     await srv.close();
   }
@@ -524,6 +538,11 @@ for (const backend of backends) {
       assert.equal(forgot.isError, false, forgot.text);
       assert.deepEqual(forgot.structured.retracted.map((f: { uuid: string }) => f.uuid), [copy.uuid]);
       assert.match(forgot.text, /retracted \(it was their only evidence\): 1/);
+      // it created the entities and wrote their summaries: those go too, and it says so
+      assert.match(forgot.text, /summaries put back .*: 4\n/);
+      assert.match(forgot.text, /\n  Alice — \(no summary\)\n/);
+      const orphans = /left with no fact and no summary \(kept\): 4\n  (.*)$/.exec(forgot.text)?.[1];
+      assert.deepEqual(orphans?.split(', ').sort(), ['Acme', 'Alice', 'Bob', 'Cyan']);
       assert.deepEqual((await call(a.client, 'facts_at', { timestamp: '2024-07-01T00:00:00Z' })).structured.facts, []);
       const believed2 = await call(a.client, 'facts_at', { timestamp: '2024-07-01T00:00:00Z', as_of: beforeForget });
       assert.ok(believed2.structured.facts.some((f: { uuid: string }) => f.uuid === copy.uuid));
@@ -683,6 +702,14 @@ test('mcp: the server explains itself: instructions, the guide of docs/MEMORY-GU
     const read = await call(a.client, 'memory_guide');
     assert.equal(read.isError, false);
     assert.equal(read.text, guide);
+
+    // a text-only client still finds the note behind a fact: its id ends the fact's line
+    const added = await call(a.client, 'add_memory', { content: 'Alice works at Acme.' });
+    const found = await call(a.client, 'search_facts', { query: 'Alice Acme' });
+    const ep = (added.structured.episode_uuid as string).slice(0, 8);
+    assert.match(found.text, new RegExp(`--WORKS_AT--> Acme \\|.*\\| ep ${ep}$`, 'm'));
+    assert.match(guide, /\| ep [0-9a-f]{8}\n/, 'the guide shows it');
+    assert.match((await call(a.client, 'get_episode', { id: ep })).text, /Alice works at Acme\./);
     const rest = await fetch(`${srv.base}/v1/guide`, { headers: { authorization: 'Bearer tokA' } });
     assert.equal(rest.status, 200);
     assert.match(rest.headers.get('content-type') ?? '', /^text\/markdown/);

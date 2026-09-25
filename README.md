@@ -231,7 +231,7 @@ npm run build
 | `get_episode` / `memory_job_status` | 一条 episode 的全文及其产生的事实 / 异步摄取任务的状态 |
 | `invalidate_fact` | 手工结束或撤回一条事实（历史保留，`as_of` 仍能看到修正前的认知） |
 | `reopen_fact` | 撤销一次错误的结束或撤回：旧记录撤回并留在历史里，插入一份从原起点起有效的更正副本 |
-| `forget_episode` | 整条笔记是错的或不该记：只由它支撑的事实撤回，其他事实去掉这条证据，被它关闭的事实重新打开；原文保留，状态为 `forgotten` |
+| `forget_episode` | 整条笔记是错的或不该记：只由它支撑的事实撤回，其他事实去掉这条证据，被它关闭的事实重新打开，它最后写的实体摘要改回；原文保留，状态为 `forgotten`。事实行末尾的 `ep` 就是笔记的 id |
 | `retry_failed` | 原地重试抽取失败的 episode（包括后台重试已放弃的） |
 | `graph_stats` | 图谱统计（含失败、已放弃重试、已遗忘的 episode 数） |
 | `memory_guide` | 使用方法全文（写什么、怎么写、怎么查、什么情况用哪个工具修），即 [docs/MEMORY-GUIDE.md](docs/MEMORY-GUIDE.md) |
@@ -301,9 +301,12 @@ llama-server -m qwen3-embed-q8.gguf --embedding --pooling last -ngl 99 --port 11
 11. **没有第二个实体的事件只进摘要** —— 抽取规则要求事实的两端都是具名实体，所以"作业 X 被取消了"这类
     只涉及一个实体的事件会写进该实体的摘要，而不是一条事实；`search_facts` 查不到它，要用
     `facts_about`/实体摘要或原始 episode 才能看到。
-12. **`forget_episode` 只撤回事实层面的贡献** —— 实体和摘要不改，被它提前的事实起点不改回；它关闭的事实
-    一律重新打开，即使另一条 episode 也说了同一个变更（这时用 `invalidate_fact` 再结束一次）。
-    记录"由哪条 episode 关闭"之前的旧数据没有这个标记，只在结果的 `unmarked_closures` 里列出，不自动重开。
+12. **`forget_episode` 撤回不到所有痕迹** —— 被它提前的事实起点不改回，实体标签不改；它最后写的实体摘要
+    改回写之前的样子，但之后被别的 episode 改写过的摘要不动，而且只记一层：一条 episode 的摘要改回后，
+    更早那条的就改不回了。它关闭的事实重新打开时，单值关系（如 `WORKS_AT`）里后来仍成立的值从哪天开始，
+    副本就在哪天结束；另一条 episode 也说了同一个变更时，这个事实保持关闭，列在结果的 `still_closed` 里。
+    记录"由哪条 episode 关闭/创建/写摘要"之前的旧数据没有这些标记：关闭只在 `unmarked_closures` 里列出，
+    不自动重开，摘要不改回。
 
 ## 打包与部署
 

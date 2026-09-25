@@ -5,12 +5,14 @@ extracts **facts** between named things, each with the time it was true, and kee
 A fact looks like this in tool results:
 
 ```
-[7f3e9a10] Dana Wu --MEMBER_OF--> Orion | "Dana Wu joined the Orion project as tech lead" | since 2026-03-02
+[7f3e9a10] Dana Wu --MEMBER_OF--> Orion | "Dana Wu joined the Orion project as tech lead" | since 2026-03-02 | ep 3c9d0b21
 ```
 
-The bracketed prefix is the fact's id. The end of the line says when it held: `since <start>`,
+The bracketed prefix is the fact's id. Then comes when it held: `since <start>`,
 `true <start> → <end>`, `since <start>, until <end>`, `from <future start>`, `still true` (start
-unknown) or `retracted` (never true).
+unknown) or `retracted` (never true). The line ends with `ep` and the ids of the notes (episodes)
+it came from, oldest first, `+N` when there are more: the ids `get_episode` and `forget_episode`
+take.
 
 ## The rule: a memory, not ground truth
 
@@ -87,7 +89,8 @@ Not like this:
   at one instant.
 - An event with only one named thing ("the Atlas project was cancelled") is kept in that entity's
   summary, not as a fact: `list_entities` with its name shows it.
-- `list_episodes` and `get_episode` show the notes themselves, the evidence behind every fact.
+- `get_episode` with the `ep` id of a fact shows the note behind it; `list_episodes` lists the
+  newest notes.
 
 ## Repairs: situation → tool
 
@@ -97,7 +100,7 @@ Not like this:
 | Something has ended | `invalidate_fact` with `at` = when it ended |
 | A stored fact was never true | `invalidate_fact` with `retract: true` |
 | A fact was closed by mistake | `reopen_fact` |
-| A whole note was wrong or not wanted | `forget_episode` (read it with `get_episode` first) |
+| A whole note was wrong or not wanted | `forget_episode` with the `ep` id (read it with `get_episode` first) |
 | Writes failed | `memory_job_status` / `graph_stats` (failed count), then `retry_failed` once the cause is fixed |
 
 - News (a new value, a new event): `add_memory`. Something simply ended and you have the fact's
@@ -105,8 +108,12 @@ Not like this:
 - Every repair takes a `reason`, which is kept. Nothing is deleted: `as_of` before a repair still
   shows what was believed.
 - `forget_episode` retracts the facts only that note supported, removes it from the evidence of
-  the others and reopens the facts it closed. Its text is kept as `forgotten`; the same text sent
-  again later is processed afresh.
+  the others, reopens the facts it closed and puts back the entity summaries it wrote last. For
+  something that has one value at a time (employer, role, home, manager), a reopened fact ends
+  where a later value that other notes support begins, and stays closed when another note states
+  the same change. A summary another note rewrote since, and labels, stay as they are: check the
+  entities it names with `list_entities`. Its text is kept as `forgotten`; the same text sent again
+  later is processed afresh.
 - The server retries failed episodes in the background a few times; `graph_stats` counts the ones
   it gave up on, which only `retry_failed` takes.
 
@@ -115,20 +122,21 @@ Not like this:
 When a result contradicts the user, or looks wrong:
 
 1. Find the fact and its id (`search_facts`, `facts_about`) and, if needed, the note behind it
-   (`get_episode`).
+   (`get_episode` with the `ep` id at the end of the fact's line).
 2. Decide: did the world change (`add_memory` with the change and its date, or `invalidate_fact`
    with `at` when something simply ended), or was the memory wrong (retract, reopen, forget)?
 3. Repair it in the same turn, then answer.
 
-Examples, with the memory holding `[7f3e9a10] Dana Wu --MEMBER_OF--> Orion | … | since 2026-03-02`:
+Examples, with the memory holding `[7f3e9a10] Dana Wu --MEMBER_OF--> Orion | … | since 2026-03-02 | ep 3c9d0b21`:
 
 - "Dana left Orion at the end of April." Something ended:
   `invalidate_fact {"uuid": "7f3e9a10", "at": "2026-05-01T00:00:00Z", "reason": "user: Dana left Orion end of April"}`.
 - "That was never Dana, it was Dan Wu." The memory was wrong:
   `invalidate_fact {"uuid": "7f3e9a10", "retract": true, "reason": "user: it was Dan Wu"}`, then
   `add_memory` "Dan Wu became tech lead of the Orion project on 2026-03-02." with that `valid_at`.
-- "That note was a draft plan, none of it happened." The whole note was wrong: `forget_episode`
-  with its id (from `list_episodes` or `get_episode`) and the reason.
+- "That note was a draft plan, none of it happened." The whole note was wrong: read it with
+  `get_episode {"id": "3c9d0b21"}`, then
+  `forget_episode {"id": "3c9d0b21", "reason": "user: a draft plan, none of it happened"}`.
 
 After a batch of async writes, glance at `graph_stats`: failed episodes mean the memory is missing
 what they said.

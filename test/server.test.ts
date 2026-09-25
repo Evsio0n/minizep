@@ -15,7 +15,7 @@ import {
 import { JobQueue } from '../src/jobs/queue.js';
 import { SessionRegistry } from '../src/server/sessions.js';
 import { listenWithRetry, parseHosts } from '../src/server/listen.js';
-import { validity } from '../src/server/tools.js';
+import { formatFact, validity } from '../src/server/tools.js';
 import type { FactRow } from '../src/server/service.js';
 import { FilePersistence, Minizep } from '../src/index.js';
 
@@ -234,7 +234,7 @@ const row = (valid_at: string | null, invalid_at: string | null, expired_at: str
   score: null,
 });
 
-test('validity: shows when a fact started, ended or is scheduled to end', () => {
+test('validity: shows when a fact started, ended or is scheduled to end; a fact line names its notes', () => {
   const now = Date.parse('2025-01-01T00:00:00Z');
   assert.equal(validity(row('2024-03-01T00:00:00.000Z', null), now), 'since 2024-03-01');
   assert.equal(validity(row(null, null), now), 'still true');
@@ -246,6 +246,14 @@ test('validity: shows when a fact started, ended or is scheduled to end', () => 
   assert.equal(validity(row('2025-03-01T00:00:00.000Z', null), now), 'from 2025-03-01');
   assert.equal(validity(row('2024-03-01T00:00:00.000Z', '2024-03-01T00:00:00.000Z'), now), 'retracted');
   assert.equal(validity(row(null, null, '2024-05-01T00:00:00.000Z'), now), 'retracted');
+
+  // the notes it came from, oldest first: the ids get_episode and forget_episode take
+  const line = (episodes: string[]) =>
+    formatFact({ ...row('2024-03-01T00:00:00.000Z', '2024-06-01T00:00:00.000Z'), episodes });
+  assert.equal(line([]), '[00000000] Alice --WORKS_AT--> Acme | "Alice works at Acme" | true 2024-03-01 → 2024-06-01');
+  assert.match(line(['6eeafffa-0000-4000-8000-000000000000']), /→ 2024-06-01 \| ep 6eeafffa$/);
+  const five = ['a', 'b', 'c', 'd', 'e'].map((c) => `${c.repeat(8)}-0000-4000-8000-000000000000`);
+  assert.match(line(five), /\| ep aaaaaaaa, bbbbbbbb, cccccccc \+2$/);
 });
 
 /* ---------------- snapshot writes ---------------- */

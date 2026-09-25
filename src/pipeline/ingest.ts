@@ -97,14 +97,28 @@ export interface ForgetResult {
   retracted: EntityEdge[];
   /** facts with other evidence: it was taken off their evidence list */
   unlinked: EntityEdge[];
-  /** facts it had closed: `fact` is the reopened copy, `previous` the closed record, now retracted */
+  /**
+   * facts it had closed: `fact` is the reopened copy, `previous` the closed
+   * record, now retracted. A later value that still holds in a one-value slot
+   * (see forgetEpisode) ends the copy where it begins.
+   */
   reopened: { fact: EntityEdge; previous: EntityEdge }[];
+  /**
+   * facts it had closed that stay closed: a value other episodes still
+   * support takes over at or before the end it gave them (another episode
+   * states the same change); left for the caller to check (reopen_fact)
+   */
+  stillClosed: EntityEdge[];
   /**
    * facts closed without a closedByEpisode marker (by a build before it
    * existed) at the moment this episode's facts were written: probably closed
    * by it, left as they are for the caller to check (reopen_fact)
    */
   unmarked: EntityEdge[];
+  /** entities whose summary it wrote last: the summary it replaced is back */
+  summaries: EntityNode[];
+  /** entities it created that are left with no fact and no summary (they are kept) */
+  orphaned: EntityNode[];
 }
 
 /** Which failed episodes retryFailed takes. */
@@ -366,12 +380,20 @@ export class IngestPipeline {
    *     with retract does (as_of before now still finds it);
    *   - a fact with other evidence only loses it from its evidence list;
    *   - a fact it closed (attributes.closedByEpisode) is reopened, as
-   *     reopenFact does: its end before the episode, if it had one, comes back;
+   *     reopenFact does: its end before the episode, if it had one, comes
+   *     back, unless another value of a one-value slot that still holds
+   *     begins earlier (see nextValue): the copy ends there, and when that
+   *     value begins at or before the end the episode gave, the fact stays
+   *     closed (`stillClosed`);
+   *   - a summary it wrote last (attributes.summaryByEpisode) is put back to
+   *     the one it replaced; the entities it created that are left with no
+   *     fact and no summary are reported (`orphaned`), not deleted;
    *   - the episode becomes 'forgotten' and keeps its text; the same text sent
    *     again later is a new episode, processed afresh.
-   * Entities and their summaries are left as they are. Closures written
-   * before the marker existed are only reported (`unmarked`). A pending or
-   * failed episode can be forgotten too: it is then never processed.
+   * Labels, and a summary another episode rewrote since, are left as they
+   * are. Closures written before the marker existed are only reported
+   * (`unmarked`). A pending or failed episode can be forgotten too: it is
+   * then never processed.
    */
   async forgetEpisode(episodeUuid: string, input: ForgetEpisodeInput): Promise<ForgetResult> {
     return this.locks.run(input.groupId, () =>
@@ -390,7 +412,19 @@ export class IngestPipeline {
           facts.filter((f) => f.episodes[0] === id && !f.attributes?.reopenedFrom).map((f) => f.createdAt.getTime()),
         );
 
-        const result: ForgetResult = { episode: found, retracted: [], unlinked: [], reopened: [], unmarked: [] };
+        // the facts it was the only evidence for, which are retracted below
+        const onlyHere = (f: EntityEdge) => f.episodes.length > 0 && f.episodes.every((e) => e === id);
+
+        const result: ForgetResult = {
+          episode: found,
+          retracted: [],
+          unlinked: [],
+          reopened: [],
+          stillClosed: [],
+          unmarked: [],
+          summaries: [],
+          orphaned: [],
+        };
         for (const f of facts) {
           const cited = f.episodes.includes(id);
           const others = f.episodes.filter((e) => e !== id);
@@ -405,18 +439,51 @@ export class IngestPipeline {
             });
             continue;
           }
+          const kept = cited ? { ...f, episodes: others } : f;
           if (closed && f.attributes?.closedByEpisode === id) {
-            const end = validDate(new Date(String(f.attributes.previousEnd ?? '')));
-            const pair = reopened({ ...f, episodes: others }, why, end && (!f.validAt || end > f.validAt) ? end : undefined, now);
+            const before = validDate(new Date(String(f.attributes.previousEnd ?? '')));
+            // a value that still holds after this forget, later in the same
+            // one-value slot, ends the fact where it begins
+            const next = nextValue(f, facts, onlyHere);
+            const end = earliest(before && (!f.validAt || before > f.validAt) ? before : undefined, next);
+            if (next && end && f.invalidAt && end <= f.invalidAt) {
+              // it takes over where the episode ended the fact (another
+              // episode states the same change): the end stands on its own
+              if (cited) result.unlinked.push(kept);
+              result.stillClosed.push(kept);
+              continue;
+            }
+            const pair = reopened(kept, why, end, now);
             // the closed record keeps the evidence it had
             result.reopened.push({ ...pair, previous: { ...pair.previous, episodes: f.episodes } });
             continue;
           }
-          const kept = cited ? { ...f, episodes: others } : f;
           if (cited) result.unlinked.push(kept);
           if (closed && f.attributes?.closedByEpisode === undefined && written.has(f.expiredAt?.getTime() ?? NaN)) {
             result.unmarked.push(kept);
           }
+        }
+
+        // what it wrote into entities: the summary it replaced comes back, and
+        // an entity it created with nothing left on it is reported
+        const gone = new Set(result.retracted.map((f) => f.uuid));
+        const used = new Set(
+          facts
+            .filter((f) => !isRetracted(f) && !gone.has(f.uuid))
+            .flatMap((f) => [f.sourceNodeUuid, f.targetNodeUuid]),
+        );
+        for (const e of await this.store.getEntities(input.groupId)) {
+          let node = e;
+          if (e.attributes?.summaryByEpisode === id) {
+            const { summaryByEpisode: _by, previousSummary, ...rest } = e.attributes;
+            // (an entity it created had no summary before)
+            const before = typeof previousSummary === 'string' ? previousSummary : '';
+            if (before !== e.summary) {
+              node = { ...e, summary: before, attributes: rest };
+              result.summaries.push(node);
+            }
+          }
+          if (e.attributes?.createdByEpisode === id && !node.summary && !used.has(e.uuid)) result.orphaned.push(node);
         }
         result.episode = { ...found, status: 'forgotten', error: reason };
 
@@ -426,6 +493,7 @@ export class IngestPipeline {
             await store.updateFact(r.previous);
             await store.addFact(r.fact);
           }
+          for (const e of result.summaries) await store.upsertEntity(e);
           await store.addEpisode(result.episode);
         };
         if (this.store.transaction) await this.store.transaction(commit);
@@ -623,6 +691,30 @@ const CLOSURE_ATTRIBUTES = new Set([
 function withoutEpisodeClosure(attributes: Record<string, unknown> | undefined): Record<string, unknown> {
   const { closedByEpisode: _episode, previousEnd: _end, ...rest } = attributes ?? {};
   return rest;
+}
+
+/**
+ * Where a later value of f's slot (its source and relation), one that is not
+ * retracted and not `gone`, begins: the earliest such start. Only for a slot
+ * that holds one value at a time (SINGLE_VALUED, or either fact flagged
+ * replacesPrevious): other relations hold several records at once, of the
+ * same target too. A value starting at f's own start counts when it was
+ * written after f; with f's start unknown, one starting at or after f's end.
+ */
+function nextValue(f: EntityEdge, facts: EntityEdge[], gone: (g: EntityEdge) => boolean): Date | undefined {
+  const relation = normaliseRelation(f.name);
+  let next: Date | undefined;
+  for (const g of facts) {
+    if (g === f || !g.validAt || g.sourceNodeUuid !== f.sourceNodeUuid || !sameRelation(g, relation)) continue;
+    if (isRetracted(g) || gone(g)) continue;
+    const oneValue =
+      SINGLE_VALUED.has(relation) || f.attributes?.replacesPrevious === true || g.attributes?.replacesPrevious === true;
+    const after = f.validAt
+      ? g.validAt > f.validAt || (sameInstant(g.validAt, f.validAt) && g.createdAt > f.createdAt)
+      : !!f.invalidAt && g.validAt >= f.invalidAt;
+    if (oneValue && after) next = earliest(next, g.validAt);
+  }
+  return next;
 }
 
 /**
@@ -888,8 +980,17 @@ class EpisodeRun {
       // merge: keep node, extend labels, and only replace the summary with a
       // real one (an empty candidate summary must never erase what we know)
       const merged = [...new Set([...node.labels, ...labels])];
-      const changed = merged.length !== node.labels.length || (!!summary && summary !== node.summary) || !node.nameEmbedding?.length;
+      const rewrites = !!summary && summary !== node.summary;
+      // the episode that stated the summary last owns it, with the one it
+      // replaced, for forgetEpisode to put back; restating another episode's
+      // summary word for word takes it over, so forgetting that one keeps it
+      const owner = node.attributes?.summaryByEpisode;
+      const takesOver = !!summary && owner !== this.episode.uuid && (rewrites || owner !== undefined);
+      const changed = merged.length !== node.labels.length || takesOver || rewrites || !node.nameEmbedding?.length;
       node.labels = merged;
+      if (takesOver) {
+        node.attributes = { ...node.attributes, summaryByEpisode: this.episode.uuid, previousSummary: node.summary };
+      }
       if (summary) node.summary = summary;
       if (changed) this.dirtyEntities.add(node);
     } else {
@@ -903,7 +1004,11 @@ class EpisodeRun {
         name,
         labels: [...labels],
         summary,
-        attributes: {},
+        // for forgetEpisode: which episode created it and wrote its summary
+        attributes: {
+          createdByEpisode: this.episode.uuid,
+          ...(summary ? { summaryByEpisode: this.episode.uuid } : {}),
+        },
         createdAt: this.now,
       };
       this.byName.set(name.toLowerCase(), node);

@@ -641,7 +641,9 @@ export class MemoryService {
   /**
    * Take back what one episode contributed (see IngestPipeline.forgetEpisode):
    * the facts only it supported are retracted, the others lose it as
-   * evidence, the facts it closed are reopened, and it becomes 'forgotten'.
+   * evidence, the facts it closed are reopened unless a later value still
+   * holds, the summaries it wrote last are put back, and it becomes
+   * 'forgotten'.
    */
   async forgetEpisode(p: Principal, input: ForgetEpisodeInputShape) {
     const group = resolveGroup(p, input.group_id);
@@ -649,10 +651,15 @@ export class MemoryService {
     try {
       const r = await this.zep.ingest.forgetEpisode(episode.uuid, { groupId: group, reason: input.reason });
       this.persistence?.schedule(this.zep);
-      const [retracted, unlinked, unmarked, copies, previous] = await Promise.all(
-        [r.retracted, r.unlinked, r.unmarked, r.reopened.map((x) => x.fact), r.reopened.map((x) => x.previous)].map(
-          (edges) => this.withNames(edges),
-        ),
+      const [retracted, unlinked, stillClosed, unmarked, copies, previous] = await Promise.all(
+        [
+          r.retracted,
+          r.unlinked,
+          r.stillClosed,
+          r.unmarked,
+          r.reopened.map((x) => x.fact),
+          r.reopened.map((x) => x.previous),
+        ].map((edges) => this.withNames(edges)),
       );
       return {
         group_id: group,
@@ -660,7 +667,10 @@ export class MemoryService {
         retracted,
         unlinked,
         reopened: copies.map((fact, i) => ({ fact, previous: previous[i] })),
+        still_closed: stillClosed,
         unmarked_closures: unmarked,
+        restored_summaries: r.summaries.map(entityRow),
+        orphaned_entities: r.orphaned.map(entityRow),
       };
     } catch (err) {
       throw asServiceError(err);
@@ -885,11 +895,6 @@ export class MemoryService {
 
   /** Server details for an authenticated caller (what /health used to expose). */
   async status(p: Principal) {
-    const store = this.zep.store;
-    const episodes =
-      p.groups === 'any'
-        ? await store.getEpisodes()
-        : (await Promise.all(p.groups.map((g) => store.getEpisodes(g)))).flat();
     return {
       ok: true,
       store: this.storeLabel,
@@ -898,10 +903,32 @@ export class MemoryService {
       groups: p.groups === 'any' ? null : [...p.groups],
       jobs: this.jobs.statsFor((j) => this.canSee(p, j)),
       /** over the caller's groups: failed episodes, and those the background retry gave up on */
-      episodes: { failed: episodes.filter((e) => e.status === 'failed').length, given_up: this.givenUp(episodes) },
+      episodes: await this.failures(p),
       /** the zone relative dates in ingested text are resolved in */
       timezone: displayTimeZone(),
     };
+  }
+
+  /**
+   * Failed and given-up episodes over the caller's groups, counted by the
+   * store (the web UI polls /v1/status: no episode is loaded for it). Null
+   * when the store cannot answer: the status still does.
+   */
+  private async failures(p: Principal): Promise<{ failed: number; given_up: number } | null> {
+    const store = this.zep.store;
+    const groups = p.groups === 'any' ? undefined : [...p.groups];
+    try {
+      if (store.countFailedEpisodes) {
+        const counts = await store.countFailedEpisodes(groups, this.retryMax);
+        return { failed: counts.failed, given_up: counts.givenUp };
+      }
+      const episodes = groups
+        ? (await Promise.all(groups.map((g) => store.getEpisodes(g)))).flat()
+        : await store.getEpisodes();
+      return { failed: episodes.filter((e) => e.status === 'failed').length, given_up: this.givenUp(episodes) };
+    } catch {
+      return null;
+    }
   }
 
   /* ---------- lifecycle ---------- */

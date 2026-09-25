@@ -58,7 +58,7 @@ export function runStoreConformance(name: string, makeStore: () => Promise<Graph
     ...over,
   });
 
-  test(`[${name}] episodes round-trip every field, including failure state`, async () => {
+  test(`[${name}] episodes round-trip every field, including failure state, which the store counts`, async () => {
     await withStore(async (s) => {
       const ep = episode({ status: 'failed', error: 'llm down', contentHash: 'abc123', attempts: 2 });
       await s.addEpisode(ep);
@@ -74,6 +74,13 @@ export function runStoreConformance(name: string, makeStore: () => Promise<Graph
       assert.equal(got.attempts, 2);
       assert.equal(got.validAt.getTime(), ep.validAt.getTime());
       assert.equal(got.createdAt.getTime(), ep.createdAt.getTime());
+
+      // what /v1/status reports, without loading any episode
+      await s.addEpisode(episode({ groupId: 'g2', status: 'failed', attempts: 1 }));
+      await s.addEpisode(episode({ groupId: 'g2', status: 'processed', attempts: 5 }));
+      assert.deepEqual(await s.countFailedEpisodes?.(['g1'], 2), { failed: 1, givenUp: 1 });
+      assert.deepEqual(await s.countFailedEpisodes?.(['g2', 'g3'], 2), { failed: 1, givenUp: 0 });
+      assert.deepEqual(await s.countFailedEpisodes?.(undefined, 1), { failed: 2, givenUp: 2 });
     });
   });
 

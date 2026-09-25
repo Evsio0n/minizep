@@ -823,7 +823,7 @@ test('ingest: a fact an episode closed by mistake is reopened; as_of before the 
   assert.deepEqual(await usesAt('2026-01-01'), []);
 });
 
-test('ingest: forgetting an episode retracts what only it said, unlinks it elsewhere and reopens what it closed, keeping the history', async () => {
+test('ingest: forgetting an episode retracts what only it said, unlinks it elsewhere, reopens what it closed up to a later value and puts back the summaries it wrote, keeping the history', async () => {
   const at = (iso: string) => new Date(iso);
   const says: Record<string, ExtractionResult> = {
     hired: scenario([entity('Alice'), entity('Acme', ['Organization'])], [
@@ -836,6 +836,16 @@ test('ingest: forgetting an episode retracts what only it said, unlinks it elsew
     moved: scenario([entity('Alice'), entity('Globex', ['Organization'])], [
       fact('Alice', 'Globex', 'WORKS_AT', { validAt: at('2025-03-01') }),
     ]),
+    // another note stating the same change
+    restated: scenario([entity('Alice'), entity('Globex', ['Organization'])], [
+      fact('Alice', 'Globex', 'WORKS_AT', { validAt: at('2025-03-01') }),
+    ]),
+    joined: scenario([entity('Alice'), entity('Initech', ['Organization'])], [
+      fact('Alice', 'Initech', 'WORKS_AT', { validAt: at('2025-06-01') }),
+    ]),
+    // one named thing: only its summary changes
+    kicked: scenario([{ name: 'Atlas', labels: ['Project'], summary: 'The Atlas project started in 2025' }]),
+    cancelled: scenario([{ name: 'Atlas', labels: ['Project'], summary: 'The Atlas project was cancelled' }]),
   };
   // the judge ends whatever it is shown: here the Acme contract, when Globex comes in
   const llm = new ScriptedLLM((content) => says[content.split(' ')[0]] ?? EMPTY, true);
@@ -843,8 +853,8 @@ test('ingest: forgetting an episode retracts what only it said, unlinks it elsew
   const add = (content: string, validAt: string, groupId = 'g') =>
     zep.ingest.addEpisode({ groupId, content, validAt: at(validAt) });
   const tick = () => new Promise((r) => setTimeout(r, 2));
-  const factsAt = async (when: string, asOf?: Date) =>
-    (await zep.factsAt(at(when), 'g', { asOf })).map((r) => r.fact.uuid).sort();
+  const factsAt = async (when: string, asOf?: Date, groupId = 'g') =>
+    (await zep.factsAt(at(when), groupId, { asOf })).map((r) => r.fact.uuid).sort();
 
   const [acme] = (await add('hired at Acme', '2025-01-01')).facts;
   const liked = await add('likes Cyan, still at Acme', '2025-02-01');
@@ -863,7 +873,11 @@ test('ingest: forgetting an episode retracts what only it said, unlinks it elsew
   const first = await zep.ingest.forgetEpisode(liked.episode.uuid, { groupId: 'g', reason: 'not about this Alice' });
   assert.deepEqual(first.retracted.map((f) => f.uuid), [cyan.uuid]);
   assert.deepEqual(first.unlinked.map((f) => [f.uuid, f.episodes]), [[acme.uuid, [acme.episodes[0]]]]);
-  assert.deepEqual([first.reopened, first.unmarked], [[], []]);
+  assert.deepEqual([first.reopened, first.stillClosed, first.unmarked], [[], [], []]);
+  // Cyan came with that note: its summary goes, and nothing is left on it
+  assert.deepEqual(first.summaries.map((e) => [e.name, e.summary]), [['Cyan', '']]);
+  assert.deepEqual(first.orphaned.map((e) => e.name), ['Cyan']);
+  assert.equal((await zep.store.findEntityByName('g', 'Alice'))?.summary, 'Alice summary', 'restated, not written by it');
   assert.equal(factView((await zep.store.getFact(cyan.uuid))!)?.state, 'retracted');
   assert.match(String((await zep.store.getFact(cyan.uuid))!.attributes.invalidatedBy), /^forgotten episode \w{8}: not about this Alice$/);
   assert.deepEqual(await factsAt('2025-02-15'), [acme.uuid]);
@@ -911,4 +925,38 @@ test('ingest: forgetting an episode retracts what only it said, unlinks it elsew
   await zep.store.updateFact({ ...(await zep.store.getFact(old.uuid))!, attributes: unmarked });
   const legacy = await zep.ingest.forgetEpisode(change.episode.uuid, { groupId: 'h', reason: 'x' });
   assert.deepEqual([legacy.reopened, legacy.unmarked.map((f) => f.uuid)], [[], [old.uuid]]);
+
+  // a later value that still holds ends what is reopened: Initech took over from Globex, and
+  // forgetting the move to Globex must not leave Alice with two employers
+  const [acme2] = (await add('hired at Acme', '2025-01-01', 'k')).facts;
+  const toGlobex = await add('moved to Globex', '2025-03-01', 'k');
+  const [initech] = (await add('joined Initech', '2025-06-01', 'k')).facts;
+  const bounded = await zep.ingest.forgetEpisode(toGlobex.episode.uuid, { groupId: 'k', reason: 'x' });
+  assert.deepEqual(bounded.retracted.map((f) => f.uuid), [toGlobex.facts[0].uuid]);
+  const [{ fact: acmeCopy, previous: acmeClosed }] = bounded.reopened;
+  assert.equal(acmeClosed.uuid, acme2.uuid);
+  assert.deepEqual([acmeCopy.validAt, acmeCopy.invalidAt], [at('2025-01-01'), at('2025-06-01')]);
+  assert.deepEqual(await factsAt('2025-04-01', undefined, 'k'), [acmeCopy.uuid]);
+  assert.deepEqual(await factsAt('2026-01-01', undefined, 'k'), [initech.uuid]);
+
+  // when another note states the same change, the fact it closed stays closed
+  const [acme3] = (await add('hired at Acme', '2025-01-01', 'm')).facts;
+  const toGlobex3 = await add('moved to Globex', '2025-03-01', 'm');
+  const [globex3] = toGlobex3.facts;
+  assert.deepEqual((await add('restated Globex', '2025-06-01', 'm')).reinforced.map((f) => f.uuid), [globex3.uuid]);
+  const restated = await zep.ingest.forgetEpisode(toGlobex3.episode.uuid, { groupId: 'm', reason: 'x' });
+  assert.deepEqual([restated.retracted, restated.reopened], [[], []]);
+  assert.deepEqual(restated.stillClosed.map((f) => f.uuid), [acme3.uuid]);
+  assert.deepEqual(restated.unlinked.map((f) => f.uuid), [globex3.uuid]);
+  assert.deepEqual(restated.summaries, [], 'Globex\'s summary was restated by the other note');
+  assert.deepEqual(await factsAt('2026-01-01', undefined, 'm'), [globex3.uuid]);
+
+  // a note that only changed a summary is taken back there
+  await add('kicked off Atlas', '2025-01-01', 'n');
+  const cancelled = await add('cancelled Atlas', '2025-05-01', 'n');
+  assert.equal((await zep.store.findEntityByName('n', 'Atlas'))?.summary, 'The Atlas project was cancelled');
+  const undone = await zep.ingest.forgetEpisode(cancelled.episode.uuid, { groupId: 'n', reason: 'never cancelled' });
+  assert.deepEqual(undone.summaries.map((e) => [e.name, e.summary]), [['Atlas', 'The Atlas project started in 2025']]);
+  assert.deepEqual(undone.orphaned, [], 'it did not create Atlas');
+  assert.equal((await zep.store.findEntityByName('n', 'Atlas'))?.summary, 'The Atlas project started in 2025');
 });

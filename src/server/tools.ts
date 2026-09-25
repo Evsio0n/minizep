@@ -72,8 +72,21 @@ export function validity(r: FactRow, now = Date.now()): string {
   return r.valid_at ? `since ${start}` : 'still true';
 }
 
+/** Episodes shown by id on a fact line; the others are counted. */
+const SHOWN_EPISODES = 3;
+
+/**
+ * One fact as a line: `[id] source --RELATION--> target | "text" | validity`,
+ * then `| ep <id>, <id> +N` naming the notes it came from (oldest first), the
+ * ids get_episode and forget_episode take: a client that shows the model only
+ * this text has no other way to them.
+ */
 export function formatFact(r: FactRow): string {
-  return `[${r.uuid.slice(0, 8)}] ${r.source} --${r.relation}--> ${r.target} | "${r.fact}" | ${validity(r)}`;
+  const line = `[${r.uuid.slice(0, 8)}] ${r.source} --${r.relation}--> ${r.target} | "${r.fact}" | ${validity(r)}`;
+  if (!r.episodes.length) return line;
+  const more = r.episodes.length - SHOWN_EPISODES;
+  const ids = r.episodes.slice(0, SHOWN_EPISODES).map((e) => e.slice(0, 8)).join(', ');
+  return `${line} | ep ${ids}${more > 0 ? ` +${more}` : ''}`;
 }
 
 function ok(text: string, structured?: object) {
@@ -302,8 +315,8 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get episode',
       description:
-        'Use to read one note in full (uuid or 8+ character prefix) with its status and the facts it ' +
-        'produced or reinforced, e.g. before forget_episode. See memory_guide.',
+        'Use to read one note in full (uuid or 8+ character prefix: the ep ids at the end of a fact line) ' +
+        'with its status and the facts it produced or reinforced, e.g. before forget_episode. See memory_guide.',
       inputSchema: shapes.episode,
       annotations: READ_ONLY,
     },
@@ -451,9 +464,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Forget episode',
       description:
-        'Use when a whole note was wrong or not wanted: the facts only it supported are retracted, the ' +
-        'others lose it as evidence, the facts it closed are reopened, and it is kept as "forgotten". ' +
-        'History is kept (as_of). See memory_guide.',
+        'Use when a whole note was wrong or not wanted (its id: the ep part of a fact line): the facts only ' +
+        'it supported are retracted, the others lose it as evidence, the facts it closed are reopened unless ' +
+        'a later value still holds, the entity summaries it wrote last are put back, and it is kept as ' +
+        '"forgotten". History is kept (as_of). See memory_guide.',
       inputSchema: shapes.forgetEpisode,
       annotations: CORRECTS,
     },
@@ -470,6 +484,24 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           `reopened (it had closed them): ${r.reopened.length}`,
           ...list(r.reopened.map((x) => x.fact)),
         ];
+        if (r.still_closed.length) {
+          lines.push(
+            `still closed (it had closed them, but a later value other notes support takes over there; ` +
+              `reopen_fact if that is wrong): ${r.still_closed.length}`,
+            ...list(r.still_closed),
+          );
+        }
+        lines.push(
+          `entity summaries put back as they were before it (one another note rewrote since stays): ` +
+            `${r.restored_summaries.length}`,
+          ...r.restored_summaries.map((e) => `  ${e.name} — ${e.summary || '(no summary)'}`),
+        );
+        if (r.orphaned_entities.length) {
+          lines.push(
+            `entities it created, left with no fact and no summary (kept): ${r.orphaned_entities.length}`,
+            `  ${r.orphaned_entities.map((e) => e.name).join(', ')}`,
+          );
+        }
         if (r.unmarked_closures.length) {
           lines.push(
             `closed when this episode was processed, by a build that did not record it (check, then reopen_fact ` +

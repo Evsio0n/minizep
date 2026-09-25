@@ -343,6 +343,12 @@ test('rest: invalidate and reopen a fact, forget an episode, with 400/404/409 fo
     assert.equal(forgot.status, 200);
     assert.deepEqual(forgot.body.retracted.map((f: { uuid: string }) => f.uuid), [reopened.body.fact.uuid]);
     assert.deepEqual([forgot.body.unlinked, forgot.body.reopened, forgot.body.unmarked_closures], [[], [], []]);
+    assert.deepEqual(forgot.body.still_closed, []);
+    // it created both entities and wrote their summaries: those go, and nothing is left on them
+    const names = (rows: { name: string }[]) => rows.map((e) => e.name).sort();
+    assert.deepEqual(forgot.body.restored_summaries.map((e: { summary: string }) => e.summary), ['', '']);
+    assert.deepEqual(names(forgot.body.restored_summaries), ['Acme', 'Alice']);
+    assert.deepEqual(names(forgot.body.orphaned_entities), ['Acme', 'Alice']);
     assert.deepEqual([forgot.body.episode.status, forgot.body.episode.error], ['forgotten', 'another Alice']);
     assert.equal((await api(srv.base, 'POST', forget, { ...tok, body: { reason: 'again' } })).status, 409, 'already forgotten');
 

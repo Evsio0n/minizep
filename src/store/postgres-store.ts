@@ -1,7 +1,7 @@
 import { Pool, type PoolClient } from 'pg';
 import { isFactActive, type EntityEdge, type EntityNode, type EpisodicNode, type UUID } from '../model/types.js';
 import { bm25TermScores, tokenize, type Bm25Corpus } from '../search/retrieval.js';
-import type { GraphStore } from './memory-store.js';
+import type { FailedEpisodes, GraphStore } from './memory-store.js';
 
 export interface PostgresStoreOptions {
   connectionString?: string;
@@ -390,6 +390,18 @@ export class PostgresStore implements GraphStore {
   async removeEpisode(uuid: UUID): Promise<void> {
     await this.ensure();
     await this.db.query('DELETE FROM episodes WHERE uuid=$1', [uuid]);
+  }
+
+  async countFailedEpisodes(groupIds: string[] | undefined, maxAttempts: number): Promise<FailedEpisodes> {
+    await this.ensure();
+    const counts =
+      'SELECT count(*) AS failed, count(*) FILTER (WHERE attempts >= $1) AS given_up ' +
+      "FROM episodes WHERE status = 'failed'";
+    const r = groupIds
+      ? await this.db.query(`${counts} AND group_id = ANY($2::text[])`, [maxAttempts, groupIds])
+      : await this.db.query(counts, [maxAttempts]);
+    // count(*) is a bigint, which node-postgres returns as a string
+    return { failed: Number(r.rows[0]?.failed ?? 0), givenUp: Number(r.rows[0]?.given_up ?? 0) };
   }
 
   /* ---------------- entities ---------------- */

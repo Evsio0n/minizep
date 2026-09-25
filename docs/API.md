@@ -441,13 +441,25 @@ Nothing is deleted, and `as_of` before the call still shows what was believed:
   (`attributes.closedByEpisode`); closures written by an older build carry no such marker and are
   only reported in `unmarked_closures` (facts closed when this episode's facts were written), for
   the caller to check and reopen;
+- for a relation that holds one value at a time (`WORKS_AT`, `HAS_ROLE`, `HAS_TITLE`, `LIVES_IN`,
+  `REPORTS_TO`, or a fact flagged `replacesPrevious`), a later value of the same source and
+  relation that still holds (starting after the fact, not retracted by this call) ends the
+  reopened copy where it begins. When that value begins at or before the end the episode gave the
+  fact (another episode states the same change), the fact **stays closed** and is listed in
+  `still_closed`; reopen it by hand if that is wrong;
+- an entity **summary** the episode wrote last is **put back** to the one it replaced (listed in
+  `restored_summaries`; an entity the episode created gets an empty summary). Ingestion records
+  on an entity which episode created it (`attributes.createdByEpisode`) and which one last stated
+  its summary, with the summary it replaced (`summaryByEpisode`, `previousSummary`); an episode
+  that restates the summary word for word takes it over. Entities the episode created that are
+  left with no fact and no summary are listed in `orphaned_entities` and kept;
 - the episode gets status `forgotten` and keeps its text; the same text sent again is a new
   episode, processed afresh. A `pending` or `failed` episode can be forgotten too: it is then never
   processed.
 
-Entities and their summaries are left as they are, and a start the episode moved earlier stays
-where it is. A fact it closed is reopened even when another episode restates the change that
-closed it; end it again with [invalidate](#post-v1factsuuidinvalidate) if so.
+Labels, a summary another episode rewrote since, entities written before these markers existed,
+and a start the episode moved earlier are left as they are. Only the last change to a summary is
+kept, so after one episode's summary is put back, an earlier episode's cannot be.
 
 ```json
 { "group_id": "teamA",
@@ -457,7 +469,10 @@ closed it; end it again with [invalidate](#post-v1factsuuidinvalidate) if so.
   "unlinked": [],
   "reopened": [ { "fact": { "uuid": "5c0de1f2-…", "…": "the reopened copy" },
                   "previous": { "uuid": "0a4e2b17-…", "…": "the closed record, now retracted" } } ],
-  "unmarked_closures": [] }
+  "still_closed": [],
+  "unmarked_closures": [],
+  "restored_summaries": [ { "name": "Alice", "summary": "the summary before this episode", "…": "entity row" } ],
+  "orphaned_entities": [] }
 ```
 
 404 when the group has no such episode, 409 when it is already forgotten.
@@ -556,6 +571,8 @@ Server details for an authenticated caller (what `/health` used to expose):
 
 `groups` is `null` in anonymous mode (any group). `jobs`, `episodes` (over the token's groups) and
 `sessions` count only what this token can see; `episodes.given_up` as in [stats](#get-v1stats).
+The store counts the episodes (no episode is loaded, the web UI polls this every 10 s);
+`episodes` is `null` when the store cannot answer, and the rest of the status is still returned.
 `timezone` is the zone relative dates in ingested text are resolved in (`MINIZEP_TIMEZONE`, else
 the server's zone).
 
@@ -630,12 +647,14 @@ rendering and the same JSON as the REST API in `structuredContent`.
 error (`isError: true`) whose text says the episode is stored for retry. Fact lines look like
 
 ```
-[160f2ea7] Alice --WORKS_AT--> Acme | "Alice works at Acme" | since 2024-03-01
+[160f2ea7] Alice --WORKS_AT--> Acme | "Alice works at Acme" | since 2024-03-01 | ep 6eeafffa
 ```
 
 with the validity rendered as `since <start>`, `true <start> → <end>`, `since <start>, until
 <future end>`, `from <future start>`, `still true` (start unknown) or `retracted`. The bracketed
-prefix is what `invalidate_fact` and `reopen_fact` take.
+prefix is what `invalidate_fact` and `reopen_fact` take. `ep` lists the first three `episodes`
+(8-character prefixes, oldest first, `+N` for the rest): what `get_episode` and `forget_episode`
+take, and the only way to them for a client that shows the model the text alone.
 
 `minizep-proxy` forwards the instructions, the tool list and its annotations as they are.
 
