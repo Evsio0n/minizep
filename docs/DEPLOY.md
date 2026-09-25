@@ -238,6 +238,10 @@ claude mcp add --transport http minizep http://100.64.0.10:8787/mcp \
 
 两种方式看到的是同一份图谱，能用哪些 group 由 token 决定。
 
+客户端里不用另写使用说明：服务在 `initialize` 时返回 `instructions`（先查再答、一件事一次
+`add_memory`、用户纠正时当场修），模型可以调用 `memory_guide` 读完整方法，即
+[MEMORY-GUIDE.md](MEMORY-GUIDE.md)（REST：`GET /v1/guide`）。代理原样转发这两样。
+
 ## 7. REST 快速上手
 
 所有 `/v1` 接口用同一个 bearer token，JSON 进 JSON 出；出错时返回 `{"error": "..."}` 和相应的状态码，
@@ -410,8 +414,9 @@ Slurm 作业有时限，"常驻"靠 `infra/embedding/supervise.sh` 提前换班�
 没有可用后端的时候：
 
 - 网关返回 503 和 JSON 错误；
-- 摄取不会退化成别的向量：episode 标记为 failed 并保留原文（"stored for retry"），后端恢复后用 MCP 工具
-  `retry_failed` 原地重试；
+- 摄取不会退化成别的向量：episode 标记为 failed 并保留原文（"stored for retry"）。服务每
+  `MINIZEP_RETRY_INTERVAL_MS`（默认 10 分钟）在后台重试，每条最多 `MINIZEP_RETRY_MAX` 次（默认 3）；
+  超过次数的在 `graph_stats` / `GET /v1/status` 里记为 given up，后端恢复后用 MCP 工具 `retry_failed` 原地重试；
 - 检索退化成只用关键词，结果标记 `degraded: true`。
 
 检查网关：`curl -sS http://100.64.0.20:11435/health`。
@@ -427,6 +432,7 @@ Slurm 作业有时限，"常驻"靠 `infra/embedding/supervise.sh` 提前换班�
 | `status=203/EXEC` | node 路径失效（例如 nvm 换了版本）；`install.sh --node <新路径>` |
 | `refusing to start without authentication` | `MINIZEP_TOKENS` 为空 |
 | `fatal: no extraction LLM configured` | 设 `MINIZEP_LLM_BASE_URL` + `MINIZEP_LLM_API_KEY`，或检查服务账号的 `~/.openclaw/openclaw.json` |
+| 每条摄取都失败，错误是 `LLM HTTP 400` 且提到 `response_format` | 这个端点不支持 JSON mode：设 `MINIZEP_LLM_JSON_MODE=0`，重启后 `retry_failed` |
 | 日志里 `store=memory + snapshot` | 没设 `MINIZEP_DATABASE_URL`（沙箱里读不到 `/var/tmp` 下的 url 文件） |
 | 日志里反复出现 `EADDRNOTAVAIL` | `MINIZEP_HOST` 里的 VPN 地址不对，或者 VPN 没起来：`tailscale ip -4` |
 | `install.sh` 等 `/health` 超时 | 看它打印的 `systemctl status` 和日志；数据库连不上时服务会按退避不断重启 |

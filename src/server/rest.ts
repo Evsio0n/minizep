@@ -127,7 +127,12 @@ type Handler = (args: {
   params: string[];
   url: URL;
   body: () => Promise<unknown>;
-}) => Promise<{ status?: number; body: unknown }>;
+}) => Promise<{
+  status?: number;
+  body: unknown;
+  /** send `body`, a string, as is with this content type instead of as JSON */
+  type?: string;
+}>;
 
 interface Route {
   method: 'GET' | 'POST';
@@ -203,6 +208,14 @@ function routes(ctx: RestContext): Route[] {
       },
     },
     {
+      method: 'POST',
+      pattern: /^\/v1\/facts\/([^/]+)\/reopen$/,
+      handler: async ({ p, params, body }) => {
+        const input = { ...asObject(await body()), uuid: pathParam(params[0]) };
+        return { body: await s.reopenFact(p, parse(shapes.reopenFact, input)) };
+      },
+    },
+    {
       method: 'GET',
       pattern: /^\/v1\/episodes$/,
       handler: async ({ p, url }) => ({ body: await s.episodes(p, parse(shapes.episodes, queryOf(url))) }),
@@ -211,6 +224,14 @@ function routes(ctx: RestContext): Route[] {
       method: 'POST',
       pattern: /^\/v1\/episodes\/retry-failed$/,
       handler: async ({ p, body }) => ({ body: await s.retryFailed(p, parse(shapes.group, asObject(await body()))) }),
+    },
+    {
+      method: 'POST',
+      pattern: /^\/v1\/episodes\/([^/]+)\/forget$/,
+      handler: async ({ p, params, body }) => {
+        const input = { ...asObject(await body()), id: pathParam(params[0]) };
+        return { body: await s.forgetEpisode(p, parse(shapes.forgetEpisode, input)) };
+      },
     },
     {
       method: 'GET',
@@ -226,8 +247,13 @@ function routes(ctx: RestContext): Route[] {
     },
     {
       method: 'GET',
+      pattern: /^\/v1\/guide$/,
+      handler: async () => ({ body: await s.guide(), type: 'text/markdown; charset=utf-8' }),
+    },
+    {
+      method: 'GET',
       pattern: /^\/v1\/status$/,
-      handler: async ({ p }) => ({ body: { ...s.status(p), sessions: ctx.sessionsOf?.(p) ?? 0 } }),
+      handler: async ({ p }) => ({ body: { ...(await s.status(p)), sessions: ctx.sessionsOf?.(p) ?? 0 } }),
     },
   ];
 }
@@ -246,13 +272,15 @@ export function createRestHandler(ctx: RestContext) {
         const allow = [...new Set(matching.map((r) => r.route.method))].join(', ');
         return sendJson(res, 405, { error: `method not allowed (use ${allow})` }, { allow });
       }
-      const { status = 200, body } = await hit.route.handler({
+      const { status = 200, body, type } = await hit.route.handler({
         p,
         params: hit.m!.slice(1),
         url,
         body: () => readJsonBody(req),
       });
-      sendJson(res, status, body);
+      if (type === undefined) return sendJson(res, status, body);
+      res.writeHead(status, { 'content-type': type, 'x-content-type-options': 'nosniff' });
+      res.end(String(body));
     } catch (err) {
       const status = (err as { status?: unknown }).status;
       if (typeof status === 'number' && status >= 400 && status < 600) {

@@ -42,6 +42,7 @@
     "dist",
     "infra",
     "ui",
+    "docs/MEMORY-GUIDE.md",
     "README.md"
   ],
   "scripts": {

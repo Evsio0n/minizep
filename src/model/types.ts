@@ -30,12 +30,20 @@ export interface EpisodicNode {
    * Lifecycle: saved as 'pending', then 'processed' once every entity and
    * fact it produced has been written, or 'failed' when anything went wrong
    * (the raw text is the most valuable thing we hold, so it is kept and can be
-   * retried in place). Undefined only on records written by older versions,
-   * which never persisted the final status; they are treated as processed.
+   * retried in place). 'forgotten': what it contributed was taken back by
+   * forgetEpisode; the text is kept for audit and never processed again.
+   * Undefined only on records written by older versions, which never
+   * persisted the final status; they are treated as processed.
    */
   status?: EpisodeStatus;
-  /** failure reason when status === 'failed' */
+  /** failure reason when status === 'failed'; why it was forgotten when 'forgotten' */
   error?: string;
+  /**
+   * How many times processing was started (automatic and manual retries
+   * included). The background retry leaves a failed episode alone once this
+   * reaches its limit. Absent on older records: none counted.
+   */
+  attempts?: number;
   /**
    * Idempotency key: content fingerprint plus the UTC day of validAt, or the
    * caller's explicit key. Stored in the content_hash column.
@@ -43,7 +51,7 @@ export interface EpisodicNode {
   contentHash?: string;
 }
 
-export type EpisodeStatus = 'pending' | 'processed' | 'failed';
+export type EpisodeStatus = 'pending' | 'processed' | 'failed' | 'forgotten';
 
 /** L1 — an extracted entity. */
 export interface EntityNode {

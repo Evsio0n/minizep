@@ -1,6 +1,12 @@
 import type { EntityEdge, EntityNode, EpisodicNode, UUID } from '../model/types.js';
 import { isFactActive } from '../model/types.js';
 
+/** Failed episodes, and those tried at least a given number of times (see countFailedEpisodes). */
+export interface FailedEpisodes {
+  failed: number;
+  givenUp: number;
+}
+
 /**
  * Graph persistence boundary.
  *
@@ -18,6 +24,12 @@ export interface GraphStore {
   getEpisodes(groupId?: string): Promise<EpisodicNode[]>;
   /** remove an episode record (used when a failed episode is reprocessed) */
   removeEpisode(uuid: UUID): Promise<void>;
+  /**
+   * The failed episodes of these groups (every group when undefined), and
+   * how many of them were tried at least `maxAttempts` times, counted where
+   * they are stored. Optional: a caller falls back to getEpisodes().
+   */
+  countFailedEpisodes?(groupIds: string[] | undefined, maxAttempts: number): Promise<FailedEpisodes>;
 
   // entities
   upsertEntity(node: EntityNode): Promise<void>;
@@ -103,6 +115,16 @@ export class MemoryGraphStore implements GraphStore, Snapshotable {
   }
   async removeEpisode(uuid: UUID): Promise<void> {
     this.episodes.delete(uuid);
+  }
+  async countFailedEpisodes(groupIds: string[] | undefined, maxAttempts: number): Promise<FailedEpisodes> {
+    let failed = 0;
+    let givenUp = 0;
+    for (const e of this.episodes.values()) {
+      if (e.status !== 'failed' || (groupIds && !groupIds.includes(e.groupId))) continue;
+      failed++;
+      if ((e.attempts ?? 0) >= maxAttempts) givenUp++;
+    }
+    return { failed, givenUp };
   }
 
   async upsertEntity(node: EntityNode): Promise<void> {

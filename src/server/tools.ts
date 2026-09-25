@@ -8,6 +8,45 @@ import { shapes, type AddMemoryOutcome, type FactRow, type JobRow, type MemorySe
 export const SERVER_INFO = { name: 'minizep', version: '0.2.0' };
 
 /**
+ * The MCP `instructions` of the initialize result: what a model that has never
+ * seen minizep needs in order to use it. The first paragraph (under 512
+ * characters, which some clients keep) stands alone; docs/MEMORY-GUIDE.md,
+ * served by memory_guide, has the full method and must agree with this.
+ */
+export const INSTRUCTIONS = [
+  'minizep is your long-term memory: dated facts about people, projects, systems, plans and decisions. ' +
+    'Before answering about any of these, call search_facts (or facts_about for one named entity). ' +
+    'When you learn something durable, call add_memory with async=true: one event per call, full sentences, ' +
+    'every subject named (no "she", "the project"), valid_at = when it happened. ' +
+    'When the user contradicts the memory, fix it in the same turn. ' +
+    'The memory is a memory, not ground truth: what the user says now wins.',
+  '',
+  'Writing: state changes as changes ("Dana Wu moved from Orion to Atlas on 2026-03-02"); the old fact closes ' +
+    'itself. Do not store secrets, small talk or guesses.',
+  'Searching: name the entities in the query. at= gives what was true then, as_of= what the memory believed ' +
+    'then, include_historical=true also ended facts.',
+  'Repairs: something ended -> invalidate_fact with at; a fact was never true -> invalidate_fact retract=true; ' +
+    'a fact closed by mistake -> reopen_fact; a whole note was wrong or unwanted -> forget_episode; writes ' +
+    'failed -> graph_stats or memory_job_status, then retry_failed.',
+  'Call memory_guide once for the full method with examples.',
+].join('\n');
+
+/** McpServer options: every server (stdio and HTTP) describes itself the same way. */
+export const SERVER_OPTIONS = { instructions: INSTRUCTIONS };
+
+/*
+ * Tool annotations, so that clients can run reads without asking and ask
+ * before a correction. Nothing reaches outside the memory (openWorldHint).
+ */
+const READ_ONLY = { readOnlyHint: true, openWorldHint: false };
+/** add_memory: sending the same note again is a duplicate, and nothing is lost */
+const ADDS = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+/** retry_failed: re-processes what is already stored */
+const REPAIRS = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
+/** invalidate_fact, reopen_fact, forget_episode: change what the memory holds true (history is kept) */
+const CORRECTS = { readOnlyHint: false, destructiveHint: true, openWorldHint: false };
+
+/**
  * Everything the tool handlers need, injected so transports can differ: the
  * shared service and who is calling (a token's principal over HTTP, the local
  * user over stdio).
@@ -33,8 +72,21 @@ export function validity(r: FactRow, now = Date.now()): string {
   return r.valid_at ? `since ${start}` : 'still true';
 }
 
+/** Episodes shown by id on a fact line; the others are counted. */
+const SHOWN_EPISODES = 3;
+
+/**
+ * One fact as a line: `[id] source --RELATION--> target | "text" | validity`,
+ * then `| ep <id>, <id> +N` naming the notes it came from (oldest first), the
+ * ids get_episode and forget_episode take: a client that shows the model only
+ * this text has no other way to them.
+ */
 export function formatFact(r: FactRow): string {
-  return `[${r.uuid.slice(0, 8)}] ${r.source} --${r.relation}--> ${r.target} | "${r.fact}" | ${validity(r)}`;
+  const line = `[${r.uuid.slice(0, 8)}] ${r.source} --${r.relation}--> ${r.target} | "${r.fact}" | ${validity(r)}`;
+  if (!r.episodes.length) return line;
+  const more = r.episodes.length - SHOWN_EPISODES;
+  const ids = r.episodes.slice(0, SHOWN_EPISODES).map((e) => e.slice(0, 8)).join(', ');
+  return `${line} | ep ${ids}${more > 0 ? ` +${more}` : ''}`;
 }
 
 function ok(text: string, structured?: object) {
@@ -137,10 +189,12 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Add memory',
       description:
-        'Ingest text into the temporal knowledge graph. Extracts entities and facts, and marks ' +
-        'relationships that the text says have ended as invalid (historical facts are kept, not deleted). ' +
-        'Reports processed, duplicate or failed; a failed episode is kept and can be retried.',
+        'Use when you learn something durable (a fact, a change, a decision): one event per call, in full ' +
+        'sentences with every subject named, valid_at = when it happened; a change closes the old fact by ' +
+        'itself. async=true answers at once with a job id, and a failed extraction is kept and retried. ' +
+        'See memory_guide.',
       inputSchema: shapes.addMemory,
+      annotations: ADDS,
     },
     (args) =>
       guard(async () => {
@@ -154,10 +208,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Search facts',
       description:
-        'Hybrid search (BM25 + embeddings + rank fusion) over facts. By default only currently-true ' +
-        'facts are returned; pass at= to time-travel, as_of= for what was known then, or ' +
-        'include_historical=true for the full history.',
+        'Use before answering about people, projects, systems, plans or decisions: searches the facts true ' +
+        'now, by keywords and meaning; name the entities in the query. at= for what was true then, as_of= ' +
+        'for what the memory believed then, include_historical=true for ended facts too. See memory_guide.',
       inputSchema: shapes.search,
+      annotations: READ_ONLY,
     },
     (args) =>
       guard(async () => {
@@ -173,9 +228,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Facts about an entity',
       description:
-        'Every fact touching one entity, with its temporal validity window. A partial name resolves ' +
-        'to the best match; other plausible matches are listed.',
+        'Use when the question is about one named entity: every fact touching it, with when it was true. ' +
+        'A partial name resolves to the best match; other plausible matches are listed. See memory_guide.',
       inputSchema: shapes.factsAbout,
+      annotations: READ_ONLY,
     },
     (args) =>
       guard(async () => {
@@ -192,7 +248,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'facts_at',
     {
       title: 'Time travel',
-      description: 'What the graph believed was true at a given instant (bi-temporal query).',
+      description:
+        'Use for "what was true on <date>": every fact true at that instant, optionally as the memory ' +
+        'knew it at as_of. See memory_guide.',
+      annotations: READ_ONLY,
       inputSchema: {
         timestamp: z.string().optional().describe('ISO-8601 instant, e.g. 2024-06-01T00:00:00Z (default now)'),
         as_of: shapes.factsAt.as_of,
@@ -212,8 +271,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'list_entities',
     {
       title: 'List entities',
-      description: 'Entities in the graph, optionally filtered by a name/summary substring.',
+      description:
+        'Use to find how the memory names something, or what it knows exists: entities with their ' +
+        'summaries, filtered by a name or summary substring. See memory_guide.',
       inputSchema: shapes.entities,
+      annotations: READ_ONLY,
     },
     (args) =>
       guard(async () => {
@@ -228,9 +290,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'List episodes',
       description:
-        'Raw ingested data (provenance), newest first, with its processing status. ' +
-        'Everything in the graph traces back to these.',
+        'Use to see the notes the memory was given (newest first) and whether each was processed; every ' +
+        'fact traces back to one. See memory_guide.',
       inputSchema: shapes.episodes,
+      annotations: READ_ONLY,
     },
     (args) =>
       guard(async () => {
@@ -252,9 +315,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Get episode',
       description:
-        'One episode (by uuid or a prefix of at least 8 characters) with its status, full text and ' +
-        'the facts it produced or reinforced.',
+        'Use to read one note in full (uuid or 8+ character prefix: the ep ids at the end of a fact line) ' +
+        'with its status and the facts it produced or reinforced, e.g. before forget_episode. See memory_guide.',
       inputSchema: shapes.episode,
+      annotations: READ_ONLY,
     },
     (args) =>
       guard(async () => {
@@ -283,10 +347,11 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Invalidate fact',
       description:
-        'Close a fact by hand: it stopped being true at `at` (default now). With retract=true the fact ' +
-        'is treated as never having been true. History is kept either way (as_of still shows what was ' +
-        'believed before). Fact ids are shown in brackets by the search tools.',
+        'Use when a fact stopped being true (at = when, default now), or with retract=true when it was ' +
+        'never true; history is kept for as_of. Fact ids are the bracketed prefixes in search results. ' +
+        'See memory_guide.',
       inputSchema: shapes.invalidateFact,
+      annotations: CORRECTS,
     },
     (args) =>
       guard(async () => {
@@ -297,12 +362,33 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
   );
 
   server.registerTool(
+    'reopen_fact',
+    {
+      title: 'Reopen fact',
+      description:
+        'Use when a fact was ended or retracted by mistake (also an end still in the future): it is true ' +
+        'again from its original start, until invalid_at if given, as a corrected copy with a new id; the ' +
+        'closed record stays in history. See memory_guide.',
+      inputSchema: shapes.reopenFact,
+      annotations: CORRECTS,
+    },
+    (args) =>
+      guard(async () => {
+        const r = await service.reopenFact(p, args);
+        return ok(`reopened [${r.previous.uuid.slice(0, 8)}] as: ${formatFact(r.fact)}`, r);
+      }),
+  );
+
+  server.registerTool(
     'retry_failed',
     {
       title: 'Retry failed episodes',
       description:
-        'Re-process the episodes whose extraction failed (e.g. during an LLM or embedding outage), in place.',
+        'Use when writes failed (graph_stats shows failed episodes) and the cause, e.g. an LLM or embedding ' +
+        'outage, is over: re-processes every failed episode of the group in place, given-up ones included. ' +
+        'See memory_guide.',
       inputSchema: shapes.group,
+      annotations: REPAIRS,
     },
     (args) =>
       guard(async () => {
@@ -318,7 +404,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'memory_job_status',
     {
       title: 'Ingestion job status',
-      description: 'Check an asynchronous add_memory job. Omit job_id to list recent jobs.',
+      description:
+        'Use to check an add_memory made with async=true: pass its job_id, or omit it to list recent jobs. ' +
+        'See memory_guide.',
+      annotations: READ_ONLY,
       inputSchema: {
         job_id: z.string().optional(),
         limit: z.number().int().min(1).max(100).optional(),
@@ -340,23 +429,99 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     'graph_stats',
     {
       title: 'Graph statistics',
-      description: 'Counts of episodes (by status), entities, active and historical facts in one group.',
+      description:
+        'Use to check the memory is healthy: episodes by status (failed and given up included), ' +
+        'entities, and current and historical facts in one group. See memory_guide.',
       inputSchema: shapes.group,
+      annotations: READ_ONLY,
     },
     (args) =>
       guard(async () => {
         const s = await service.stats(p, args);
-        const text = [
+        const e = s.episodes;
+        const lines = [
           `group    : ${s.group_id}`,
-          `episodes : ${s.episodes.total} (${s.episodes.processed} processed, ${s.episodes.pending} pending, ` +
-            `${s.episodes.failed} failed)`,
+          `episodes : ${e.total} (${e.processed} processed, ${e.pending} pending, ${e.failed} failed, ` +
+            `${e.forgotten} forgotten)`,
           `entities : ${s.entities}`,
           `facts    : ${s.facts.total} (${s.facts.active} currently true, ${s.facts.historical} historical)`,
           `store    : ${service.storeLabel}`,
           `jobs     : ${s.jobs.running} running, ${s.jobs.queued} queued`,
           `llm      : ${service.llmLabel}`,
-        ].join('\n');
-        return ok(text, s);
+        ];
+        if (e.failed) {
+          lines.push(
+            `failed   : ${e.failed}, ${e.given_up} of them tried ${service.retryMax} times or more and no longer ` +
+              'retried automatically; call retry_failed once the cause (LLM, embeddings) is fixed',
+          );
+        }
+        return ok(lines.join('\n'), s);
       }),
+  );
+
+  server.registerTool(
+    'forget_episode',
+    {
+      title: 'Forget episode',
+      description:
+        'Use when a whole note was wrong or not wanted (its id: the ep part of a fact line): the facts only ' +
+        'it supported are retracted, the others lose it as evidence, the facts it closed are reopened unless ' +
+        'a later value still holds, the entity summaries it wrote last are put back, and it is kept as ' +
+        '"forgotten". History is kept (as_of). See memory_guide.',
+      inputSchema: shapes.forgetEpisode,
+      annotations: CORRECTS,
+    },
+    (args) =>
+      guard(async () => {
+        const r = await service.forgetEpisode(p, args);
+        const list = (rows: FactRow[]) => rows.map((f) => `  ${formatFact(f)}`);
+        const lines = [
+          `forgot episode ${r.episode.uuid.slice(0, 8)} in group "${r.group_id}" (its text is kept)`,
+          `retracted (it was their only evidence): ${r.retracted.length}`,
+          ...list(r.retracted),
+          `no longer cite it (other evidence remains): ${r.unlinked.length}`,
+          ...list(r.unlinked),
+          `reopened (it had closed them): ${r.reopened.length}`,
+          ...list(r.reopened.map((x) => x.fact)),
+        ];
+        if (r.still_closed.length) {
+          lines.push(
+            `still closed (it had closed them, but a later value other notes support takes over there; ` +
+              `reopen_fact if that is wrong): ${r.still_closed.length}`,
+            ...list(r.still_closed),
+          );
+        }
+        lines.push(
+          `entity summaries put back as they were before it (one another note rewrote since stays): ` +
+            `${r.restored_summaries.length}`,
+          ...r.restored_summaries.map((e) => `  ${e.name} — ${e.summary || '(no summary)'}`),
+        );
+        if (r.orphaned_entities.length) {
+          lines.push(
+            `entities it created, left with no fact and no summary (kept): ${r.orphaned_entities.length}`,
+            `  ${r.orphaned_entities.map((e) => e.name).join(', ')}`,
+          );
+        }
+        if (r.unmarked_closures.length) {
+          lines.push(
+            `closed when this episode was processed, by a build that did not record it (check, then reopen_fact ` +
+              `if it was this episode): ${r.unmarked_closures.length}`,
+            ...list(r.unmarked_closures),
+          );
+        }
+        return ok(lines.join('\n'), r);
+      }),
+  );
+
+  server.registerTool(
+    'memory_guide',
+    {
+      title: 'Memory guide',
+      description:
+        'Read once before relying on this memory: how to write, search and repair it, with a decision ' +
+        'table and examples (Markdown).',
+      annotations: READ_ONLY,
+    },
+    () => guard(async () => ok(await service.guide())),
   );
 }

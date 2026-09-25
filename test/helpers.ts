@@ -1,6 +1,7 @@
 import type {
   ContradictionCandidate,
   ContradictionExisting,
+  ContradictionVerdict,
   ExtractionResult,
   ExtractOptions,
   KnownFact,
@@ -10,11 +11,11 @@ import { HashEmbedder } from '../src/provider/interfaces.js';
 
 /**
  * How a scripted LLM answers detectContradiction: `true` ends every existing
- * fact it is shown, `false` none, a function picks indexes itself.
+ * fact it is shown, `false` none, a function picks indexes (or a verdict) itself.
  */
 export type ContradictionScript =
   | boolean
-  | ((candidate: ContradictionCandidate, existing: ContradictionExisting[]) => number[]);
+  | ((candidate: ContradictionCandidate, existing: ContradictionExisting[]) => number[] | ContradictionVerdict);
 
 /**
  * Deterministic, scriptable LLM stand-in. Tests must never touch the network,
@@ -47,7 +48,7 @@ export class ScriptedLLM implements LLMProvider {
   async detectContradiction(
     candidate: ContradictionCandidate,
     existing: ContradictionExisting[],
-  ): Promise<number[]> {
+  ): Promise<number[] | ContradictionVerdict> {
     this.contradictionCalls.push({ candidate, existing });
     if (typeof this.contradictions === 'function') return this.contradictions(candidate, existing);
     return this.contradictions ? existing.map((_, i) => i) : [];
@@ -103,7 +104,7 @@ export const fact = (
   sourceName: string,
   targetName: string,
   relation: string,
-  extra: Partial<{ validAt: Date; invalidAt: Date }> = {},
+  extra: Partial<{ validAt: Date; invalidAt: Date; replacesPrevious: boolean }> = {},
 ) => ({
   sourceName,
   targetName,

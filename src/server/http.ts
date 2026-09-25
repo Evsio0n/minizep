@@ -24,6 +24,8 @@
  *   MINIZEP_SESSION_TTL_MS     idle MCP sessions expire (default 1800000)
  *   MINIZEP_MAX_SESSIONS       MCP session cap, oldest idle evicted (default 256)
  *   MINIZEP_DRAIN_TIMEOUT_MS   how long shutdown waits for queued ingestion (default 120000)
+ *   MINIZEP_RETRY_INTERVAL_MS  retry failed episodes in the background this often (default 600000, 0 = off)
+ *   MINIZEP_RETRY_MAX          ... until an episode has been tried this many times (default 3)
  *   MINIZEP_UI_GROUPS          "group[|group...]" or "*": serve the web UI on /ui, WITHOUT a
  *                              token, for these groups (private networks only; unset = off)
  *   MINIZEP_UI_HOSTS           comma-separated host names the UI may be opened under, besides
@@ -82,6 +84,8 @@ const app = createHttpApp({
   sessionTtlMs: envInt('MINIZEP_SESSION_TTL_MS', 30 * 60_000),
   maxSessions: envInt('MINIZEP_MAX_SESSIONS', 256),
   drainTimeoutMs: envInt('MINIZEP_DRAIN_TIMEOUT_MS', 120_000),
+  retryIntervalMs: envInt('MINIZEP_RETRY_INTERVAL_MS', 600_000),
+  retryMax: envInt('MINIZEP_RETRY_MAX', 3),
   log,
 });
 await app.listen(hosts, envInt('MINIZEP_PORT', 8787));

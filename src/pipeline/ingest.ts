@@ -71,7 +71,65 @@ export interface InvalidateFactInput {
   retract?: boolean;
 }
 
-/** A manual invalidation that cannot be applied, with why. */
+/** How a wrongly ended or retracted fact is reopened. */
+export interface ReopenFactInput {
+  /** the fact must belong to this group (otherwise it is reported as not found) */
+  groupId: string;
+  /** why the fact still holds, kept on both records for auditing */
+  reason: string;
+  /** real-world instant it did stop being true, if it did (default: still true) */
+  invalidAt?: Date;
+}
+
+/** How an episode is forgotten. */
+export interface ForgetEpisodeInput {
+  /** the episode must belong to this group (otherwise it is reported as not found) */
+  groupId: string;
+  /** why, kept on the episode and on every fact it changes */
+  reason: string;
+}
+
+/** What forgetting an episode changed. */
+export interface ForgetResult {
+  /** the episode, now 'forgotten' (its text is kept) */
+  episode: EpisodicNode;
+  /** facts it was the only evidence for: retracted, kept in history */
+  retracted: EntityEdge[];
+  /** facts with other evidence: it was taken off their evidence list */
+  unlinked: EntityEdge[];
+  /**
+   * facts it had closed: `fact` is the reopened copy, `previous` the closed
+   * record, now retracted. A later value that still holds in a one-value slot
+   * (see forgetEpisode) ends the copy where it begins.
+   */
+  reopened: { fact: EntityEdge; previous: EntityEdge }[];
+  /**
+   * facts it had closed that stay closed: a value other episodes still
+   * support takes over at or before the end it gave them (another episode
+   * states the same change); left for the caller to check (reopen_fact)
+   */
+  stillClosed: EntityEdge[];
+  /**
+   * facts closed without a closedByEpisode marker (by a build before it
+   * existed) at the moment this episode's facts were written: probably closed
+   * by it, left as they are for the caller to check (reopen_fact)
+   */
+  unmarked: EntityEdge[];
+  /** entities whose summary it wrote last: the summary it replaced is back */
+  summaries: EntityNode[];
+  /** entities it created that are left with no fact and no summary (they are kept) */
+  orphaned: EntityNode[];
+}
+
+/** Which failed episodes retryFailed takes. */
+export interface RetryOptions {
+  /** only episodes tried fewer times than this (default: every failed one) */
+  maxAttempts?: number;
+  /** at most this many, oldest first (default: all) */
+  limit?: number;
+}
+
+/** A manual invalidation, reopen or forget that cannot be applied, with why. */
 export class InvalidationError extends Error {
   constructor(
     message: string,
@@ -167,26 +225,40 @@ export class IngestPipeline {
     return this.saveLocks.run(input.groupId, () => this.saveLocked(input, options));
   }
 
-  /** Process a saved episode (a no-op 'duplicate' when it is already processed). */
+  /**
+   * Process a saved episode (a no-op 'duplicate' when it is already processed,
+   * or was forgotten before it was: the result's episode says which).
+   */
   async processEpisode(episodeUuid: string): Promise<IngestResult> {
     const saved = await this.store.getEpisode(episodeUuid);
     if (!saved) throw new Error(`episode ${episodeUuid} not found`);
     return this.locks.run(saved.groupId, async () => {
       // re-read under the lock: another caller may have processed it meanwhile
       const episode = (await this.store.getEpisode(episodeUuid)) ?? saved;
-      return isProcessed(episode) ? duplicateResult(episode) : this.processLocked(episode);
+      return isProcessed(episode) || episode.status === 'forgotten'
+        ? duplicateResult(episode)
+        : this.processLocked(episode);
     });
   }
 
   /**
-   * Re-process episodes whose processing previously failed, in place.
+   * Re-process episodes whose processing previously failed, in place, oldest
+   * first.
    *
    * Failed episodes hold raw text that was never turned into graph facts; this
    * is the recovery path for an LLM or embedding outage. A failed retry keeps
-   * the same record with a fresh error.
+   * the same record with a fresh error. Every retry counts as an attempt; the
+   * background retry passes `maxAttempts` and `limit` to leave the episodes
+   * that keep failing alone and to take a few at a time.
    */
-  async retryFailed(groupId?: string): Promise<{ retried: number; succeeded: number; stillFailing: number }> {
-    const failed = (await this.store.getEpisodes(groupId)).filter((e) => e.status === 'failed');
+  async retryFailed(
+    groupId?: string,
+    options: RetryOptions = {},
+  ): Promise<{ retried: number; succeeded: number; stillFailing: number }> {
+    const failed = (await this.store.getEpisodes(groupId))
+      .filter((e) => e.status === 'failed' && (e.attempts ?? 0) < (options.maxAttempts ?? Infinity))
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
+      .slice(0, options.limit ?? Infinity);
     let succeeded = 0;
     let stillFailing = 0;
     for (const ep of failed) {
@@ -222,7 +294,7 @@ export class IngestPipeline {
       const found = await this.store.getFact(factUuid);
       if (!found || found.groupId !== input.groupId) throw new InvalidationError('fact not found', 'not_found');
       if (isRetracted(found)) throw new InvalidationError('fact is already retracted', 'conflict');
-      const f: EntityEdge = { ...found, attributes: { ...found.attributes } };
+      const f: EntityEdge = { ...found, attributes: withoutEpisodeClosure(found.attributes) };
       const now = new Date();
 
       if (input.retract) {
@@ -253,6 +325,184 @@ export class IngestPipeline {
     });
   }
 
+  /**
+   * Undo a wrong end or retraction (an ingestion that closed a fact that is
+   * still true), under the group's lock.
+   *
+   * One row holds one belief, so the wrongly closed row is not edited back:
+   * it is retracted (empty window, expiredAt now; a row that is already
+   * retracted keeps its retraction) and a corrected copy is inserted with the
+   * same endpoints, relation, text, start, evidence and embedding, created
+   * now, open or ending at `invalidAt`. as_of before now finds the old row and
+   * not the copy, as_of from now on the copy and never the old row. As with
+   * any retraction of an ended fact, an as_of between the wrong end and the
+   * reopen sees the old row without that end (one row cannot hold both the end
+   * and its withdrawal); the end and its reason stay in the old row's
+   * attributes (closedAt, closedBy).
+   */
+  async reopenFact(factUuid: string, input: ReopenFactInput): Promise<{ fact: EntityEdge; previous: EntityEdge }> {
+    return this.locks.run(input.groupId, async () => {
+      const found = await this.store.getFact(factUuid);
+      if (!found || found.groupId !== input.groupId) throw new InvalidationError('fact not found', 'not_found');
+      const reopenedAs = found.attributes?.reopenedAs;
+      if (typeof reopenedAs === 'string') {
+        throw new InvalidationError(`fact was already reopened as ${reopenedAs}`, 'conflict');
+      }
+      const now = new Date();
+      const retracted = isRetracted(found);
+      // an end still in the future counts too: a change "effective next
+      // Monday" can supersede a fact that stays true
+      if (!retracted && !found.invalidAt) {
+        throw new InvalidationError('fact has no end and is not retracted: nothing to reopen', 'conflict');
+      }
+      if (input.invalidAt && found.validAt && input.invalidAt <= found.validAt) {
+        throw new InvalidationError(
+          `fact started at ${found.validAt.toISOString()}, it cannot end at or before that`,
+          'conflict',
+        );
+      }
+
+      const { fact: copy, previous } = reopened(found, input.reason, input.invalidAt, now);
+      const commit = async (store: GraphStore) => {
+        await store.updateFact(previous);
+        await store.addFact(copy);
+      };
+      if (this.store.transaction) await this.store.transaction(commit);
+      else await commit(this.store);
+      return { fact: copy, previous };
+    });
+  }
+
+  /**
+   * Take back what one episode contributed, under both of the group's locks
+   * (no episode is processed, and none of the same text saved, meanwhile):
+   *   - a fact it was the only evidence for is retracted, as invalidateFact
+   *     with retract does (as_of before now still finds it);
+   *   - a fact with other evidence only loses it from its evidence list;
+   *   - a fact it closed (attributes.closedByEpisode) is reopened, as
+   *     reopenFact does: its end before the episode, if it had one, comes
+   *     back, unless another value of a one-value slot that still holds
+   *     begins earlier (see nextValue): the copy ends there, and when that
+   *     value begins at or before the end the episode gave, the fact stays
+   *     closed (`stillClosed`);
+   *   - a summary it wrote last (attributes.summaryByEpisode) is put back to
+   *     the one it replaced; the entities it created that are left with no
+   *     fact and no summary are reported (`orphaned`), not deleted;
+   *   - the episode becomes 'forgotten' and keeps its text; the same text sent
+   *     again later is a new episode, processed afresh.
+   * Labels, and a summary another episode rewrote since, are left as they
+   * are. Closures written before the marker existed are only reported
+   * (`unmarked`). A pending or failed episode can be forgotten too: it is
+   * then never processed.
+   */
+  async forgetEpisode(episodeUuid: string, input: ForgetEpisodeInput): Promise<ForgetResult> {
+    return this.locks.run(input.groupId, () =>
+      this.saveLocks.run(input.groupId, async () => {
+        const found = await this.store.getEpisode(episodeUuid);
+        if (!found || found.groupId !== input.groupId) throw new InvalidationError('episode not found', 'not_found');
+        if (found.status === 'forgotten') throw new InvalidationError('episode is already forgotten', 'conflict');
+        const id = found.uuid;
+        const now = new Date();
+        const reason = input.reason.slice(0, 120);
+        const why = `forgotten episode ${id.slice(0, 8)}: ${reason}`.slice(0, 120);
+        const facts = await this.store.getFacts(input.groupId);
+        // the instants this episode's run wrote its new facts: a closure the run
+        // made carries the same instant as its expiredAt
+        const written = new Set(
+          facts.filter((f) => f.episodes[0] === id && !f.attributes?.reopenedFrom).map((f) => f.createdAt.getTime()),
+        );
+
+        // the facts it was the only evidence for, which are retracted below
+        const onlyHere = (f: EntityEdge) => f.episodes.length > 0 && f.episodes.every((e) => e === id);
+
+        const result: ForgetResult = {
+          episode: found,
+          retracted: [],
+          unlinked: [],
+          reopened: [],
+          stillClosed: [],
+          unmarked: [],
+          summaries: [],
+          orphaned: [],
+        };
+        for (const f of facts) {
+          const cited = f.episodes.includes(id);
+          const others = f.episodes.filter((e) => e !== id);
+          const closed = !!f.invalidAt && !isRetracted(f) && typeof f.attributes?.reopenedAs !== 'string';
+          if (cited && others.length === 0) {
+            if (isRetracted(f)) continue; // nothing left to take back
+            result.retracted.push({
+              ...f,
+              invalidAt: f.validAt,
+              expiredAt: now,
+              attributes: { ...withoutEpisodeClosure(f.attributes), retracted: true, invalidatedBy: why },
+            });
+            continue;
+          }
+          const kept = cited ? { ...f, episodes: others } : f;
+          if (closed && f.attributes?.closedByEpisode === id) {
+            const before = validDate(new Date(String(f.attributes.previousEnd ?? '')));
+            // a value that still holds after this forget, later in the same
+            // one-value slot, ends the fact where it begins
+            const next = nextValue(f, facts, onlyHere);
+            const end = earliest(before && (!f.validAt || before > f.validAt) ? before : undefined, next);
+            if (next && end && f.invalidAt && end <= f.invalidAt) {
+              // it takes over where the episode ended the fact (another
+              // episode states the same change): the end stands on its own
+              if (cited) result.unlinked.push(kept);
+              result.stillClosed.push(kept);
+              continue;
+            }
+            const pair = reopened(kept, why, end, now);
+            // the closed record keeps the evidence it had
+            result.reopened.push({ ...pair, previous: { ...pair.previous, episodes: f.episodes } });
+            continue;
+          }
+          if (cited) result.unlinked.push(kept);
+          if (closed && f.attributes?.closedByEpisode === undefined && written.has(f.expiredAt?.getTime() ?? NaN)) {
+            result.unmarked.push(kept);
+          }
+        }
+
+        // what it wrote into entities: the summary it replaced comes back, and
+        // an entity it created with nothing left on it is reported
+        const gone = new Set(result.retracted.map((f) => f.uuid));
+        const used = new Set(
+          facts
+            .filter((f) => !isRetracted(f) && !gone.has(f.uuid))
+            .flatMap((f) => [f.sourceNodeUuid, f.targetNodeUuid]),
+        );
+        for (const e of await this.store.getEntities(input.groupId)) {
+          let node = e;
+          if (e.attributes?.summaryByEpisode === id) {
+            const { summaryByEpisode: _by, previousSummary, ...rest } = e.attributes;
+            // (an entity it created had no summary before)
+            const before = typeof previousSummary === 'string' ? previousSummary : '';
+            if (before !== e.summary) {
+              node = { ...e, summary: before, attributes: rest };
+              result.summaries.push(node);
+            }
+          }
+          if (e.attributes?.createdByEpisode === id && !node.summary && !used.has(e.uuid)) result.orphaned.push(node);
+        }
+        result.episode = { ...found, status: 'forgotten', error: reason };
+
+        const commit = async (store: GraphStore) => {
+          for (const f of [...result.retracted, ...result.unlinked]) await store.updateFact(f);
+          for (const r of result.reopened) {
+            await store.updateFact(r.previous);
+            await store.addFact(r.fact);
+          }
+          for (const e of result.summaries) await store.upsertEntity(e);
+          await store.addEpisode(result.episode);
+        };
+        if (this.store.transaction) await this.store.transaction(commit);
+        else await commit(this.store);
+        return result;
+      }),
+    );
+  }
+
   /** Only ever executed while holding the group's save lock. */
   private async saveLocked(
     input: EpisodeInput,
@@ -263,8 +513,9 @@ export class IngestPipeline {
     const key = idempotencyKey(input.content, validAt, input.idempotencyKey);
 
     if (options.idempotent !== false) {
-      const matches = (await this.store.getEpisodes(input.groupId)).filter((e) =>
-        sameEpisode(e, key, input, validAt),
+      // a forgotten episode is kept for audit only: the same text again is new
+      const matches = (await this.store.getEpisodes(input.groupId)).filter(
+        (e) => e.status !== 'forgotten' && sameEpisode(e, key, input, validAt),
       );
       const done = matches.find(isProcessed);
       if (done) return { episode: done, duplicate: true };
@@ -302,6 +553,8 @@ export class IngestPipeline {
 
   /** Only ever executed while holding the group's lock. */
   private async processLocked(episode: EpisodicNode): Promise<IngestResult> {
+    // counted when the attempt starts, stored with its outcome below
+    episode.attempts = (episode.attempts ?? 0) + 1;
     try {
       // the 'processed' mark commits with the graph writes: a retry must never
       // find half an episode already in the graph
@@ -362,6 +615,14 @@ function normaliseRelation(relation: string | undefined): string {
 
 const sameRelation = (f: EntityEdge, relation: string) => normaliseRelation(f.name) === relation;
 
+/**
+ * Relations that hold one target at a time for their source (employer, title,
+ * home, manager): a new target is checked against the old one whether or not
+ * the extraction marked it with replacesPrevious, so a backfilled or plainly
+ * worded value ("Alice is CTO at Acme") cannot leave two current values.
+ */
+const SINGLE_VALUED = new Set(['WORKS_AT', 'HAS_ROLE', 'HAS_TITLE', 'LIVES_IN', 'REPORTS_TO']);
+
 function validDate(d: unknown): Date | undefined {
   return d instanceof Date && !Number.isNaN(d.getTime()) ? d : undefined;
 }
@@ -412,6 +673,93 @@ function isRetracted(f: EntityEdge): boolean {
   return !!f.expiredAt;
 }
 
+/** Attributes that say how a fact was closed, which a reopened copy does not inherit. */
+const CLOSURE_ATTRIBUTES = new Set([
+  'invalidatedBy',
+  'retracted',
+  'reopenedAs',
+  'closedBy',
+  'closedAt',
+  'closedByEpisode',
+  'previousEnd',
+]);
+
+/**
+ * The attributes without the marker of an ingestion's closure: a fact closed
+ * by hand afterwards is no longer the episode's to reopen.
+ */
+function withoutEpisodeClosure(attributes: Record<string, unknown> | undefined): Record<string, unknown> {
+  const { closedByEpisode: _episode, previousEnd: _end, ...rest } = attributes ?? {};
+  return rest;
+}
+
+/**
+ * Where a later value of f's slot (its source and relation), one that is not
+ * retracted and not `gone`, begins: the earliest such start. Only for a slot
+ * that holds one value at a time (SINGLE_VALUED, or either fact flagged
+ * replacesPrevious): other relations hold several records at once, of the
+ * same target too. A value starting at f's own start counts when it was
+ * written after f; with f's start unknown, one starting at or after f's end.
+ */
+function nextValue(f: EntityEdge, facts: EntityEdge[], gone: (g: EntityEdge) => boolean): Date | undefined {
+  const relation = normaliseRelation(f.name);
+  let next: Date | undefined;
+  for (const g of facts) {
+    if (g === f || !g.validAt || g.sourceNodeUuid !== f.sourceNodeUuid || !sameRelation(g, relation)) continue;
+    if (isRetracted(g) || gone(g)) continue;
+    const oneValue =
+      SINGLE_VALUED.has(relation) || f.attributes?.replacesPrevious === true || g.attributes?.replacesPrevious === true;
+    const after = f.validAt
+      ? g.validAt > f.validAt || (sameInstant(g.validAt, f.validAt) && g.createdAt > f.createdAt)
+      : !!f.invalidAt && g.validAt >= f.invalidAt;
+    if (oneValue && after) next = earliest(next, g.validAt);
+  }
+  return next;
+}
+
+/**
+ * The two rows of a reopen (see reopenFact): the closed row retracted (an
+ * existing retraction is kept) and a copy created now with the same
+ * endpoints, relation, text, start, evidence and embedding, open or ending at
+ * `invalidAt`.
+ */
+function reopened(
+  found: EntityEdge,
+  why: string,
+  invalidAt: Date | undefined,
+  now: Date,
+): { fact: EntityEdge; previous: EntityEdge } {
+  const reason = why.slice(0, 120);
+  const retracted = isRetracted(found);
+  const kept = Object.fromEntries(Object.entries(found.attributes ?? {}).filter(([k]) => !CLOSURE_ATTRIBUTES.has(k)));
+  const copy: EntityEdge = {
+    ...found,
+    uuid: uuid(),
+    episodes: [...found.episodes],
+    factEmbedding: found.factEmbedding ? [...found.factEmbedding] : undefined,
+    invalidAt,
+    createdAt: now,
+    expiredAt: undefined,
+    attributes: { ...kept, reopenedFrom: found.uuid, reopenReason: reason },
+  };
+  const previous: EntityEdge = {
+    ...found,
+    attributes: {
+      ...found.attributes,
+      retracted: true,
+      reopenedAs: copy.uuid,
+      invalidatedBy: `reopened as ${copy.uuid.slice(0, 8)}: ${reason}`.slice(0, 120),
+      ...(typeof found.attributes?.invalidatedBy === 'string' ? { closedBy: found.attributes.invalidatedBy } : {}),
+      ...(!retracted && found.invalidAt ? { closedAt: found.invalidAt.toISOString() } : {}),
+    },
+  };
+  if (!retracted) {
+    previous.invalidAt = found.validAt;
+    previous.expiredAt = now;
+  }
+  return { fact: copy, previous };
+}
+
 /** A fact that is true now, or scheduled to become true later. */
 function isLive(f: EntityEdge, now: Date): boolean {
   return isFactActive(f, now) || (!!f.validAt && f.validAt > now && isFactActive(f, f.validAt));
@@ -431,14 +779,23 @@ function earliest(a: Date | undefined, b: Date | undefined): Date | undefined {
 }
 
 /**
- * Which existing facts does the provider say are ended? Accepts the index
- * list of the current contract and the boolean of the old one (true = all).
+ * Which existing facts does the provider say are ended, and which does it say
+ * the candidate only restates? Accepts a verdict ({ended, same}), the index
+ * list of the earlier contract and the boolean of the old one (true = all).
+ * `same` is undefined when the provider did not tell restatements apart.
  */
-function pickContradicted<T>(answer: unknown, existing: T[]): T[] {
-  if (answer === true) return existing;
-  if (!Array.isArray(answer)) return [];
+function readVerdict<T>(answer: unknown, existing: T[]): { ended: T[]; same?: T[] } {
+  if (answer && typeof answer === 'object' && !Array.isArray(answer)) {
+    const v = answer as { ended?: unknown; same?: unknown };
+    return { ended: pickIndexes(v.ended, existing), ...(Array.isArray(v.same) ? { same: pickIndexes(v.same, existing) } : {}) };
+  }
+  return { ended: answer === true ? existing : pickIndexes(answer, existing) };
+}
+
+function pickIndexes<T>(indexes: unknown, existing: T[]): T[] {
+  if (!Array.isArray(indexes)) return [];
   const picked = new Set<T>();
-  for (const i of answer) {
+  for (const i of indexes) {
     if (Number.isInteger(i) && i >= 0 && i < existing.length) picked.add(existing[i as number]);
   }
   return [...picked];
@@ -623,8 +980,17 @@ class EpisodeRun {
       // merge: keep node, extend labels, and only replace the summary with a
       // real one (an empty candidate summary must never erase what we know)
       const merged = [...new Set([...node.labels, ...labels])];
-      const changed = merged.length !== node.labels.length || (!!summary && summary !== node.summary) || !node.nameEmbedding?.length;
+      const rewrites = !!summary && summary !== node.summary;
+      // the episode that stated the summary last owns it, with the one it
+      // replaced, for forgetEpisode to put back; restating another episode's
+      // summary word for word takes it over, so forgetting that one keeps it
+      const owner = node.attributes?.summaryByEpisode;
+      const takesOver = !!summary && owner !== this.episode.uuid && (rewrites || owner !== undefined);
+      const changed = merged.length !== node.labels.length || takesOver || rewrites || !node.nameEmbedding?.length;
       node.labels = merged;
+      if (takesOver) {
+        node.attributes = { ...node.attributes, summaryByEpisode: this.episode.uuid, previousSummary: node.summary };
+      }
       if (summary) node.summary = summary;
       if (changed) this.dirtyEntities.add(node);
     } else {
@@ -638,7 +1004,11 @@ class EpisodeRun {
         name,
         labels: [...labels],
         summary,
-        attributes: {},
+        // for forgetEpisode: which episode created it and wrote its summary
+        attributes: {
+          createdByEpisode: this.episode.uuid,
+          ...(summary ? { summaryByEpisode: this.episode.uuid } : {}),
+        },
         createdAt: this.now,
       };
       this.byName.set(name.toLowerCase(), node);
@@ -793,37 +1163,55 @@ class EpisodeRun {
     // is over already, so this statement can only be more evidence for it.
     const restated = records.filter((f) => !this.created.has(f) && !isSame(f) && holds(f));
 
-    // b. contradictions: the facts between the same pair, plus the facts in
-    //    the same slot with another target (functional attributes such as
-    //    WORKS_AT, HAS_ROLE, LIVES_IN change target, not endpoints), that are
-    //    live now or held at validAt (a backfilled statement can replace a
-    //    value that has since ended). A statement with an unknown start
-    //    cannot end anything.
+    // b. contradictions: the facts between the same pair that are live now or
+    //    held at validAt (a backfilled statement can replace a value that has
+    //    since ended). The facts in the same slot with another target are
+    //    candidates only for a relation that holds one target at a time (a new
+    //    employer, home or title changes target, not endpoints): one of
+    //    SINGLE_VALUED, one the extraction marked with replacesPrevious, or
+    //    one where such a fact began after this statement's start (a document
+    //    added late). Most relations hold several values at once (evaluated on
+    //    several datasets, uses several tools). A statement with an unknown
+    //    start cannot end anything.
     let ended: EntityEdge[] = [];
+    // the records shown to the judge, and the ones it said this statement only
+    // restates (undefined when it was not asked or did not tell them apart)
+    let shown: EntityEdge[] = [];
+    let restates: EntityEdge[] | undefined;
     if (validAt) {
-      const candidates = pool.filter(
+      const flagged = plan.cand.replacesPrevious === true;
+      const oneValue = flagged || SINGLE_VALUED.has(relation);
+      const exclusive = (f: EntityEdge) =>
+        oneValue || (f.attributes?.replacesPrevious === true && !!f.validAt && f.validAt > validAt);
+      shown = pool.filter(
         (f) =>
           !this.created.has(f) &&
           !isRetracted(f) &&
           !(records.includes(f) && isSame(f)) &&
           (isLive(f, this.now) || covers(f, validAt)) &&
-          (connects(f, src, tgt) || (sameSlot(f) && f.targetNodeUuid !== tgt.uuid)),
+          (connects(f, src, tgt) || (sameSlot(f) && f.targetNodeUuid !== tgt.uuid && exclusive(f))),
       );
-      if (candidates.length > 0) {
+      if (shown.length > 0) {
         const answer: unknown = await this.llm.detectContradiction(
-          { sourceName: src.name, targetName: tgt.name, fact: text, relation, validAt },
-          candidates.map((f) => ({ fact: f.fact, validAt: f.validAt, invalidAt: f.invalidAt })),
+          { sourceName: src.name, targetName: tgt.name, fact: text, relation, validAt, replacesPrevious: flagged },
+          shown.map((f) => ({ fact: f.fact, validAt: f.validAt, invalidAt: f.invalidAt })),
         );
-        ended = pickContradicted(answer, candidates);
+        ({ ended, same: restates } = readVerdict(answer, shown));
       }
     }
 
     // a record of this relationship that the statement does not end is the
     // same relationship described differently: it gains the evidence (and an
     // end the text states) instead of a second edge. For a record that has
-    // ended, a new open edge would bring the relation back.
-    const same = restated.find((f) => !ended.includes(f));
+    // ended, a new open edge would bring the relation back. When the judge
+    // told restatements apart, a record it saw and did not call one holds
+    // alongside this statement (another job evaluated on the same dataset):
+    // the statement becomes a fact of its own, within that record's known end.
+    const kept = restated.filter((f) => !ended.includes(f));
+    const alongside = restates ? kept.filter((f) => shown.includes(f) && !restates.includes(f)) : [];
+    const same = kept.find((f) => !alongside.includes(f));
     if (same) return this.reinforce(same, invalidAt, text);
+    for (const f of alongside) end = earliest(end, f.invalidAt);
 
     // (`ended` is only filled when validAt is known)
     for (const old of ended) {
@@ -853,7 +1241,8 @@ class EpisodeRun {
       validAt,
       invalidAt: end,
       createdAt: this.now,
-      attributes: {},
+      // kept so that an older value added later still ends where this one began
+      attributes: plan.cand.replacesPrevious === true ? { replacesPrevious: true } : {},
     };
     this.work.set(edge.uuid, edge);
     this.created.add(edge);
@@ -895,10 +1284,17 @@ class EpisodeRun {
    * episode simply carries its end; an existing one is also expired now.
    */
   private close(f: EntityEdge, at: Date, reason: string): void {
+    // the end the fact had before this episode, for forgetEpisode to restore
+    const before = this.invalidated.includes(f) ? f.attributes.previousEnd : f.invalidAt?.toISOString();
     f.invalidAt = at;
     if (this.created.has(f)) return;
     f.expiredAt = this.now;
-    f.attributes = { ...f.attributes, invalidatedBy: reason.slice(0, 120) };
+    f.attributes = {
+      ...withoutEpisodeClosure(f.attributes),
+      invalidatedBy: reason.slice(0, 120),
+      closedByEpisode: this.episode.uuid,
+      ...(before ? { previousEnd: before } : {}),
+    };
     this.dirtyFacts.add(f);
     if (!this.invalidated.includes(f)) this.invalidated.push(f);
   }

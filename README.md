@@ -70,7 +70,8 @@ sudo deploy/install.sh --user minizep     # 启用、重启、等 /health 就绪
 | 时序语义单测（时间窗/时间旅行/历史保留） | ✅ 双时间轴：有效时间 `at` + 知识时间 `as_of` |
 | 摄取串行化（并发不再产生重复实体） | ✅ 按 group 加锁：同一 group 串行，不同 group 并发（竞态曾用探针证实：10 并发 → 10 个重复实体） |
 | 幂等（同文本同 group 同一天只摄取一次） | ✅ 键 = 规范化内容哈希 + `validAt` 的 UTC 日期，或显式 `idempotencyKey`；只跳过已处理成功的重复，失败/未完成的原地重新处理 |
-| LLM 失败隔离 + 重试恢复 | ✅ episode 先以 pending 落盘，失败标记 failed 并保留原文，`retryFailed()` 原地重试；启动时恢复 pending |
+| LLM 失败隔离 + 重试恢复 | ✅ episode 先以 pending 落盘，失败标记 failed 并保留原文；服务在后台定时原地重试（每条最多 `MINIZEP_RETRY_MAX` 次），`retry_failed` 手工重试；启动时恢复 pending；抽取用 JSON mode，回复解析失败时带着错误再问一次 |
+| 自描述、自维护 | ✅ MCP `instructions` + `memory_guide` 工具（[docs/MEMORY-GUIDE.md](docs/MEMORY-GUIDE.md)）教会任何接入的模型怎么写、怎么查、怎么修；工具带 read-only/destructive 标注；`forget_episode` 撤回一条 episode 带来的全部改动 |
 | Postgres + pgvector 存储后端 | ✅ 与内存实现跑同一套契约测试 |
 | JSON → 数据库迁移 | ✅ 幂等，重映射实体 uuid，保留时间窗 |
 | 测试隔离（独立 schema） | ✅ 每个测试文件独立 schema，可并行 |
@@ -227,7 +228,18 @@ npm run build
 | `facts_about` | 某实体的全部事实及有效期 |
 | `facts_at` | 指定时刻图中为真的事实 |
 | `list_entities` / `list_episodes` | 实体列表 / 原始 episode（溯源） |
-| `graph_stats` | 图谱统计 |
+| `get_episode` / `memory_job_status` | 一条 episode 的全文及其产生的事实 / 异步摄取任务的状态 |
+| `invalidate_fact` | 手工结束或撤回一条事实（历史保留，`as_of` 仍能看到修正前的认知） |
+| `reopen_fact` | 撤销一次错误的结束或撤回：旧记录撤回并留在历史里，插入一份从原起点起有效的更正副本 |
+| `forget_episode` | 整条笔记是错的或不该记：只由它支撑的事实撤回，其他事实去掉这条证据，被它关闭的事实重新打开，它最后写的实体摘要改回；原文保留，状态为 `forgotten`。事实行末尾的 `ep` 就是笔记的 id |
+| `retry_failed` | 原地重试抽取失败的 episode（包括后台重试已放弃的） |
+| `graph_stats` | 图谱统计（含失败、已放弃重试、已遗忘的 episode 数） |
+| `memory_guide` | 使用方法全文（写什么、怎么写、怎么查、什么情况用哪个工具修），即 [docs/MEMORY-GUIDE.md](docs/MEMORY-GUIDE.md) |
+
+接入的模型不需要客户端侧的提示词：`initialize` 返回的 `instructions` 讲清基本流程（回答前先查，
+一件事一次 `add_memory`、主语写全名、`valid_at` 写发生时间，用户纠正时当场修），细节在 `memory_guide`。
+工具带 MCP 标注：只读工具 `readOnlyHint`，`invalidate_fact`/`reopen_fact`/`forget_episode` 为
+`destructiveHint`，客户端可据此自动放行查询、修改前询问。
 
 ## 配置
 
@@ -238,6 +250,9 @@ npm run build
 | `MINIZEP_LLM_PROVIDER` | `deepseek` | 从 `~/.openclaw/openclaw.json` 读取凭据 |
 | `MINIZEP_LLM_MODEL` | `deepseek-flash` | **不要用 `deepseek-v4-pro`**（见下） |
 | `MINIZEP_LLM_API_KEY` / `MINIZEP_LLM_BASE_URL` | — | 显式覆盖，优先于配置文件 |
+| `MINIZEP_LLM_JSON_MODE` | `1` | 请求 `response_format: {"type":"json_object"}`（DeepSeek、OpenAI 支持）；端点不认这个字段时设 `0` |
+| `MINIZEP_RETRY_INTERVAL_MS` | `600000` | 后台重试失败 episode 的间隔，`0` 关闭 |
+| `MINIZEP_RETRY_MAX` | `3` | 一条 episode 尝试到这个次数后后台不再重试（`retry_failed` 仍可手工重试） |
 | `MINIZEP_EMBED_URL` | `http://127.0.0.1:11435` | llama.cpp / vLLM / 任意 OpenAI 兼容端点 |
 | `MINIZEP_EMBED_MODEL` | `qwen3-embed` | |
 | `MINIZEP_SEARCH_MIN_COSINE` | `0.4` | 检索的相关度下限：既没有关键词命中、也不靠近查询所提实体的事实，余弦低于它就不返回（见下） |
@@ -261,13 +276,19 @@ llama-server -m qwen3-embed-q8.gguf --embedding --pooling last -ngl 99 --port 11
 1. **级联失效只靠 prompt** —— "Alice 离职"时 prompt 要求 LLM 同时失效依附于它的 `HAS_ROLE`/`MEMBER_OF` 等事实，没有结构化的依赖约束；LLM 漏掉时依附事实仍为活跃。
 2. **实体消歧有限** —— 名称相同（大小写无关）才合并，`Alice` 和 `Alice Chen` 仍是两个实体（查询侧 `findEntities` 会按前缀/子串/名称向量给出候选），没有 Graphiti 那样的 LLM dedup。
 3. **快照体积** —— 向量直接存进 JSON，1024 维 × 每条实体/事实。1000 条量级约数十 MB，量大时应把向量拆到独立的二进制/向量库。
-4. **矛盾检测依赖 LLM** —— 抽取给出的 `invalidations` 是主路径，`detectContradiction` 只对同一对实体之间、以及同源同关系（换了目标）的事实兜底判断；两者都漏判时旧事实不会被关闭。
+4. **矛盾检测依赖 LLM** —— 抽取给出的 `invalidations` 是主路径，`detectContradiction` 只对同一对实体之间的事实兜底判断；
+   同源同关系、换了目标的事实只在一次只有一个值的关系上参与判断：`WORKS_AT`/`HAS_ROLE`/`HAS_TITLE`/`LIVES_IN`/`REPORTS_TO`，
+   以及抽取标了 `replacesPrevious` 的事实（雇主、职位、住址、上级、归属这类关系，或文本说新值取代了旧值），
+   因为多数关系可以同时有多个值（在多个数据集上评测、用多个工具）。判断要求两者不能同时成立，确认、补充、“不取代”都不算；
+   同一对实体、同一关系下判断为并存的另一条事实（如另一个任务在同一数据集上的评测）单独成边，只有复述才并入已有事实。
+   漏判时旧事实不会被关闭，误判时用 `reopen_fact` 撤销（结束时间还在将来的也可以）。
 5. **无 community 层** —— 没有 Graphiti 的 L2 社区聚类与增量摘要。
 6. **单实例、单写入进程** —— MCP 会话在进程内存里，服务重启后客户端要重新初始化会话，也不能多个实例分担同一批会话。
    每个数据库只能有一个写入进程：启动时会接管所有 `pending` 的 episode，另一个进程若正在处理其中一条，会被重复抽取。
    需要多个客户端时用一个 HTTP 服务 + `minizep-proxy`，不要让 stdio 版 `minizep-mcp` 直连同一个库。
-7. **`as_of` 只对事实的第一次变更精确** —— 每条事实只有一行，结束或撤回时就地改写。已经结束的事实不能再改结束时间
-   （返回冲突，只能撤回）；撤回一条已结束的事实后，撤回之前那段时间的 `as_of` 查询会看不到它原来的结束时间。
+7. **`as_of` 只对事实的第一次变更精确** —— 每条事实只有一行，结束或撤回时就地改写。已经结束的事实不能就地改结束时间
+   （返回冲突）：要么撤回，要么用 `reopen_fact` 撤回旧行、插入一份带正确结束时间（或仍然有效）的副本。撤回一条已结束的事实后
+   （`reopen_fact` 也是如此），从结束到撤回之间那段时间的 `as_of` 查询会看不到它原来的结束时间（重开时记在旧行的属性里）。
 8. **补录旧文档时依附事实可能漏关** —— 旧文档里的主关系（如 `WORKS_AT`）能正确落在已结束的窗口内，
    但同一篇里只在那段关系期间成立的附属事实（如"带领某团队"）不一定跟着关闭，LLM 在抽取旧文档时看不到后来的结束。
 9. **检索的相关度截断是粗粒度的** —— 只截掉“没有关键词命中、不靠近查询所提实体、余弦低于 `MINIZEP_SEARCH_MIN_COSINE`”
@@ -280,6 +301,12 @@ llama-server -m qwen3-embed-q8.gguf --embedding --pooling last -ngl 99 --port 11
 11. **没有第二个实体的事件只进摘要** —— 抽取规则要求事实的两端都是具名实体，所以"作业 X 被取消了"这类
     只涉及一个实体的事件会写进该实体的摘要，而不是一条事实；`search_facts` 查不到它，要用
     `facts_about`/实体摘要或原始 episode 才能看到。
+12. **`forget_episode` 撤回不到所有痕迹** —— 被它提前的事实起点不改回，实体标签不改；它最后写的实体摘要
+    改回写之前的样子，但之后被别的 episode 改写过的摘要不动，而且只记一层：一条 episode 的摘要改回后，
+    更早那条的就改不回了。它关闭的事实重新打开时，单值关系（如 `WORKS_AT`）里后来仍成立的值从哪天开始，
+    副本就在哪天结束；另一条 episode 也说了同一个变更时，这个事实保持关闭，列在结果的 `still_closed` 里。
+    记录"由哪条 episode 关闭/创建/写摘要"之前的旧数据没有这些标记：关闭只在 `unmarked_closures` 里列出，
+    不自动重开，摘要不改回。
 
 ## 打包与部署
 
