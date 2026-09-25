@@ -92,6 +92,9 @@ test('provider: the extraction prompt carries the reference time, known summarie
       // a changed property of one entity replaces its value in the summary, it is not a fact
       assert.match(system, /A summary states current values/);
       assert.match(system, /for a changing property kept in a fact \(address, port, version, status\) replaces the old one/);
+      // only an explicit replacement lets the pipeline end another value of the same relation
+      assert.match(system, /replacesPrevious is true ONLY when the text says the new value replaces an earlier one/);
+      assert.match(system, /A negated relationship \("X does not replace Y", "X is not part of Y"\) is neither a fact nor an\s+invalidation/);
     },
   );
 });
@@ -120,10 +123,11 @@ test('provider: start dates are shown as calendar days of the configured zone, l
     () => ({ contradicts: false, which: [] }),
     async (requests) => {
       const llm = new OpenAICompatLLM({ baseUrl: 'http://llm.invalid', apiKey: 'test', model: 'stub', timeZone: 'Asia/Shanghai', retries: 1 });
-      await llm.detectContradiction({ sourceName: 'Alice', targetName: 'Globex', fact: 'Alice joined Globex', validAt: start }, [
+      await llm.detectContradiction({ sourceName: 'Alice', targetName: 'Globex', fact: 'Alice joined Globex', validAt: start, replacesPrevious: true }, [
         { fact: 'Alice works at Acme', validAt: start },
       ]);
       assert.equal(userOf(requests[0]).match(/\(since 2026-03-01\)/g)?.length, 2);
+      assert.match(userOf(requests[0]), /^New fact \(the text says it replaces an earlier value\): Alice joined Globex/);
     },
   );
 });
@@ -151,13 +155,17 @@ test('provider: facts may reference known entities that the reply did not list a
   await withChatStub(
     () => ({
       entities: [{ name: 'Globex', labels: ['Organization'], summary: '' }],
-      facts: [{ sourceName: 'Alice Chen', targetName: 'Globex', relation: 'WORKS_AT', fact: 'Alice Chen joined Globex', validAt: '2026-02-27T00:00:00+00:00' }],
+      facts: [
+        { sourceName: 'Alice Chen', targetName: 'Globex', relation: 'WORKS_AT', fact: 'Alice Chen joined Globex', validAt: '2026-02-27T00:00:00+00:00', replacesPrevious: true },
+        { sourceName: 'Alice Chen', targetName: 'Globex', relation: 'OWNS_SHARES_IN', fact: 'Alice Chen owns shares in Globex', replacesPrevious: 'yes' },
+      ],
       invalidations: [],
     }),
     async () => {
       const out = await stubLLM().extract('She joined Globex.', ['Alice Chen'], []);
-      assert.equal(out.facts.length, 1, 'the pipeline, not the provider, decides whether an endpoint resolves');
+      assert.equal(out.facts.length, 2, 'the pipeline, not the provider, decides whether an endpoint resolves');
       assert.equal(out.facts[0].validAt?.toISOString(), '2026-02-27T00:00:00.000Z');
+      assert.deepEqual(out.facts.map((f) => f.replacesPrevious), [true, undefined], 'only an explicit true replaces');
     },
   );
 });
@@ -174,6 +182,13 @@ test('provider: detectContradiction uses its own prompt and returns the indexes 
       const system = systemOf(requests[0]);
       assert.doesNotMatch(system, /extract a temporal knowledge graph/, 'not the extraction prompt');
       assert.match(system, /"which"/);
+      // strict: only facts that cannot both hold are ended, and doubt ends nothing
+      assert.match(system, /ended ONLY when it and the new fact cannot both be true at the same time/);
+      assert.match(system, /a restatement, elaboration or confirmation of the same relationship/);
+      assert.match(system, /another value of a relationship that can have several at once/);
+      assert.match(system, /does not replace, is separate from, or is in addition to another/);
+      assert.match(system, /When unsure, the existing fact is not ended/);
+      assert.match(userOf(requests[0]), /^New fact: Alice was promoted/);
       assert.match(userOf(requests[0]), /2\. Alice is a senior engineer at Acme \(since 2024-01-01\)/);
     },
   );

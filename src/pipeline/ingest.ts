@@ -793,25 +793,31 @@ class EpisodeRun {
     // is over already, so this statement can only be more evidence for it.
     const restated = records.filter((f) => !this.created.has(f) && !isSame(f) && holds(f));
 
-    // b. contradictions: the facts between the same pair, plus the facts in
-    //    the same slot with another target (functional attributes such as
-    //    WORKS_AT, HAS_ROLE, LIVES_IN change target, not endpoints), that are
-    //    live now or held at validAt (a backfilled statement can replace a
-    //    value that has since ended). A statement with an unknown start
-    //    cannot end anything.
+    // b. contradictions: the facts between the same pair that are live now or
+    //    held at validAt (a backfilled statement can replace a value that has
+    //    since ended). The facts in the same slot with another target are
+    //    candidates only when the text says this value replaces an earlier one
+    //    (a new employer, home or title changes target, not endpoints), or
+    //    when such a fact replaced an earlier value after this statement's
+    //    start (a document added late): most relations hold several values at
+    //    once (evaluated on several datasets, uses several tools). A statement
+    //    with an unknown start cannot end anything.
     let ended: EntityEdge[] = [];
     if (validAt) {
+      const replaces = plan.cand.replacesPrevious === true;
+      const exclusive = (f: EntityEdge) =>
+        replaces || (f.attributes?.replacesPrevious === true && !!f.validAt && f.validAt > validAt);
       const candidates = pool.filter(
         (f) =>
           !this.created.has(f) &&
           !isRetracted(f) &&
           !(records.includes(f) && isSame(f)) &&
           (isLive(f, this.now) || covers(f, validAt)) &&
-          (connects(f, src, tgt) || (sameSlot(f) && f.targetNodeUuid !== tgt.uuid)),
+          (connects(f, src, tgt) || (sameSlot(f) && f.targetNodeUuid !== tgt.uuid && exclusive(f))),
       );
       if (candidates.length > 0) {
         const answer: unknown = await this.llm.detectContradiction(
-          { sourceName: src.name, targetName: tgt.name, fact: text, relation, validAt },
+          { sourceName: src.name, targetName: tgt.name, fact: text, relation, validAt, replacesPrevious: replaces },
           candidates.map((f) => ({ fact: f.fact, validAt: f.validAt, invalidAt: f.invalidAt })),
         );
         ended = pickContradicted(answer, candidates);
@@ -853,7 +859,8 @@ class EpisodeRun {
       validAt,
       invalidAt: end,
       createdAt: this.now,
-      attributes: {},
+      // kept so that an older value added later still ends where this one began
+      attributes: plan.cand.replacesPrevious === true ? { replacesPrevious: true } : {},
     };
     this.work.set(edge.uuid, edge);
     this.created.add(edge);

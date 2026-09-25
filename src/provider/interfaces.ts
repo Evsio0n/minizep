@@ -19,6 +19,13 @@ export interface ExtractedFact {
   validAt?: Date;
   /** when the fact stopped being true, if the text says so */
   invalidAt?: Date;
+  /**
+   * The text says this value replaces an earlier one ("moved to", "now works
+   * at", "changed from X to Y"). Only then are the facts with the same source
+   * and relation but another target checked for contradiction; most relations
+   * can hold several values at once. Absent means false.
+   */
+  replacesPrevious?: boolean;
 }
 
 /**
@@ -82,6 +89,8 @@ export interface ContradictionCandidate {
   fact: string;
   relation?: string;
   validAt?: Date;
+  /** the text says it replaces an earlier value (see ExtractedFact) */
+  replacesPrevious?: boolean;
 }
 
 /** An existing fact that the candidate might end. */
@@ -101,8 +110,10 @@ export interface LLMProvider {
   /**
    * Which existing facts does the candidate end? Returns their 0-based indexes
    * into `existing` (empty: none). `existing` holds the active facts between
-   * the same pair plus those with the same source and relation but another
-   * target. Providers written against the old boolean contract are still
+   * the same pair; facts with the same source and relation but another target
+   * only when the candidate replaces an earlier value, or when such a fact
+   * replaced an earlier value after the candidate began (a document added
+   * late). Providers written against the old boolean contract are still
    * accepted by the pipeline: `true` means "all of them".
    */
   detectContradiction(

@@ -103,7 +103,7 @@ export const fact = (
   sourceName: string,
   targetName: string,
   relation: string,
-  extra: Partial<{ validAt: Date; invalidAt: Date }> = {},
+  extra: Partial<{ validAt: Date; invalidAt: Date; replacesPrevious: boolean }> = {},
 ) => ({
   sourceName,
   targetName,

@@ -43,7 +43,7 @@ export interface LLMConfig {
 const EXTRACTION_SYSTEM = `You extract a temporal knowledge graph from one text.
 Return ONLY a JSON object, no prose, no markdown fences:
 {"entities":[{"name":"string","labels":["Person"|"Organization"|"Product"|"Host"|"Project"|"Job"|"Role"|"Concept"|"Event"|"Location"|"Preference"],"summary":"string"}],
- "facts":[{"sourceName":"string","targetName":"string","relation":"SCREAMING_SNAKE_CASE","fact":"self-contained sentence","validAt":"ISO-8601 or null","invalidAt":"ISO-8601 or null"}],
+ "facts":[{"sourceName":"string","targetName":"string","relation":"SCREAMING_SNAKE_CASE","fact":"self-contained sentence","validAt":"ISO-8601 or null","invalidAt":"ISO-8601 or null","replacesPrevious":false}],
  "invalidations":[{"sourceName":"string","targetName":"string","relation":"SCREAMING_SNAKE_CASE or null","invalidAt":"ISO-8601 or null","reason":"short justification"}]}
 
 Time — the message starts with a reference time: when the text was written, with its UTC offset and weekday.
@@ -104,6 +104,12 @@ facts vs invalidations — this distinction is critical:
 - A new value for a single-valued relationship (employer, title, role, team, home city, manager) or
   for a changing property kept in a fact (address, port, version, status) replaces the old one: emit
   the new fact and invalidate the old one. Only a property kept in a summary is updated there.
+- replacesPrevious is true ONLY when the text says the new value replaces an earlier one ("moved to",
+  "switched to", "now works at", "changed from X to Y", "was replaced by", 改为, 搬到, 换成, 取代);
+  otherwise false. Another value of a relationship that can have several (evaluated on several
+  datasets, uses several tools, member of several teams) replaces nothing.
+- A negated relationship ("X does not replace Y", "X is not part of Y") is neither a fact nor an
+  invalidation: keep what it says in the sentence of a positive fact or in an entity summary.
 - invalidAt = when it ended, resolved against the reference time; null when the text gives no clue.
 - If a relationship both starts and ends within this text, put it in "facts" with invalidAt.
 - Emit empty arrays when a category has no entries.
@@ -117,18 +123,31 @@ Output:
 {"entities":[{"name":"Alice Chen","labels":["Person"],"summary":"Alice Chen, formerly a backend engineer on Acme Corp's payments team, is a Staff Engineer at Globex."},
   {"name":"Globex","labels":["Organization"],"summary":"Globex is a company that Alice Chen joined as a Staff Engineer."},
   {"name":"Staff Engineer","labels":["Role"],"summary":"Staff Engineer is Alice Chen's role at Globex."}],
- "facts":[{"sourceName":"Alice Chen","targetName":"Globex","relation":"WORKS_AT","fact":"Alice Chen joined Globex as a Staff Engineer after leaving Acme Corp on 2026-02-27","validAt":null,"invalidAt":null},
-  {"sourceName":"Alice Chen","targetName":"Staff Engineer","relation":"HAS_ROLE","fact":"Alice Chen is a Staff Engineer at Globex","validAt":null,"invalidAt":null}],
+ "facts":[{"sourceName":"Alice Chen","targetName":"Globex","relation":"WORKS_AT","fact":"Alice Chen joined Globex as a Staff Engineer after leaving Acme Corp on 2026-02-27","validAt":null,"invalidAt":null,"replacesPrevious":true},
+  {"sourceName":"Alice Chen","targetName":"Staff Engineer","relation":"HAS_ROLE","fact":"Alice Chen is a Staff Engineer at Globex","validAt":null,"invalidAt":null,"replacesPrevious":true}],
  "invalidations":[{"sourceName":"Alice Chen","targetName":"Acme Corp","relation":"WORKS_AT","invalidAt":"2026-02-27T00:00:00+00:00","reason":"left Acme Corp last Friday"},
   {"sourceName":"Alice Chen","targetName":"backend engineer","relation":"HAS_ROLE","invalidAt":"2026-02-27T00:00:00+00:00","reason":"the role ended with leaving Acme Corp"},
   {"sourceName":"Alice Chen","targetName":"payments team","relation":"MEMBER_OF","invalidAt":"2026-02-27T00:00:00+00:00","reason":"the team membership ended with leaving Acme Corp"}]}`;
 
 const CONTRADICTION_SYSTEM = `You maintain a temporal knowledge graph. You get one NEW fact and a numbered
 list of EXISTING facts, and decide which existing facts stop being true once the new fact holds.
-An existing fact is ended when the new fact replaces it: another employer, title, role, team, manager,
-home, owner, status, date or value for the same thing; a reversal; an explicit update.
-It is NOT ended when both can hold at the same time (working at a company and owning shares in it;
-a role and a team membership; two hobbies), or when the new fact only adds detail to it.
+An existing fact is ended ONLY when it and the new fact cannot both be true at the same time: another
+employer, title, manager, home, owner, status or value for a thing that has one at a time; a reversal.
+These are NOT contradictions, the existing fact stays true:
+- a restatement, elaboration or confirmation of the same relationship ("still valid", "remains",
+  "confirmed", more detail about it);
+- another value of a relationship that can have several at once (evaluated on several datasets, uses
+  several tools, member of several teams, runs several jobs; working at a company and owning shares in
+  it; a role and a team membership);
+- a statement that something does not replace, is separate from, or is in addition to another;
+- a fact about a different scope (another dataset, version or run) or a period that does not overlap.
+When unsure, the existing fact is not ended.
+Examples:
+- NEW "Model M was also evaluated on benchmark B2"; EXISTING 1. "Model M was evaluated on benchmark B1"
+  -> {"contradicts": false, "which": []}
+- NEW "The Q3 test result of service S still stands"; EXISTING 1. "Service S passed the Q3 test"
+  -> {"contradicts": false, "which": []}
+- NEW "Dana moved from Initech to Globex"; EXISTING 1. "Dana works at Initech" -> {"contradicts": true, "which": [1]}
 Dates in parentheses are when each fact started. The new fact may be OLDER than an existing one (a
 document added late): still list every existing fact it cannot hold together with; the order in time is
 taken from the dates.
@@ -230,6 +249,7 @@ export class OpenAICompatLLM implements LLMProvider {
         fact: string;
         validAt?: string | null;
         invalidAt?: string | null;
+        replacesPrevious?: boolean | null;
       }[];
       invalidations?: {
         sourceName: string;
@@ -268,6 +288,8 @@ export class OpenAICompatLLM implements LLMProvider {
         fact: f.fact.trim(),
         validAt: toDate(f.validAt),
         invalidAt: toDate(f.invalidAt),
+        // only an explicit true: a missing or malformed flag replaces nothing
+        ...(f.replacesPrevious === true ? { replacesPrevious: true } : {}),
       }));
 
     // invalidations may name endpoints that already exist; they do not have to
@@ -313,7 +335,8 @@ export class OpenAICompatLLM implements LLMProvider {
     const list = existing.map((e, i) => `${i + 1}. ${e.fact}${since(e.validAt, this.timeZone)}`).join('\n');
     const raw = await this.chat(
       CONTRADICTION_SYSTEM,
-      `New fact: ${candidate.fact}${since(candidate.validAt, this.timeZone)}\n\nExisting facts:\n${list}`,
+      `New fact${candidate.replacesPrevious ? ' (the text says it replaces an earlier value)' : ''}: ` +
+        `${candidate.fact}${since(candidate.validAt, this.timeZone)}\n\nExisting facts:\n${list}`,
       this.cfg.maxTokens ?? 8000,
     );
     return parseContradiction(parseJsonObject(raw), existing.length);
