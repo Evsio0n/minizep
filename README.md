@@ -135,7 +135,8 @@ agent ──► <gateway>:11435 ──► <compute-node>:<job-port> (llama.cpp)
 ```
 
 - `llamacpp-serve.sh`：Slurm 作业模板（分区等占位符见文件头注释，路径用环境变量）。不固定节点；
-  端口由作业号推导（`PORT_BASE + SLURM_JOB_ID % PORT_RANGE`），新旧作业落在同一节点也不冲突。
+  端口由作业号推导（`PORT_BASE + SLURM_JOB_ID % PORT_RANGE`），该端口在节点上已被占用时（例如同节点上
+  另一个作业号相差 `PORT_RANGE` 整数倍的作业）顺延到范围内下一个空闲端口。
   启动时把 `<节点IP>:<端口>` 写入 `$BASE/endpoints/<jobid>`，退出时删除。
 - `supervise.sh`：每 `INTERVAL` 秒检查一次，维护 `$BASE/current-target`（只指向健康的后端）。
 - `embed-proxy.py`：TCP 转发到 `current-target`；没有可用后端时返回 HTTP 503 + JSON 错误，而不是直接断开。
@@ -143,16 +144,37 @@ agent ──► <gateway>:11435 ──► <compute-node>:<job-port> (llama.cpp)
 **滚动续期**：Slurm 有 7 天时限，所以"常驻"靠提前换班，而不是等作业消失再重投：
 
 1. 所有运行中/排队中的作业剩余时间都不超过 `LEAD`（默认 3 小时）时，提交新作业；一个都没有时同样提交（冷启动）。
-2. 新作业的 `GET /health` 返回 200（模型加载完成）后，`current-target` 才原子地切到它（总是指向最新的健康作业）。
+   剩余时间为 `INVALID`（已超时限）的作业不算覆盖。
+2. 新作业的 `GET /health` 返回 200（模型加载完成）后，`current-target` 才原子地切到它（总是指向最新提交的健康作业；
+   新旧按提交时间判断，不按作业号，因为作业号会回绕）。健康检查直连节点，不走环境变量里的代理。
 3. 切换满 `GRACE` 秒（默认 300）后，取消同名的旧作业。
-4. 启动后或上次健康之后超过 `STALE_AFTER` 秒（默认 1800）仍不健康的作业会被取消，不再算作"已覆盖"，
-   所以卡住的新作业不会挡住下一次续期。`squeue` 失败时这一轮什么都不做。
+4. 运行中的作业从 supervisor 第一次看到它健康检查失败起，连续失败超过 `STALE_AFTER` 秒（默认 1800）就被取消，
+   不再算作"已覆盖"，所以卡住的新作业不会挡住下一次续期。返回 200、作业被重新排队（requeue），
+   或 supervisor 停了超过 `STALE_AFTER` 秒之后，都重新计时，所以 supervisor 重启不会误杀正在服务的作业。
+5. 所有作业都健康检查失败时（问题可能在网关这边），`current-target` 指向的作业不取消，但不再算覆盖，
+   会提交替补；等有作业恢复健康再取消它。
+6. 被 hold 的排队作业（`JobHeldUser`、`JobHeldAdmin`、`launch failed requeued held`）不会自己启动，
+   直接取消并重投。需要手动 hold 作业时先停掉 supervisor。
+
+`squeue` 失败时这一轮什么都不做。同一个 `BASE` 只能有一个 supervisor（`flock`），`DRY_RUN=1` 可以同时旁观。
 
 ```bash
 DRY_RUN=1 ONCE=1 BASE=<job-dir> infra/embedding/supervise.sh   # 只打印决策，不做任何改动
-bash infra/embedding/test/supervise.test.sh                     # 假 squeue/sbatch/scancel/curl/getent
+bash infra/embedding/test/supervise.test.sh                     # 假 squeue/sbatch/scancel/curl/getent/ss
 python3 infra/embedding/test/test_embed_proxy.py
 ```
+
+**从旧版 supervisor 迁移**：旧作业脚本固定端口和节点，也不写 `endpoints/`；只换 `supervise.sh` 的话，
+续期提交的仍是旧脚本，新作业永远不会成为目标，旧作业到时限照样断服。所以要一起换：
+
+1. 停掉旧的 supervisor（`kill <pid>`）。
+2. 把 `infra/embedding/llamacpp-serve.sh` 复制到 `$BASE/llamacpp-serve.sh`（`JOBSCRIPT` 的默认值），
+   填好分区等占位符。
+3. `DRY_RUN=1 ONCE=1 BASE=<job-dir> infra/embedding/supervise.sh` 确认决策，再用 nohup 启动新的 supervisor。
+
+正在运行的旧作业没有 `endpoints/<jobid>`，不做健康检查也不会被取消，`current-target` 保持原值；
+到续期时提交的新作业健康后才切过去，旧作业在 `GRACE` 秒后取消。`JOBSCRIPT` 不写 `endpoints/` 时
+supervisor 启动时会告警；运行超过 5 分钟仍没有发布端点的作业也会告警。
 
 > 本文档中的 `<gateway>` / `<compute-node>` 是占位符；实际部署时由 `MINIZEP_EMBED_URL` 指定。
 
