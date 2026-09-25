@@ -76,6 +76,22 @@ export function runStoreConformance(name: string, makeStore: () => Promise<Graph
     });
   });
 
+  test(`[${name}] an episode is fetched by uuid, and re-saving it updates its status in place`, async () => {
+    await withStore(async (s) => {
+      const ep = episode({ status: 'pending', contentHash: 'k@2024-01-01' });
+      await s.addEpisode(ep);
+      assert.equal((await s.getEpisode(ep.uuid))?.status, 'pending');
+
+      await s.addEpisode({ ...ep, status: 'failed', error: 'embeddings API 502' });
+      await s.addEpisode({ ...ep, status: 'processed', error: undefined });
+      const got = await s.getEpisode(ep.uuid);
+      assert.equal(got?.status, 'processed');
+      assert.equal(got?.error, undefined, 'a cleared error is cleared in storage too');
+      assert.equal((await s.getEpisodes('g1')).length, 1, 'still one record');
+      assert.equal(await s.getEpisode(uuid()), undefined);
+    });
+  });
+
   test(`[${name}] episodes are scoped by group and removable`, async () => {
     await withStore(async (s) => {
       const a = episode({ groupId: 'g1' });

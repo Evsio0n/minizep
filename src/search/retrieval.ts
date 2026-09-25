@@ -92,11 +92,16 @@ export function hashEmbed(text: string, dims = 256): number[] {
 
 /** Reciprocal Rank Fusion: rank-based, score-scale agnostic. */
 export function rrfFuse(rankings: string[][], k = 60): string[] {
+  return rrfFuseScored(rankings, k).map((r) => r.id);
+}
+
+/** RRF keeping the fused score, best first (exposed on search results). */
+export function rrfFuseScored(rankings: string[][], k = 60): { id: string; score: number }[] {
   const scores = new Map<string, number>();
   for (const ranking of rankings) {
     ranking.forEach((id, rank) => {
       scores.set(id, (scores.get(id) ?? 0) + 1 / (k + rank + 1));
     });
   }
-  return [...scores.entries()].sort((a, b) => b[1] - a[1]).map(([id]) => id);
+  return [...scores.entries()].sort((a, b) => b[1] - a[1]).map(([id, score]) => ({ id, score }));
 }

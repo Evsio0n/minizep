@@ -8,8 +8,13 @@ import { isFactActive } from '../model/types.js';
  * a database-backed one cannot, and the pipeline must not care which it has.
  */
 export interface GraphStore {
+  /** vector length the store accepts, when it is fixed (or already pinned) */
+  readonly embeddingDims?: number;
+
   // episodes
+  /** insert, or update an existing uuid in place (status, error, key) */
   addEpisode(ep: EpisodicNode): Promise<void>;
+  getEpisode(uuid: UUID): Promise<EpisodicNode | undefined>;
   getEpisodes(groupId?: string): Promise<EpisodicNode[]>;
   /** remove an episode record (used when a failed episode is reprocessed) */
   removeEpisode(uuid: UUID): Promise<void>;
@@ -43,6 +48,10 @@ export function isSnapshotable(store: GraphStore): store is GraphStore & Snapsho
 /**
  * In-memory graph with adjacency indexes. Fast, dependency-free, and the
  * reference implementation the other backends are tested against.
+ *
+ * Like the database's vector(N) columns, it pins the embedding dimension: the
+ * first vector stored fixes it, and a vector of another length is rejected
+ * instead of being scored against an incompatible space.
  */
 export class MemoryGraphStore implements GraphStore, Snapshotable {
   private episodes = new Map<UUID, EpisodicNode>();
@@ -50,9 +59,31 @@ export class MemoryGraphStore implements GraphStore, Snapshotable {
   private facts = new Map<UUID, EntityEdge>();
   private byName = new Map<string, UUID>();
   private byEntity = new Map<UUID, Set<UUID>>();
+  private dims: number | undefined;
+
+  /** pinned by the first vector stored */
+  get embeddingDims(): number | undefined {
+    return this.dims;
+  }
+
+  /** Same failure (and wording) as PostgresStore for a wrong-length vector. */
+  private checkDims(embedding?: number[]): void {
+    if (!embedding || embedding.length === 0) return;
+    if (this.dims === undefined) {
+      this.dims = embedding.length;
+    } else if (embedding.length !== this.dims) {
+      throw new Error(
+        `embedding dimension mismatch: store expects ${this.dims}, got ${embedding.length}. ` +
+          `Changing the embedding model requires re-indexing (see README).`,
+      );
+    }
+  }
 
   async addEpisode(ep: EpisodicNode): Promise<void> {
     this.episodes.set(ep.uuid, ep);
+  }
+  async getEpisode(uuid: UUID): Promise<EpisodicNode | undefined> {
+    return this.episodes.get(uuid);
   }
   async getEpisodes(groupId?: string): Promise<EpisodicNode[]> {
     return [...this.episodes.values()].filter((e) => !groupId || e.groupId === groupId);
@@ -62,6 +93,7 @@ export class MemoryGraphStore implements GraphStore, Snapshotable {
   }
 
   async upsertEntity(node: EntityNode): Promise<void> {
+    this.checkDims(node.nameEmbedding);
     // Mirror the database's UNIQUE (group_id, lower(name)) constraint: a second
     // entity with the same name in the same group updates the existing one.
     // Its uuid stays stable — facts already point at it, and stable identity is
@@ -95,11 +127,13 @@ export class MemoryGraphStore implements GraphStore, Snapshotable {
   }
 
   async addFact(edge: EntityEdge): Promise<void> {
+    this.checkDims(edge.factEmbedding);
     this.facts.set(edge.uuid, edge);
     this.link(edge.sourceNodeUuid, edge.uuid);
     this.link(edge.targetNodeUuid, edge.uuid);
   }
   async updateFact(edge: EntityEdge): Promise<void> {
+    this.checkDims(edge.factEmbedding);
     this.facts.set(edge.uuid, edge);
   }
   private link(entity: UUID, fact: UUID): void {
@@ -147,6 +181,11 @@ export class MemoryGraphStore implements GraphStore, Snapshotable {
     this.facts.clear();
     this.byName.clear();
     this.byEntity.clear();
+    // a snapshot pins the dimension it was written with (not re-validated:
+    // an old snapshot must still load, even if it holds mixed vectors)
+    this.dims =
+      (data.facts ?? []).find((f) => f.factEmbedding?.length)?.factEmbedding?.length ??
+      (data.entities ?? []).find((n) => n.nameEmbedding?.length)?.nameEmbedding?.length;
     for (const ep of data.episodes ?? []) this.episodes.set(ep.uuid, ep);
     for (const n of data.entities ?? []) {
       this.entities.set(n.uuid, n);

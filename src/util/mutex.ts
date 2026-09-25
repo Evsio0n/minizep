@@ -32,3 +32,31 @@ export class Mutex {
     });
   }
 }
+
+/**
+ * One Mutex per key. Ingestion only needs a defined order WITHIN a memory
+ * group (entities and facts never cross groups), so different groups run
+ * concurrently while the same group stays strictly serialised. Idle keys are
+ * dropped so the map does not grow with every group ever seen.
+ */
+export class KeyedMutex {
+  private locks = new Map<string, { mutex: Mutex; users: number }>();
+
+  /** Run `fn` exclusively for `key`; callers with the same key queue in FIFO order. */
+  run<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    let entry = this.locks.get(key);
+    if (!entry) this.locks.set(key, (entry = { mutex: new Mutex(), users: 0 }));
+    const lock = entry;
+    lock.users++;
+    return lock.mutex.run(fn).finally(() => {
+      if (--lock.users === 0 && this.locks.get(key) === lock) this.locks.delete(key);
+    });
+  }
+
+  /** Queued or running operations across all keys (for metrics/tests). */
+  get pending(): number {
+    let n = 0;
+    for (const { users } of this.locks.values()) n += users;
+    return n;
+  }
+}
