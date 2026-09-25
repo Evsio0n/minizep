@@ -83,6 +83,7 @@ class EmbedProxyTest(unittest.TestCase):
     def assert_unavailable(self, status: int, headers: dict, body: bytes) -> None:
         self.assertEqual(status, 503)
         self.assertEqual(headers.get("Content-Type"), "application/json")
+        self.assertEqual(headers.get("Retry-After"), "5")
         error = json.loads(body)["error"]
         self.assertEqual(error["code"], 503)
         self.assertEqual(error["type"], "unavailable_error")
