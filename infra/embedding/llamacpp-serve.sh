@@ -20,8 +20,9 @@
 #   CUDA_LIB    CUDA runtime directory prepended to LD_LIBRARY_PATH (optional)
 #   LLAMA_HOME  HOME for llama.cpp caches  (default /tmp/minizep-llama-home)
 #   PORT_BASE, PORT_RANGE  port = PORT_BASE + SLURM_JOB_ID % PORT_RANGE (default 20000,
-#               12000: two jobs on one node do not collide, and the range stays below
-#               the Linux ephemeral ports)
+#               12000, below the Linux ephemeral ports). Two jobs whose ids differ by a
+#               multiple of PORT_RANGE get the same port, so when something on the node
+#               already listens there the next free port in the range is used.
 #   NODE_IFACE  publish this interface's IPv4 address (default: resolve the hostname)
 #
 # While llama-server runs, $BASE/endpoints/$SLURM_JOB_ID holds "<node-ip>:<port>"; it is
@@ -44,10 +45,28 @@ CTX="${CTX:-4096}"
 NGL="${NGL:-99}"
 PORT_BASE="${PORT_BASE:-20000}"
 PORT_RANGE="${PORT_RANGE:-12000}"
-PORT=$(( PORT_BASE + SLURM_JOB_ID % PORT_RANGE ))
 ENDPOINT_FILE="$BASE/endpoints/$SLURM_JOB_ID"
 
 log() { echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] $*"; }
+
+# Does anything on this node listen on TCP port $1?
+port_in_use() {
+  if command -v ss >/dev/null 2>&1; then
+    [[ $(ss -ltn "sport = :$1" 2>/dev/null) == *LISTEN* ]]
+  else
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+  fi
+}
+
+# PORT_BASE + SLURM_JOB_ID % PORT_RANGE, or the first free port after it in the range.
+pick_port() {
+  local i port
+  for (( i = 0; i < 100 && i < PORT_RANGE; i++ )); do
+    port=$(( PORT_BASE + (SLURM_JOB_ID + i) % PORT_RANGE ))
+    port_in_use "$port" || { echo "$port"; return 0; }
+  done
+  return 1
+}
 
 # First non-loopback IPv4 address of this node, as seen from the gateway.
 node_ip() {
@@ -79,6 +98,10 @@ trap on_signal TERM INT HUP
 ip=$(node_ip)
 if [ -z "$ip" ]; then
   log "cannot determine this node's IP address (set NODE_IFACE)"
+  exit 1
+fi
+if ! PORT=$(pick_port); then
+  log "no free port among the 100 from $(( PORT_BASE + SLURM_JOB_ID % PORT_RANGE )) (see PORT_BASE, PORT_RANGE)"
   exit 1
 fi
 
