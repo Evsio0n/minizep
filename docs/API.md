@@ -448,7 +448,8 @@ retracted. To undo a wrong end or retraction, [reopen](#post-v1factsuuidreopen) 
 
 ### POST /v1/facts/:uuid/reopen
 
-Undo a wrong end or retraction, e.g. an ingestion that closed a fact which is still true.
+Undo a wrong end or retraction, e.g. an ingestion that closed a fact which is still true. The end
+may still be in the future (a change "effective next Monday" that should not have ended the fact).
 `:uuid` is the fact uuid or a prefix of at least 8 characters.
 
 | Field        | Type   | Notes |
@@ -475,8 +476,8 @@ both:
 An `as_of` before the reopen finds the old row and not the copy; from the reopen on, only the
 copy, and the old row is `retracted` at every `at`. As with any retraction of an ended fact, an
 `as_of` between the wrong end and the reopen sees the old row without that end. 409 when the fact
-is active or has not ended (`nothing to reopen`), was already reopened, or `invalid_at` is not after
-its start.
+has no end and is not retracted (`nothing to reopen`), was already reopened, or `invalid_at` is not
+after its start.
 
 ### GET /v1/stats
 

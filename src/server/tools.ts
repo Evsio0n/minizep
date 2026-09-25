@@ -301,10 +301,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'Reopen fact',
       description:
-        'Undo a wrong end or retraction (e.g. ingestion closed a fact that is still true). The fact is ' +
-        'true again from its original start, until `invalid_at` if given. The wrongly closed record is ' +
-        'retracted but kept (as_of before now still shows it); the corrected copy gets a new id. ' +
-        'Refused while the fact is active.',
+        'Undo a wrong end or retraction (e.g. ingestion closed a fact that is still true), also an end ' +
+        'that is still in the future. The fact is true again from its original start, until `invalid_at` ' +
+        'if given. The wrongly closed record is retracted but kept (as_of before now still shows it); the ' +
+        'corrected copy gets a new id. Refused for a fact with no end that is not retracted.',
       inputSchema: shapes.reopenFact,
     },
     (args) =>

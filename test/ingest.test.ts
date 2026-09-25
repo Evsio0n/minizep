@@ -750,13 +750,16 @@ test('ingest: a fact can be ended or retracted by hand, only within its own grou
 
 test('ingest: a fact an episode closed by mistake is reopened; as_of before the reopen finds the old record, after it only the copy', async () => {
   const pair = [entity('job J1', ['Job']), entity('dataset D', ['Concept'])];
-  const says = (relation: string, text: string) => ({ ...fact('job J1', 'dataset D', relation), fact: text });
+  const says = (relation: string, text: string, validAt?: Date) => ({ ...fact('job J1', 'dataset D', relation, { validAt }), fact: text });
+  const soon = new Date(Date.now() + 7 * 86_400_000);
   // a judge that ends whatever it is shown, as an over-eager model did with a confirmation
   const llm = new ScriptedLLM(
     (content) =>
       content.startsWith('uses')
         ? scenario(pair, [says('USES', 'job J1 uses dataset D')])
-        : scenario(pair, [says('EVALUATED_ON', 'the result of job J1 on dataset D still stands')]),
+        : content === 'rerun next week'
+          ? scenario(pair, [says('SCHEDULED_ON', 'job J1 will run on dataset D again next week', soon)])
+          : scenario(pair, [says('EVALUATED_ON', 'the result of job J1 on dataset D still stands')]),
     true,
   );
   const zep = new Minizep({ llm, embedder: deterministicEmbedder() });
@@ -802,9 +805,18 @@ test('ingest: a fact an episode closed by mistake is reopened; as_of before the 
   await assert.rejects(zep.ingest.reopenFact(copy.uuid, { groupId: 'g', reason: 'x' }), /nothing to reopen/);
   await assert.rejects(zep.ingest.reopenFact(copy.uuid, { groupId: 'other', reason: 'x' }), /fact not found/);
 
+  // a change dated in the future closes it with an end still to come: it is active now, and reopened all the same
+  const scheduled = await zep.ingest.addEpisode({ groupId: 'g', content: 'rerun next week' });
+  const endsSoon = scheduled.invalidated.find((f) => f.uuid === copy.uuid);
+  assert.equal(endsSoon?.invalidAt?.getTime(), soon.getTime());
+  assert.equal(factView(endsSoon!)?.state, 'active');
+  const { fact: kept } = await zep.ingest.reopenFact(copy.uuid, { groupId: 'g', reason: 'a rerun ends nothing' });
+  assert.equal(kept.invalidAt, undefined);
+  assert.deepEqual(await usesAt(new Date(soon.getTime() + 86_400_000).toISOString()), [kept.uuid]);
+
   // a wrong retraction is undone the same way; the retraction itself stays dated when it was made
-  const retracted = await zep.ingest.invalidateFact(copy.uuid, { groupId: 'g', reason: 'oops', retract: true });
-  const second = await zep.ingest.reopenFact(copy.uuid, { groupId: 'g', reason: 'it was true', invalidAt: new Date('2025-12-01') });
+  const retracted = await zep.ingest.invalidateFact(kept.uuid, { groupId: 'g', reason: 'oops', retract: true });
+  const second = await zep.ingest.reopenFact(kept.uuid, { groupId: 'g', reason: 'it was true', invalidAt: new Date('2025-12-01') });
   assert.equal(second.previous.expiredAt?.getTime(), retracted.expiredAt?.getTime());
   assert.equal(second.fact.invalidAt?.toISOString(), '2025-12-01T00:00:00.000Z');
   assert.deepEqual(await usesAt('2025-06-01'), [second.fact.uuid]);

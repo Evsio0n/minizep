@@ -288,8 +288,10 @@ export class IngestPipeline {
       }
       const now = new Date();
       const retracted = isRetracted(found);
-      if (!retracted && !(found.invalidAt && found.invalidAt <= now)) {
-        throw new InvalidationError('fact has not ended or been retracted: nothing to reopen', 'conflict');
+      // an end still in the future counts too: a change "effective next
+      // Monday" can supersede a fact that stays true
+      if (!retracted && !found.invalidAt) {
+        throw new InvalidationError('fact has no end and is not retracted: nothing to reopen', 'conflict');
       }
       if (input.invalidAt && found.validAt && input.invalidAt <= found.validAt) {
         throw new InvalidationError(
