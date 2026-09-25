@@ -45,6 +45,28 @@ export interface KnownFact {
   targetName: string;
   relation: string;
   fact: string;
+  /** when it became true, so the LLM can reason about what ended when */
+  validAt?: Date;
+}
+
+/** An existing entity, handed to the LLM with what we already know about it. */
+export interface KnownEntity {
+  name: string;
+  summary: string;
+}
+
+export interface ExtractOptions {
+  /**
+   * The instant the text speaks from (the episode's validAt). Relative
+   * expressions ("yesterday", "next Monday", "上个月") must be resolved
+   * against it, never against the wall clock.
+   */
+  referenceTime?: Date;
+  /**
+   * The known entities (the same set as `knownEntityNames`) with their current
+   * summaries, so the LLM can return an updated summary that keeps them.
+   */
+  knownEntities?: KnownEntity[];
 }
 
 export interface ExtractionResult {
@@ -53,26 +75,51 @@ export interface ExtractionResult {
   invalidations: ExtractedInvalidation[];
 }
 
+/** The new fact handed to detectContradiction. */
+export interface ContradictionCandidate {
+  sourceName: string;
+  targetName: string;
+  fact: string;
+  relation?: string;
+  validAt?: Date;
+}
+
+/** An existing fact that the candidate might end. */
+export interface ContradictionExisting {
+  fact: string;
+  validAt?: Date;
+  invalidAt?: Date;
+}
+
 export interface LLMProvider {
   extract(
     content: string,
     knownEntityNames: string[],
     knownFacts?: KnownFact[],
+    options?: ExtractOptions,
   ): Promise<ExtractionResult>;
-  /** Does candidate fact contradict an existing fact between the same pair? */
+  /**
+   * Which existing facts does the candidate end? Returns their 0-based indexes
+   * into `existing` (empty: none). `existing` holds the active facts between
+   * the same pair plus those with the same source and relation but another
+   * target. Providers written against the old boolean contract are still
+   * accepted by the pipeline: `true` means "all of them".
+   */
   detectContradiction(
-    candidate: { sourceName: string; targetName: string; fact: string },
-    existing: { fact: string; validAt?: Date; invalidAt?: Date }[],
-  ): Promise<boolean>;
+    candidate: ContradictionCandidate,
+    existing: ContradictionExisting[],
+  ): Promise<number[]>;
 }
 
 export interface Embedder {
   embed(text: string): Promise<number[]>;
+  /** vector length, when the embedder knows it up front */
+  readonly dims?: number;
 }
 
 export class HashEmbedder implements Embedder {
   // lazy import-free wiring done in retrieval.ts; re-exported here
-  constructor(private dims = 256) {}
+  constructor(readonly dims = 256) {}
   async embed(text: string): Promise<number[]> {
     const { hashEmbed } = await import('../search/retrieval.js');
     return hashEmbed(text, this.dims);

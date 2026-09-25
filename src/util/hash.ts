@@ -9,3 +9,18 @@ export function contentHash(content: string): string {
   const normalised = content.trim().replace(/\s+/g, ' ').toLowerCase();
   return createHash('sha256').update(normalised).digest('hex').slice(0, 32);
 }
+
+/**
+ * Ingestion idempotency key, stored in the episode's content_hash column.
+ *
+ * The same text on another day is a new event ("the production database went
+ * down" twice is two incidents), so the UTC day of the episode's validAt is part
+ * of the key. The content is Unicode-normalised (NFC) first: the same note typed
+ * on two devices may arrive composed ("é") or decomposed ("e" + accent). A
+ * caller that knows better passes its own key, which then identifies the
+ * episode on its own (content and date no longer matter).
+ */
+export function idempotencyKey(content: string, validAt: Date, explicitKey?: string): string {
+  if (explicitKey) return `key:${createHash('sha256').update(explicitKey).digest('hex').slice(0, 32)}`;
+  return `${contentHash(content.normalize('NFC'))}@${validAt.toISOString().slice(0, 10)}`;
+}

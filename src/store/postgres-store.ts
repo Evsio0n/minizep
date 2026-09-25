@@ -210,6 +210,14 @@ export class PostgresStore implements GraphStore {
     );
   }
 
+  async getEpisode(uuid: UUID): Promise<EpisodicNode | undefined> {
+    // the column is UUID-typed: anything else would be a query error, not a miss
+    if (!UUID_RE.test(uuid)) return undefined;
+    await this.ensure();
+    const r = await this.pool.query('SELECT * FROM episodes WHERE uuid=$1', [uuid]);
+    return r.rows[0] ? rowToEpisode(r.rows[0]) : undefined;
+  }
+
   async getEpisodes(groupId?: string): Promise<EpisodicNode[]> {
     await this.ensure();
     const r = groupId
@@ -340,7 +348,7 @@ export class PostgresStore implements GraphStore {
    */
   async searchFactsByText(
     query: string,
-    opts: { groupId?: string; limit?: number; activeAt?: Date | null } = {},
+    opts: { groupId?: string; limit?: number; activeAt?: Date | null; asOf?: Date } = {},
   ): Promise<{ edge: EntityEdge; score: number }[]> {
     await this.ensure();
     // websearch_to_tsquery("alice works at acme") means alice AND works AND at
@@ -359,7 +367,7 @@ export class PostgresStore implements GraphStore {
       params.push(opts.groupId);
       sql += ` AND group_id = $${params.length}`;
     }
-    sql += this.temporalPredicate(params, opts.activeAt, ' AND ');
+    sql += this.temporalPredicate(params, opts.activeAt, ' AND ', opts.asOf);
     params.push(opts.limit ?? 20);
     sql += ` ORDER BY score DESC LIMIT $${params.length}`;
     const r = await this.pool.query(sql, params);
@@ -374,17 +382,38 @@ export class PostgresStore implements GraphStore {
     return r.rows.map(rowToFact);
   }
 
-  /** Appends temporal-validity predicates, binding parameters as it goes. */
-  private temporalPredicate(params: unknown[], activeAt: Date | null | undefined, sep: string): string {
-    if (activeAt === null) return ''; // caller wants history too
-    const at = activeAt ?? new Date();
-    params.push(at);
-    let sql = `${sep}(expired_at IS NULL OR expired_at > $${params.length})`;
-    params.push(at);
-    sql += ` AND (invalid_at IS NULL OR invalid_at > $${params.length})`;
-    params.push(at);
-    sql += ` AND (valid_at IS NULL OR valid_at <= $${params.length})`;
-    return sql;
+  /**
+   * Appends the bi-temporal validity predicate, binding parameters as it goes.
+   * Mirrors isFactActive(fact, activeAt, asOf) exactly:
+   *   known  : created_at <= asOf
+   *   started: valid_at IS NULL OR valid_at <= at
+   *   ended  : invalid_at <= at, with the end known by asOf
+   *            (expired_at, or created_at when the end came with the fact),
+   *            or a retraction (expired, no invalid_at) known by asOf
+   * activeAt === null means "history too": only the knowledge-time cut applies.
+   */
+  private temporalPredicate(
+    params: unknown[],
+    activeAt: Date | null | undefined,
+    sep: string,
+    asOf?: Date,
+  ): string {
+    if (activeAt === null) {
+      if (!asOf) return ''; // caller wants all of history
+      params.push(asOf);
+      return `${sep}created_at <= $${params.length}`;
+    }
+    params.push(activeAt ?? new Date());
+    const at = `$${params.length}`;
+    params.push(asOf ?? new Date());
+    const known = `$${params.length}`;
+    return (
+      `${sep}created_at <= ${known}` +
+      ` AND (valid_at IS NULL OR valid_at <= ${at})` +
+      ` AND NOT (` +
+      `(invalid_at IS NOT NULL AND invalid_at <= ${at} AND COALESCE(expired_at, created_at) <= ${known})` +
+      ` OR (invalid_at IS NULL AND expired_at IS NOT NULL AND expired_at <= ${known}))`
+    );
   }
 
   /**
@@ -393,7 +422,7 @@ export class PostgresStore implements GraphStore {
    */
   async searchFactsByVector(
     embedding: number[],
-    opts: { groupId?: string; limit?: number; activeAt?: Date | null } = {},
+    opts: { groupId?: string; limit?: number; activeAt?: Date | null; asOf?: Date } = {},
   ): Promise<{ edge: EntityEdge; distance: number }[]> {
     await this.ensure();
     const params: unknown[] = [this.vec(embedding)];
@@ -402,7 +431,7 @@ export class PostgresStore implements GraphStore {
       params.push(opts.groupId);
       sql += ` AND group_id = $${params.length}`;
     }
-    sql += this.temporalPredicate(params, opts.activeAt, ' AND ');
+    sql += this.temporalPredicate(params, opts.activeAt, ' AND ', opts.asOf);
     params.push(opts.limit ?? 20);
     sql += ` ORDER BY fact_embedding <=> $1::vector LIMIT $${params.length}`;
     const r = await this.pool.query(sql, params);
@@ -411,6 +440,8 @@ export class PostgresStore implements GraphStore {
 }
 
 /* ---------------- row mapping ---------------- */
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function rowToEpisode(r: Record<string, unknown>): EpisodicNode {
   return {

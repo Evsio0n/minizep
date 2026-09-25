@@ -1,20 +1,32 @@
 import type {
+  ContradictionCandidate,
+  ContradictionExisting,
   ExtractionResult,
+  ExtractOptions,
   KnownFact,
   LLMProvider,
 } from '../src/provider/interfaces.js';
 import { HashEmbedder } from '../src/provider/interfaces.js';
 
 /**
+ * How a scripted LLM answers detectContradiction: `true` ends every existing
+ * fact it is shown, `false` none, a function picks indexes itself.
+ */
+export type ContradictionScript =
+  | boolean
+  | ((candidate: ContradictionCandidate, existing: ContradictionExisting[]) => number[]);
+
+/**
  * Deterministic, scriptable LLM stand-in. Tests must never touch the network,
  * otherwise the temporal semantics they assert are not reproducible.
  */
 export class ScriptedLLM implements LLMProvider {
-  readonly calls: { content: string; known: string[]; knownFacts: KnownFact[] }[] = [];
+  readonly calls: { content: string; known: string[]; knownFacts: KnownFact[]; options: ExtractOptions }[] = [];
+  readonly contradictionCalls: { candidate: ContradictionCandidate; existing: ContradictionExisting[] }[] = [];
 
   constructor(
     private handler: (content: string) => ExtractionResult | Promise<ExtractionResult>,
-    private contradictions = false,
+    private contradictions: ContradictionScript = false,
     private delayMs = 0,
   ) {}
 
@@ -22,8 +34,9 @@ export class ScriptedLLM implements LLMProvider {
     content: string,
     known: string[] = [],
     knownFacts: KnownFact[] = [],
+    options: ExtractOptions = {},
   ): Promise<ExtractionResult> {
-    this.calls.push({ content, known, knownFacts });
+    this.calls.push({ content, known, knownFacts, options });
     // a real await point: this is what lets concurrent calls interleave if the
     // pipeline does not serialise them
     if (this.delayMs > 0) await new Promise((r) => setTimeout(r, this.delayMs));
@@ -31,8 +44,13 @@ export class ScriptedLLM implements LLMProvider {
     return this.handler(content);
   }
 
-  async detectContradiction(): Promise<boolean> {
-    return this.contradictions;
+  async detectContradiction(
+    candidate: ContradictionCandidate,
+    existing: ContradictionExisting[],
+  ): Promise<number[]> {
+    this.contradictionCalls.push({ candidate, existing });
+    if (typeof this.contradictions === 'function') return this.contradictions(candidate, existing);
+    return this.contradictions ? existing.map((_, i) => i) : [];
   }
 }
 
@@ -44,8 +62,8 @@ export class BrokenLLM implements LLMProvider {
     this.attempts++;
     throw new Error(this.message);
   }
-  async detectContradiction(): Promise<boolean> {
-    return false;
+  async detectContradiction(): Promise<number[]> {
+    return [];
   }
 }
 
@@ -98,9 +116,11 @@ export const invalidation = (
   sourceName: string,
   targetName: string,
   relation?: string,
+  invalidAt?: Date,
 ) => ({
   sourceName,
   targetName,
   relation,
+  invalidAt,
   reason: 'text states it ended',
 });
