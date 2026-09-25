@@ -680,6 +680,8 @@ const S = {
   stProcessed: 'Processed',
   stPending: 'Pending',
   stFailed: 'Failed',
+  stForgotten: 'Forgotten',
+  forgottenBecause: (reason) => `Forgotten (its facts were taken back): ${reason}`,
   colStatus: 'Status',
   colName: 'Name',
   colSource: 'Source',
@@ -689,7 +691,7 @@ const S = {
   hiddenEpisodes: (n) => `${n} episode${n === 1 ? '' : 's'} ingested later hidden`,
   noEpisodes: 'No episodes',
   noEpisodesText: 'Episodes are the raw memories minizep was given.',
-  epStatus: { processed: 'processed', pending: 'pending', failed: 'failed' },
+  epStatus: { processed: 'processed', pending: 'pending', failed: 'failed', forgotten: 'forgotten' },
   // panels
   panelKind: { node: 'Entity', edge: 'Fact', episode: 'Episode' },
   summary: 'Summary',
@@ -3588,11 +3590,14 @@ function EpisodesView(root) {
     const hidden = rows.length - known.length;
     note.textContent = hidden ? S.hiddenEpisodes(hidden) : '';
     const count = (pred) => known.filter(pred).length;
+    const forgotten = count((e) => e.status === 'forgotten');
     statusChips.render([
       { value: 'all', label: S.all, count: known.length },
       { value: 'processed', label: S.stProcessed, count: count((e) => (e.status || 'processed') === 'processed') },
       { value: 'pending', label: S.stPending, count: count((e) => e.status === 'pending') },
       { value: 'failed', label: S.stFailed, count: count((e) => e.status === 'failed') },
+      // only groups where an episode was forgotten (forget_episode) get the chip
+      ...(forgotten ? [{ value: 'forgotten', label: S.stForgotten, count: forgotten }] : []),
     ]);
     sourceChips.render(['all', 'text', 'json', 'markdown'].map((v) => ({ value: v, label: v === 'all' ? S.all : v })));
     const failed = count((e) => e.status === 'failed');
@@ -3859,6 +3864,7 @@ async function episodePanel(id, signal) {
     out.push(h('div', { class: 'errbox' }, h('strong', null, S.stFailed), ep.error ? h('span', null, ep.error) : null,
       h('div', null, h('button', { class: 'btn btn-sm', type: 'button', onclick: (ev) => retryFailed(ev.currentTarget) }, icon('refresh', 14), S.retryFailed))));
   }
+  if (ep.status === 'forgotten') out.push(h('div', { class: 'muted small' }, S.forgottenBecause(ep.error || '')));
   out.push(h('dl', { class: 'kv' },
     h('dt', null, S.metaHappened), h('dd', null, fmtDateTime(ms(ep.valid_at))),
     h('dt', null, S.metaIngested), h('dd', null, fmtDateTime(ms(ep.created_at))),

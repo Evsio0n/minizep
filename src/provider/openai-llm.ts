@@ -39,6 +39,21 @@ export interface LLMConfig {
    * else this process's zone).
    */
   timeZone?: string;
+  /**
+   * Ask for JSON mode (`response_format: {type: "json_object"}`), which
+   * DeepSeek and OpenAI support (default: MINIZEP_LLM_JSON_MODE, else on).
+   * Turn it off for an endpoint that rejects the field.
+   */
+  jsonMode?: boolean;
+}
+
+type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string };
+
+/** An on/off environment variable: 0, false, off and no are off; unset is `fallback`. */
+function envFlag(name: string, fallback: boolean): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (!raw) return fallback;
+  return !['0', 'false', 'off', 'no'].includes(raw);
 }
 
 const EXTRACTION_SYSTEM = `You extract a temporal knowledge graph from one text.
@@ -169,9 +184,11 @@ Return ONLY JSON: {"contradicts": true|false, "which": [numbers of the ended fac
 
 export class OpenAICompatLLM implements LLMProvider {
   private readonly timeZone: string;
+  private readonly jsonMode: boolean;
 
   constructor(private cfg: LLMConfig) {
     this.timeZone = cfg.timeZone ?? process.env.MINIZEP_TIMEZONE ?? localTimeZone();
+    this.jsonMode = cfg.jsonMode ?? envFlag('MINIZEP_LLM_JSON_MODE', true);
     // an unknown zone would fail every extraction; fail at construction instead
     try {
       formatReferenceTime(new Date(), this.timeZone);
@@ -188,13 +205,13 @@ export class OpenAICompatLLM implements LLMProvider {
    *   - HTTP 429 / 5xx (rate limit, upstream hiccup)
    *   - empty `content` because the reasoning budget consumed all max_tokens
    */
-  private async chat(system: string, userPrompt: string, maxTokens: number): Promise<string> {
+  private async chat(messages: ChatMessage[], maxTokens: number): Promise<string> {
     const attempts = this.cfg.retries ?? 3;
     let lastErr: Error | undefined;
 
     for (let i = 0; i < attempts; i++) {
       try {
-        return await this.chatOnce(system, userPrompt, maxTokens);
+        return await this.chatOnce(messages, maxTokens);
       } catch (err) {
         lastErr = err as Error;
         const retryable = /empty content|HTTP (429|5\d\d)|fetch failed|timeout|aborted/i.test(lastErr.message);
@@ -207,7 +224,40 @@ export class OpenAICompatLLM implements LLMProvider {
     throw lastErr;
   }
 
-  private async chatOnce(system: string, userPrompt: string, maxTokens: number): Promise<string> {
+  /**
+   * A chat answered with one JSON object. A reply that does not parse is
+   * handed back once with the parse error; a second bad reply throws, which
+   * fails the episode like any other extraction error.
+   */
+  private async chatJson(system: string, userPrompt: string, maxTokens: number): Promise<unknown> {
+    const messages: ChatMessage[] = [
+      { role: 'system', content: system },
+      { role: 'user', content: userPrompt },
+    ];
+    const raw = await this.chat(messages, maxTokens);
+    try {
+      return parseJsonObject(raw);
+    } catch (err) {
+      if (!(err instanceof JsonReplyError)) throw err;
+      console.error(`[minizep] LLM reply is not valid JSON (${err.problem}); asking once more`);
+      const again = await this.chat(
+        [
+          ...messages,
+          { role: 'assistant', content: raw },
+          {
+            role: 'user',
+            content:
+              `Your reply is not valid JSON: ${err.problem}. ` +
+              'Return valid JSON only: the whole object, no prose, no markdown fences.',
+          },
+        ],
+        maxTokens,
+      );
+      return parseJsonObject(again);
+    }
+  }
+
+  private async chatOnce(messages: ChatMessage[], maxTokens: number): Promise<string> {
     const res = await fetch(`${this.cfg.baseUrl.replace(/\/$/, '')}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -216,12 +266,10 @@ export class OpenAICompatLLM implements LLMProvider {
       },
       body: JSON.stringify({
         model: this.cfg.model,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: userPrompt },
-        ],
+        messages,
         temperature: 0,
         max_tokens: maxTokens,
+        ...(this.jsonMode ? { response_format: { type: 'json_object' } } : {}),
       }),
       signal: AbortSignal.timeout(this.cfg.timeoutMs ?? 120_000),
     });
@@ -249,12 +297,11 @@ export class OpenAICompatLLM implements LLMProvider {
   ): Promise<ExtractionResult> {
     // the pipeline always passes the episode's time; a direct caller gets now
     const opts = { ...options, referenceTime: options.referenceTime ?? new Date() };
-    const raw = await this.chat(
+    const parsed = (await this.chatJson(
       EXTRACTION_SYSTEM,
       buildExtractionPrompt(content, knownEntityNames, knownFacts, opts, this.timeZone),
       this.cfg.maxTokens ?? 8000,
-    );
-    const parsed = parseJsonObject(raw) as {
+    )) as {
       entities?: { name: string; labels?: string[]; summary?: string }[];
       facts?: {
         sourceName: string;
@@ -347,13 +394,12 @@ export class OpenAICompatLLM implements LLMProvider {
   ): Promise<ContradictionVerdict> {
     if (existing.length === 0) return { ended: [], same: [] };
     const list = existing.map((e, i) => `${i + 1}. ${e.fact}${since(e.validAt, this.timeZone)}`).join('\n');
-    const raw = await this.chat(
+    const parsed = await this.chatJson(
       CONTRADICTION_SYSTEM,
       `New fact${candidate.replacesPrevious ? ' (it replaces an earlier value)' : ''}: ` +
         `${candidate.fact}${since(candidate.validAt, this.timeZone)}\n\nExisting facts:\n${list}`,
       this.cfg.maxTokens ?? 8000,
     );
-    const parsed = parseJsonObject(raw);
     const same = parseSame(parsed, existing.length);
     return { ended: parseContradiction(parsed, existing.length), ...(same ? { same } : {}) };
   }
@@ -462,6 +508,16 @@ export function formatReferenceTime(d: Date, timeZone = 'UTC'): string {
   );
 }
 
+/** A reply that holds no parseable JSON object; `problem` says why, without the reply. */
+class JsonReplyError extends Error {
+  constructor(
+    readonly problem: string,
+    raw: string,
+  ) {
+    super(`${problem} in LLM output: ${raw.slice(0, 160)}`);
+  }
+}
+
 /** Tolerates fenced code blocks and surrounding prose. */
 function parseJsonObject(raw: string): unknown {
   let text = raw.trim();
@@ -469,10 +525,12 @@ function parseJsonObject(raw: string): unknown {
   if (fence) text = fence[1].trim();
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) {
-    throw new Error(`no JSON object in LLM output: ${raw.slice(0, 160)}`);
+  if (start === -1 || end === -1 || end <= start) throw new JsonReplyError('no JSON object', raw);
+  try {
+    return JSON.parse(text.slice(start, end + 1));
+  } catch (err) {
+    throw new JsonReplyError(`invalid JSON (${(err as Error).message.slice(0, 120)})`, raw);
   }
-  return JSON.parse(text.slice(start, end + 1));
 }
 
 function toDate(v: string | null | undefined): Date | undefined {

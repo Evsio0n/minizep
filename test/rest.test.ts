@@ -293,7 +293,7 @@ test('rest: episodes list and lookup by prefix', async () => {
   }
 });
 
-test('rest: invalidate and reopen a fact, with 400/404/409 for bad requests', async () => {
+test('rest: invalidate and reopen a fact, forget an episode, with 400/404/409 for bad requests', async () => {
   const srv = await startServer();
   try {
     const tok = { token: 'tokA' };
@@ -333,9 +333,22 @@ test('rest: invalidate and reopen a fact, with 400/404/409 for bad requests', as
     assert.deepEqual([reopened.body.fact.valid_at, reopened.body.fact.invalid_at], ['2024-01-01T00:00:00.000Z', '2024-09-01T00:00:00.000Z']);
     assert.equal((await api(srv.base, 'POST', reopen, { ...tok, body: { reason: 'again' } })).status, 409, 'already reopened');
 
+    // the note itself was wrong: forgetting it retracts the copy only it supports
+    const forget = `/v1/episodes/${(added.body.episode_uuid as string).slice(0, 8)}/forget`;
+    assert.equal((await api(srv.base, 'POST', forget, { ...tok, body: {} })).status, 400, 'reason is required');
+    assert.equal((await api(srv.base, 'POST', '/v1/episodes/ffffffff/forget', { ...tok, body: { reason: 'x' } })).status, 404);
+    assert.equal((await api(srv.base, 'POST', forget, { token: 'tokB', body: { reason: 'x' } })).status, 404, 'another group');
+    assert.equal((await api(srv.base, 'GET', forget, tok)).status, 405);
+    const forgot = await api(srv.base, 'POST', forget, { ...tok, body: { reason: 'another Alice' } });
+    assert.equal(forgot.status, 200);
+    assert.deepEqual(forgot.body.retracted.map((f: { uuid: string }) => f.uuid), [reopened.body.fact.uuid]);
+    assert.deepEqual([forgot.body.unlinked, forgot.body.reopened, forgot.body.unmarked_closures], [[], [], []]);
+    assert.deepEqual([forgot.body.episode.status, forgot.body.episode.error], ['forgotten', 'another Alice']);
+    assert.equal((await api(srv.base, 'POST', forget, { ...tok, body: { reason: 'again' } })).status, 409, 'already forgotten');
+
     const stats = await api(srv.base, 'GET', '/v1/stats', tok);
     assert.deepEqual(stats.body.facts, { total: 2, active: 0, historical: 2 });
-    assert.deepEqual(stats.body.episodes, { total: 1, pending: 0, processed: 1, failed: 0 });
+    assert.deepEqual(stats.body.episodes, { total: 1, pending: 0, processed: 0, failed: 0, given_up: 0, forgotten: 1 });
     assert.deepEqual(stats.body.jobs, { queued: 0, running: 0 });
   } finally {
     await srv.close();

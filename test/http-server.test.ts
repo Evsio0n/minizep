@@ -83,6 +83,7 @@ const MINIMAL_ARGS: Record<string, Record<string, unknown>> = {
   get_episode: { id: '00000000' },
   invalidate_fact: { uuid: '00000000', reason: 'test' },
   reopen_fact: { uuid: '00000000', reason: 'test' },
+  forget_episode: { id: '00000000', reason: 'test' },
   retry_failed: {},
   graph_stats: {},
 };
@@ -435,7 +436,7 @@ for (const backend of backends) {
       assert.ok(!legacyNow?.status, 'a legacy episode stays as it was');
       const a = await connect(srv.base, 'tokA');
       const stats = await call(a.client, 'graph_stats');
-      assert.deepEqual(stats.structured.episodes, { total: 2, pending: 0, processed: 2, failed: 0 });
+      assert.deepEqual(stats.structured.episodes, { total: 2, pending: 0, processed: 2, failed: 0, given_up: 0, forgotten: 0 });
     } finally {
       await srv.close();
       await backend.dispose(store);
@@ -513,6 +514,27 @@ for (const backend of backends) {
       assert.equal(foreign.isError, true);
       assert.match(foreign.text, /fact not found/);
       assert.match((await call(b.client, 'reopen_fact', { uuid: likes.uuid, reason: 'x' })).text, /fact not found/);
+
+      // the whole note was wrong: forgetting it retracts the reopened copy it alone supports
+      const episode = added.structured.episode_uuid as string;
+      assert.match((await call(b.client, 'forget_episode', { id: episode, reason: 'x' })).text, /episode not found/);
+      const beforeForget = new Date().toISOString();
+      await new Promise((r) => setTimeout(r, 5));
+      const forgot = await call(a.client, 'forget_episode', { id: episode.slice(0, 8), reason: 'a test note' });
+      assert.equal(forgot.isError, false, forgot.text);
+      assert.deepEqual(forgot.structured.retracted.map((f: { uuid: string }) => f.uuid), [copy.uuid]);
+      assert.match(forgot.text, /retracted \(it was their only evidence\): 1/);
+      assert.deepEqual((await call(a.client, 'facts_at', { timestamp: '2024-07-01T00:00:00Z' })).structured.facts, []);
+      const believed2 = await call(a.client, 'facts_at', { timestamp: '2024-07-01T00:00:00Z', as_of: beforeForget });
+      assert.ok(believed2.structured.facts.some((f: { uuid: string }) => f.uuid === copy.uuid));
+      const kept = await call(a.client, 'get_episode', { id: episode });
+      assert.match(kept.text, /status\s+: forgotten \(a test note\)/);
+      assert.equal(kept.structured.episode.content, 'Alice works at Acme. Bob likes Cyan.');
+      const again = await call(a.client, 'forget_episode', { id: episode, reason: 'x' });
+      assert.equal(again.isError, true);
+      assert.match(again.text, /already forgotten/);
+      const counted = await call(a.client, 'graph_stats');
+      assert.deepEqual(counted.structured.episodes, { total: 1, pending: 0, processed: 0, failed: 0, given_up: 0, forgotten: 1 });
     } finally {
       await srv.close();
       await backend.dispose(store);
@@ -586,6 +608,90 @@ test('shutdown: a drain that times out reports it and leaves the episode pending
 /* ================================================================
  * New and extended tools (C4)
  * ================================================================ */
+
+test('retry: failed episodes are retried in the background until they succeed or reach the limit; retry_failed still takes those', async () => {
+  const srv = await startServer({ retryIntervalMs: 20, retryMax: 2 });
+  try {
+    const a = await connect(srv.base, 'tokA');
+    srv.llm.failWith = 'LLM HTTP 500: upstream error';
+    const failed = await call(a.client, 'add_memory', { content: 'Alice works at Acme.' });
+    assert.equal(failed.structured.status, 'failed');
+    const stored = () => srv.zep.store.getEpisode(failed.structured.episode_uuid);
+    assert.equal((await stored())?.attempts, 1);
+
+    // one automatic retry, which fails too: the episode is then given up and left alone
+    await waitFor(async () => (await stored())?.attempts === 2);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(srv.llm.calls, 2, 'not retried a third time');
+    const stats = await call(a.client, 'graph_stats');
+    assert.deepEqual(stats.structured.episodes, { total: 1, pending: 0, processed: 0, failed: 1, given_up: 1, forgotten: 0 });
+    assert.match(stats.text, /1 of them tried 2 times or more .* call retry_failed/);
+    assert.deepEqual((await api(srv.base, 'GET', '/v1/status', { token: 'tokA' })).body.episodes, { failed: 1, given_up: 1 });
+
+    // one that failed once is picked up and processed once the LLM is back
+    srv.llm.failWith = null;
+    const earlier = pendingEpisode('teamA', 'Bob works at Borealis.', 'failed');
+    await srv.zep.store.addEpisode(earlier);
+    await waitFor(async () => (await srv.zep.store.getEpisode(earlier.uuid))?.status === 'processed');
+    assert.equal((await stored())?.status, 'failed', 'the given-up one is not');
+
+    // by hand it is retried whatever its count, and that attempt counts too
+    const retry = await call(a.client, 'retry_failed');
+    assert.deepEqual([retry.structured.retried, retry.structured.succeeded], [1, 1]);
+    assert.deepEqual([(await stored())?.status, (await stored())?.attempts], ['processed', 3]);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('mcp: the server explains itself: instructions, the guide of docs/MEMORY-GUIDE.md, annotated tools', async () => {
+  const srv = await startServer();
+  try {
+    const a = await connect(srv.base, 'tokA');
+    const instructions = a.client.getInstructions() ?? '';
+    assert.ok(instructions.length >= 1000 && instructions.length <= 1500, `${instructions.length} characters`);
+    // what a client that keeps only 512 characters gets is the whole loop
+    const lead = instructions.slice(0, instructions.indexOf('\n\n'));
+    assert.ok(lead.length <= 512, `${lead.length} characters`);
+    for (const re of [/search_facts/, /add_memory/, /one event per call/, /valid_at/, /contradicts the memory/, /not ground truth/]) {
+      assert.match(lead, re);
+    }
+
+    const { tools } = await a.client.listTools();
+    const reads = ['search_facts', 'facts_about', 'facts_at', 'list_entities', 'list_episodes', 'get_episode', 'memory_job_status', 'graph_stats', 'memory_guide'];
+    const guide = readFileSync(new URL('../docs/MEMORY-GUIDE.md', import.meta.url), 'utf8');
+    for (const t of tools) {
+      assert.equal(t.annotations?.openWorldHint, false, t.name);
+      assert.equal(t.annotations?.readOnlyHint, reads.includes(t.name), t.name);
+      if (t.name === 'memory_guide') continue;
+      assert.match(t.description ?? '', /^Use .* See memory_guide\.$/s, t.name);
+      assert.ok(guide.includes(`\`${t.name}\``), `the guide covers ${t.name}`);
+    }
+    assert.deepEqual(
+      tools.filter((t) => t.annotations?.destructiveHint).map((t) => t.name).sort(),
+      ['forget_episode', 'invalidate_fact', 'reopen_fact'],
+    );
+    const add = tools.find((t) => t.name === 'add_memory')?.annotations;
+    assert.deepEqual([add?.destructiveHint, add?.idempotentHint], [false, true]);
+    assert.equal(tools.find((t) => t.name === 'retry_failed')?.annotations?.destructiveHint, false);
+    // the instructions send to the same tools as the guide's decision table
+    for (const name of ['add_memory', 'invalidate_fact', 'reopen_fact', 'forget_episode', 'memory_job_status', 'graph_stats', 'retry_failed', 'memory_guide']) {
+      assert.match(instructions, new RegExp(`\\b${name}\\b`));
+      assert.ok(tools.some((t) => t.name === name), name);
+    }
+
+    const read = await call(a.client, 'memory_guide');
+    assert.equal(read.isError, false);
+    assert.equal(read.text, guide);
+    const rest = await fetch(`${srv.base}/v1/guide`, { headers: { authorization: 'Bearer tokA' } });
+    assert.equal(rest.status, 200);
+    assert.match(rest.headers.get('content-type') ?? '', /^text\/markdown/);
+    assert.equal(await rest.text(), guide);
+    assert.equal((await api(srv.base, 'GET', '/v1/guide')).status, 401);
+  } finally {
+    await srv.close();
+  }
+});
 
 test('get_episode: by uuid prefix, with the facts it produced and reinforced', async () => {
   const srv = await startServer();

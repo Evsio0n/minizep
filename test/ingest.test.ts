@@ -822,3 +822,93 @@ test('ingest: a fact an episode closed by mistake is reopened; as_of before the 
   assert.deepEqual(await usesAt('2025-06-01'), [second.fact.uuid]);
   assert.deepEqual(await usesAt('2026-01-01'), []);
 });
+
+test('ingest: forgetting an episode retracts what only it said, unlinks it elsewhere and reopens what it closed, keeping the history', async () => {
+  const at = (iso: string) => new Date(iso);
+  const says: Record<string, ExtractionResult> = {
+    hired: scenario([entity('Alice'), entity('Acme', ['Organization'])], [
+      fact('Alice', 'Acme', 'WORKS_AT', { validAt: at('2025-01-01'), invalidAt: at('2030-01-01') }),
+    ]),
+    likes: scenario([entity('Alice'), entity('Acme', ['Organization']), entity('Cyan', ['Concept'])], [
+      fact('Alice', 'Acme', 'WORKS_AT', { validAt: at('2025-01-01'), invalidAt: at('2030-01-01') }),
+      fact('Alice', 'Cyan', 'LIKES'),
+    ]),
+    moved: scenario([entity('Alice'), entity('Globex', ['Organization'])], [
+      fact('Alice', 'Globex', 'WORKS_AT', { validAt: at('2025-03-01') }),
+    ]),
+  };
+  // the judge ends whatever it is shown: here the Acme contract, when Globex comes in
+  const llm = new ScriptedLLM((content) => says[content.split(' ')[0]] ?? EMPTY, true);
+  const zep = new Minizep({ llm, embedder: deterministicEmbedder() });
+  const add = (content: string, validAt: string, groupId = 'g') =>
+    zep.ingest.addEpisode({ groupId, content, validAt: at(validAt) });
+  const tick = () => new Promise((r) => setTimeout(r, 2));
+  const factsAt = async (when: string, asOf?: Date) =>
+    (await zep.factsAt(at(when), 'g', { asOf })).map((r) => r.fact.uuid).sort();
+
+  const [acme] = (await add('hired at Acme', '2025-01-01')).facts;
+  const liked = await add('likes Cyan, still at Acme', '2025-02-01');
+  const [cyan] = liked.facts;
+  const moved = await add('moved to Globex', '2025-03-01');
+  const [globex] = moved.facts;
+  const [closed] = moved.invalidated;
+  assert.equal(closed.uuid, acme.uuid);
+  assert.equal(closed.attributes.closedByEpisode, moved.episode.uuid, 'the closure names its episode');
+  assert.equal(closed.attributes.previousEnd, '2030-01-01T00:00:00.000Z', 'and the end it replaced');
+
+  // a note with other evidence only loses its citation; what it alone said is retracted
+  await tick();
+  const beforeFirst = new Date();
+  await tick();
+  const first = await zep.ingest.forgetEpisode(liked.episode.uuid, { groupId: 'g', reason: 'not about this Alice' });
+  assert.deepEqual(first.retracted.map((f) => f.uuid), [cyan.uuid]);
+  assert.deepEqual(first.unlinked.map((f) => [f.uuid, f.episodes]), [[acme.uuid, [acme.episodes[0]]]]);
+  assert.deepEqual([first.reopened, first.unmarked], [[], []]);
+  assert.equal(factView((await zep.store.getFact(cyan.uuid))!)?.state, 'retracted');
+  assert.match(String((await zep.store.getFact(cyan.uuid))!.attributes.invalidatedBy), /^forgotten episode \w{8}: not about this Alice$/);
+  assert.deepEqual(await factsAt('2025-02-15'), [acme.uuid]);
+  assert.deepEqual(await factsAt('2025-02-15', beforeFirst), [acme.uuid, cyan.uuid].sort(), 'as believed before');
+  const kept = (await zep.store.getEpisode(liked.episode.uuid))!;
+  assert.deepEqual([kept.status, kept.error, kept.content], ['forgotten', 'not about this Alice', 'likes Cyan, still at Acme']);
+  await assert.rejects(
+    zep.ingest.forgetEpisode(liked.episode.uuid, { groupId: 'g', reason: 'x' }),
+    (err: InvalidationError) => err.code === 'conflict' && /already forgotten/.test(err.message),
+  );
+  await assert.rejects(zep.ingest.forgetEpisode(moved.episode.uuid, { groupId: 'other', reason: 'x' }), /episode not found/);
+
+  // forgetting the change reopens the fact it closed, with the end that fact had before
+  await tick();
+  const beforeSecond = new Date();
+  await tick();
+  const second = await zep.ingest.forgetEpisode(moved.episode.uuid, { groupId: 'g', reason: 'Alice never moved' });
+  assert.deepEqual(second.retracted.map((f) => f.uuid), [globex.uuid]);
+  const [{ fact: copy, previous }] = second.reopened;
+  assert.equal(previous.uuid, acme.uuid);
+  assert.equal(previous.attributes.reopenedAs, copy.uuid);
+  assert.deepEqual([copy.validAt, copy.invalidAt, copy.episodes], [at('2025-01-01'), at('2030-01-01'), [acme.episodes[0]]]);
+  assert.equal(copy.attributes.closedByEpisode, undefined, 'the copy is open, nothing closed it');
+  assert.deepEqual(await factsAt('2025-06-01'), [copy.uuid]);
+  // as believed before: Globex, and not the copy (the closed row shows without its end, as after any reopen)
+  const then = await factsAt('2025-06-01', beforeSecond);
+  assert.ok(then.includes(globex.uuid) && !then.includes(copy.uuid));
+
+  // the forgotten text is new again when it comes back
+  const again = await add('likes Cyan, still at Acme', '2025-02-01');
+  assert.equal(again.status, 'processed');
+  assert.notEqual(again.episode.uuid, liked.episode.uuid);
+
+  // a pending episode that is forgotten is never processed
+  const { episode: queued } = await zep.ingest.saveEpisode({ groupId: 'g', content: 'hired twice', validAt: at('2025-04-01') });
+  await zep.ingest.forgetEpisode(queued.uuid, { groupId: 'g', reason: 'sent by mistake' });
+  const calls = llm.calls.length;
+  assert.equal((await zep.ingest.processEpisode(queued.uuid)).episode.status, 'forgotten');
+  assert.equal(llm.calls.length, calls);
+
+  // a closure written without the marker (an older build) is reported, not reopened
+  const [old] = (await add('hired at Acme', '2025-01-01', 'h')).facts;
+  const change = await add('moved to Globex', '2025-03-01', 'h');
+  const { closedByEpisode: _e, previousEnd: _p, ...unmarked } = (await zep.store.getFact(old.uuid))!.attributes;
+  await zep.store.updateFact({ ...(await zep.store.getFact(old.uuid))!, attributes: unmarked });
+  const legacy = await zep.ingest.forgetEpisode(change.episode.uuid, { groupId: 'h', reason: 'x' });
+  assert.deepEqual([legacy.reopened, legacy.unmarked.map((f) => f.uuid)], [[], [old.uuid]]);
+});

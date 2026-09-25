@@ -70,7 +70,8 @@ sudo deploy/install.sh --user minizep     # 启用、重启、等 /health 就绪
 | 时序语义单测（时间窗/时间旅行/历史保留） | ✅ 双时间轴：有效时间 `at` + 知识时间 `as_of` |
 | 摄取串行化（并发不再产生重复实体） | ✅ 按 group 加锁：同一 group 串行，不同 group 并发（竞态曾用探针证实：10 并发 → 10 个重复实体） |
 | 幂等（同文本同 group 同一天只摄取一次） | ✅ 键 = 规范化内容哈希 + `validAt` 的 UTC 日期，或显式 `idempotencyKey`；只跳过已处理成功的重复，失败/未完成的原地重新处理 |
-| LLM 失败隔离 + 重试恢复 | ✅ episode 先以 pending 落盘，失败标记 failed 并保留原文，`retryFailed()` 原地重试；启动时恢复 pending |
+| LLM 失败隔离 + 重试恢复 | ✅ episode 先以 pending 落盘，失败标记 failed 并保留原文；服务在后台定时原地重试（每条最多 `MINIZEP_RETRY_MAX` 次），`retry_failed` 手工重试；启动时恢复 pending；抽取用 JSON mode，回复解析失败时带着错误再问一次 |
+| 自描述、自维护 | ✅ MCP `instructions` + `memory_guide` 工具（[docs/MEMORY-GUIDE.md](docs/MEMORY-GUIDE.md)）教会任何接入的模型怎么写、怎么查、怎么修；工具带 read-only/destructive 标注；`forget_episode` 撤回一条 episode 带来的全部改动 |
 | Postgres + pgvector 存储后端 | ✅ 与内存实现跑同一套契约测试 |
 | JSON → 数据库迁移 | ✅ 幂等，重映射实体 uuid，保留时间窗 |
 | 测试隔离（独立 schema） | ✅ 每个测试文件独立 schema，可并行 |
@@ -227,9 +228,18 @@ npm run build
 | `facts_about` | 某实体的全部事实及有效期 |
 | `facts_at` | 指定时刻图中为真的事实 |
 | `list_entities` / `list_episodes` | 实体列表 / 原始 episode（溯源） |
+| `get_episode` / `memory_job_status` | 一条 episode 的全文及其产生的事实 / 异步摄取任务的状态 |
 | `invalidate_fact` | 手工结束或撤回一条事实（历史保留，`as_of` 仍能看到修正前的认知） |
 | `reopen_fact` | 撤销一次错误的结束或撤回：旧记录撤回并留在历史里，插入一份从原起点起有效的更正副本 |
-| `graph_stats` | 图谱统计 |
+| `forget_episode` | 整条笔记是错的或不该记：只由它支撑的事实撤回，其他事实去掉这条证据，被它关闭的事实重新打开；原文保留，状态为 `forgotten` |
+| `retry_failed` | 原地重试抽取失败的 episode（包括后台重试已放弃的） |
+| `graph_stats` | 图谱统计（含失败、已放弃重试、已遗忘的 episode 数） |
+| `memory_guide` | 使用方法全文（写什么、怎么写、怎么查、什么情况用哪个工具修），即 [docs/MEMORY-GUIDE.md](docs/MEMORY-GUIDE.md) |
+
+接入的模型不需要客户端侧的提示词：`initialize` 返回的 `instructions` 讲清基本流程（回答前先查，
+一件事一次 `add_memory`、主语写全名、`valid_at` 写发生时间，用户纠正时当场修），细节在 `memory_guide`。
+工具带 MCP 标注：只读工具 `readOnlyHint`，`invalidate_fact`/`reopen_fact`/`forget_episode` 为
+`destructiveHint`，客户端可据此自动放行查询、修改前询问。
 
 ## 配置
 
@@ -240,6 +250,9 @@ npm run build
 | `MINIZEP_LLM_PROVIDER` | `deepseek` | 从 `~/.openclaw/openclaw.json` 读取凭据 |
 | `MINIZEP_LLM_MODEL` | `deepseek-flash` | **不要用 `deepseek-v4-pro`**（见下） |
 | `MINIZEP_LLM_API_KEY` / `MINIZEP_LLM_BASE_URL` | — | 显式覆盖，优先于配置文件 |
+| `MINIZEP_LLM_JSON_MODE` | `1` | 请求 `response_format: {"type":"json_object"}`（DeepSeek、OpenAI 支持）；端点不认这个字段时设 `0` |
+| `MINIZEP_RETRY_INTERVAL_MS` | `600000` | 后台重试失败 episode 的间隔，`0` 关闭 |
+| `MINIZEP_RETRY_MAX` | `3` | 一条 episode 尝试到这个次数后后台不再重试（`retry_failed` 仍可手工重试） |
 | `MINIZEP_EMBED_URL` | `http://127.0.0.1:11435` | llama.cpp / vLLM / 任意 OpenAI 兼容端点 |
 | `MINIZEP_EMBED_MODEL` | `qwen3-embed` | |
 | `MINIZEP_SEARCH_MIN_COSINE` | `0.4` | 检索的相关度下限：既没有关键词命中、也不靠近查询所提实体的事实，余弦低于它就不返回（见下） |
@@ -288,6 +301,9 @@ llama-server -m qwen3-embed-q8.gguf --embedding --pooling last -ngl 99 --port 11
 11. **没有第二个实体的事件只进摘要** —— 抽取规则要求事实的两端都是具名实体，所以"作业 X 被取消了"这类
     只涉及一个实体的事件会写进该实体的摘要，而不是一条事实；`search_facts` 查不到它，要用
     `facts_about`/实体摘要或原始 episode 才能看到。
+12. **`forget_episode` 只撤回事实层面的贡献** —— 实体和摘要不改，被它提前的事实起点不改回；它关闭的事实
+    一律重新打开，即使另一条 episode 也说了同一个变更（这时用 `invalidate_fact` 再结束一次）。
+    记录"由哪条 episode 关闭"之前的旧数据没有这个标记，只在结果的 `unmarked_closures` 里列出，不自动重开。
 
 ## 打包与部署
 

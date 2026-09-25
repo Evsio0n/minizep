@@ -15,6 +15,7 @@ import { JobQueue } from '../src/jobs/queue.js';
 import type { EpisodicNode } from '../src/model/types.js';
 import { MemoryService } from '../src/server/service.js';
 import { serveStdio } from '../src/server/stdio.js';
+import { INSTRUCTIONS } from '../src/server/tools.js';
 import { deterministicEmbedder } from './helpers.js';
 import { ControlledLLM, call, startServer, waitFor } from './server-helpers.js';
 
@@ -124,6 +125,7 @@ test('stdio: the single local user may use any group', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'minizep-stdio-'));
   try {
     const { client, server } = await stdioSetup(join(dir, 'graph.json'));
+    assert.equal(client.getInstructions(), INSTRUCTIONS);
     const r = await call(client, 'add_memory', { content: 'Alice works at Acme.', group_id: 'project-x' });
     assert.equal(r.isError, false);
     assert.equal(r.structured.group_id, 'project-x');
@@ -135,7 +137,7 @@ test('stdio: the single local user may use any group', async () => {
   }
 });
 
-test('stdio proxy: forwards every tool of the HTTP server under the token\'s groups, and survives session expiry', async () => {
+test('stdio proxy: forwards the instructions and every tool of the HTTP server under the token\'s groups, and survives session expiry', async () => {
   const srv = await startServer({ sessionTtlMs: 150 });
   const transport = new StdioClientTransport({
     command: process.execPath,
@@ -149,10 +151,13 @@ test('stdio proxy: forwards every tool of the HTTP server under the token\'s gro
   transport.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
   try {
     await client.connect(transport);
-    const names = (await client.listTools()).tools.map((t) => t.name);
-    for (const tool of ['add_memory', 'get_episode', 'invalidate_fact', 'reopen_fact', 'retry_failed', 'facts_at']) {
+    assert.equal(client.getInstructions(), INSTRUCTIONS);
+    const { tools } = await client.listTools();
+    const names = tools.map((t) => t.name);
+    for (const tool of ['add_memory', 'get_episode', 'invalidate_fact', 'reopen_fact', 'forget_episode', 'retry_failed', 'facts_at', 'memory_guide']) {
       assert.ok(names.includes(tool), `${tool} is forwarded`);
     }
+    assert.equal(tools.find((t) => t.name === 'forget_episode')?.annotations?.destructiveHint, true, 'with its annotations');
 
     const added = await call(client, 'add_memory', { content: 'Alice works at Acme.' });
     assert.equal(added.structured.status, 'processed');

@@ -15,6 +15,8 @@ RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build /app/dist ./dist
 # the web UI page (served on /ui only when MINIZEP_UI_GROUPS is set)
 COPY ui ./ui
+# the usage guide the memory_guide tool and GET /v1/guide serve
+COPY docs/MEMORY-GUIDE.md ./docs/MEMORY-GUIDE.md
 
 # run unprivileged
 USER node

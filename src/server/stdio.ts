@@ -11,7 +11,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { localPrincipal } from './auth.js';
 import type { MemoryService } from './service.js';
-import { registerTools, SERVER_INFO } from './tools.js';
+import { registerTools, SERVER_INFO, SERVER_OPTIONS } from './tools.js';
 
 export interface StdioOptions {
   service: MemoryService;
@@ -21,6 +21,8 @@ export interface StdioOptions {
   stdout?: Writable;
   /** how long shutdown waits for queued ingestion (default 120 s) */
   drainTimeoutMs?: number;
+  /** retry failed episodes in the background this often (default 600000; 0 = never) */
+  retryIntervalMs?: number;
   log?: (msg: string) => void;
 }
 
@@ -43,8 +45,9 @@ export async function serveStdio(opts: StdioOptions): Promise<StdioServer> {
 
   const recovered = await service.recoverPending();
   if (recovered) log(`re-enqueued ${recovered} pending episode(s) from a previous run`);
+  const stopRetrying = service.retryEvery(opts.retryIntervalMs ?? 600_000, log);
 
-  const server = new McpServer(SERVER_INFO);
+  const server = new McpServer(SERVER_INFO, SERVER_OPTIONS);
   // single local user: every group is theirs
   registerTools(server, { service, principal: localPrincipal(opts.defaultGroup) });
   // once the client is gone its pipe is broken: a late answer must not crash
@@ -60,6 +63,7 @@ export async function serveStdio(opts: StdioOptions): Promise<StdioServer> {
   const shutdown = (reason: string): Promise<boolean> => {
     stopping ??= (async () => {
       log(`${reason}: finishing queued work (up to ${drainTimeoutMs}ms)`);
+      stopRetrying();
       let drained = false;
       try {
         drained = await service.shutdown(drainTimeoutMs);
