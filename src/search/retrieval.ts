@@ -4,12 +4,54 @@
  *   plus a temporal filter ("what was true at time T").
  */
 
+/**
+ * Scripts written without spaces between words (Han, kana) plus Hangul.
+ * Script_Extensions rather than Script so marks shared by several scripts,
+ * like the kana prolonged-sound mark in "コーヒー", stay inside their word.
+ */
+const CJK = '\\p{scx=Han}\\p{scx=Hiragana}\\p{scx=Katakana}\\p{scx=Hangul}';
+const CJK_CHAR = new RegExp(`[${CJK}]`, 'u');
+const SCRIPT_RUNS = new RegExp(`[${CJK}]+|[^${CJK}]+`, 'gu');
+
+/**
+ * Keyword tokens for BM25, Postgres full-text search and hashEmbed.
+ *
+ * Latin/digit words split on whitespace and punctuation. A CJK run has no
+ * word boundaries, so it becomes its overlapping character bigrams
+ * ("阿里巴巴" -> 阿里 里巴 巴巴); a one-character run stays as it is. Queries
+ * and documents go through this same function, so matching stays symmetric.
+ * NFKC folds the full-width letters and digits common in CJK text ("ＧＰＴ４")
+ * into their ASCII forms.
+ */
 export function tokenize(text: string): string[] {
-  return text
+  const tokens: string[] = [];
+  const words = text
+    .normalize('NFKC')
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
-    .split(/\s+/)
-    .filter((t) => t.length > 0);
+    .split(/\s+/);
+  for (const word of words) {
+    // one word can mix scripts ("在google做pm"): handle each run on its own
+    for (const run of word.match(SCRIPT_RUNS) ?? []) {
+      if (CJK_CHAR.test(run)) tokens.push(...bigrams(run));
+      else tokens.push(run);
+    }
+  }
+  return tokens;
+}
+
+/** True for tokens made of CJK characters (a lone one is still a word). */
+export function isCjkToken(token: string): boolean {
+  return CJK_CHAR.test(token);
+}
+
+function bigrams(run: string): string[] {
+  // by code point: CJK extension ideographs are surrogate pairs in UTF-16
+  const chars = [...run];
+  if (chars.length === 1) return chars;
+  const out: string[] = [];
+  for (let i = 0; i < chars.length - 1; i++) out.push(chars[i] + chars[i + 1]);
+  return out;
 }
 
 /* ---------------- BM25 ---------------- */
