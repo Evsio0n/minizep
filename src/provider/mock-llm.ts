@@ -1,4 +1,11 @@
-import type { ExtractionResult, KnownFact, LLMProvider } from './interfaces.js';
+import type {
+  ContradictionCandidate,
+  ContradictionExisting,
+  ExtractionResult,
+  ExtractOptions,
+  KnownFact,
+  LLMProvider,
+} from './interfaces.js';
 
 /**
  * Rule-based mock extractor — zero network, deterministic.
@@ -8,13 +15,15 @@ import type { ExtractionResult, KnownFact, LLMProvider } from './interfaces.js';
  * implement LLMProvider with an actual model.
  *
  * Terminations ("left", "离开") are reported as invalidations, matching how
- * the real provider is expected to behave.
+ * the real provider is expected to behave. Their time is left to the pipeline
+ * (the episode's validAt), never the wall clock.
  */
 export class MockLLMProvider implements LLMProvider {
   async extract(
     content: string,
     _known: string[],
     _knownFacts: KnownFact[] = [],
+    _options: ExtractOptions = {},
   ): Promise<ExtractionResult> {
     const entities = new Map<string, { name: string; labels: string[]; summary: string }>();
     const facts: ExtractionResult['facts'] = [];
@@ -48,7 +57,8 @@ export class MockLLMProvider implements LLMProvider {
           sourceName: a.trim(),
           targetName: b.trim(),
           relation,
-          fact: `${a.trim()} --${relation}--> ${b.trim()}`,
+          // the matched clause is the self-contained sentence
+          fact: m[0].trim(),
         });
       }
     }
@@ -62,7 +72,6 @@ export class MockLLMProvider implements LLMProvider {
           sourceName: a.trim(),
           targetName: b.trim(),
           relation,
-          invalidAt: new Date(),
           reason: `text states "${why}"`,
         });
       }
@@ -76,17 +85,19 @@ export class MockLLMProvider implements LLMProvider {
   }
 
   async detectContradiction(
-    candidate: { fact: string },
-    existing: { fact: string }[],
-  ): Promise<boolean> {
+    candidate: ContradictionCandidate,
+    existing: ContradictionExisting[],
+  ): Promise<number[]> {
     // mock heuristic: same relation word + negation/antonym markers
     const antonyms = [['joins', 'left'], ['likes', 'hates']];
-    for (const e of existing) {
-      for (const [x, y] of antonyms) {
-        if (e.fact.includes(x) && candidate.fact.includes(y)) return true;
-        if (e.fact.includes(y) && candidate.fact.includes(x)) return true;
-      }
-    }
-    return false;
+    const ended: number[] = [];
+    existing.forEach((e, i) => {
+      const hit = antonyms.some(
+        ([x, y]) =>
+          (e.fact.includes(x) && candidate.fact.includes(y)) || (e.fact.includes(y) && candidate.fact.includes(x)),
+      );
+      if (hit) ended.push(i);
+    });
+    return ended;
   }
 }
