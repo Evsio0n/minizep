@@ -42,7 +42,7 @@ export interface LLMConfig {
 
 const EXTRACTION_SYSTEM = `You extract a temporal knowledge graph from one text.
 Return ONLY a JSON object, no prose, no markdown fences:
-{"entities":[{"name":"string","labels":["Person"|"Organization"|"Product"|"Project"|"Role"|"Concept"|"Event"|"Location"|"Preference"],"summary":"string"}],
+{"entities":[{"name":"string","labels":["Person"|"Organization"|"Product"|"Host"|"Project"|"Job"|"Role"|"Concept"|"Event"|"Location"|"Preference"],"summary":"string"}],
  "facts":[{"sourceName":"string","targetName":"string","relation":"SCREAMING_SNAKE_CASE","fact":"self-contained sentence","validAt":"ISO-8601 or null","invalidAt":"ISO-8601 or null"}],
  "invalidations":[{"sourceName":"string","targetName":"string","relation":"SCREAMING_SNAKE_CASE or null","invalidAt":"ISO-8601 or null","reason":"short justification"}]}
 
@@ -55,27 +55,38 @@ Time — the message starts with a reference time: when the text was written, wi
   "appointed CFO yesterday, effective next Monday" starts on that Monday.
 - When only a month or a year is known, use its first day ("上个月" written on 2025-02-01 -> 2025-01-01).
 - Use null when the text gives no time for a fact; never guess.
-- Dates, times, weekdays and durations are NEVER entities, and entity names never contain time words:
-  "下周五", "next Monday", "last year" are times; "昨天的周会" is at most the entity "周会".
+- Entity names never contain time words: "下周五", "next Monday", "last year" are times; "昨天的周会" is
+  at most the entity "周会".
 
 Language:
 - Keep entity names, summaries and fact sentences in the language of the text. Do not translate:
   a Chinese text gets Chinese summaries and fact sentences.
 
 Entities:
+- An entity is a named thing: a person, organisation, role, product, service or software, machine or
+  host, project, job with a name or id ("job 4711", not "4711"), place, event or concept.
+- Literal values are NEVER entities: IP addresses, host:port, ports, URLs, file paths, versions, amounts,
+  quantities, bare numbers, dates, weekdays, times and durations. A value stays in the sentence of the
+  fact between the named entities it qualifies ("Grafana on web-1 listens on 192.0.2.10:3000" is the fact
+  Grafana --RUNS_ON--> web-1), or in the summary of the one entity it describes.
 - Reuse the exact name of a known entity when the text refers to it, also by a shorter or longer form.
-- summary: one or two sentences on who or what the entity is. For a known entity return an UPDATED
-  summary that keeps everything its known summary says and adds what this text says; if the text
-  adds nothing about it, return "".
+- summary: one or two sentences on who or what the entity is, with the properties the text gives it.
+  For a known entity return an UPDATED summary that keeps what its known summary says and adds what
+  this text says; if the text adds nothing about it, return "". A summary states current values: when
+  the text gives a property a new value (another address, port, version or status), the new value
+  replaces the old one, which stays at most as history ("moved from port 3000 to 3001 on 2026-03-02").
 
 Facts:
 - "fact" is one self-contained natural-language sentence that keeps every detail the text gives:
-  role, title, team, organisation, amounts, dates. Write "Alice Chen joined Globex as a Staff Engineer",
-  never "Alice Chen --WORKS_AT--> Globex".
-- relation is a short label such as WORKS_AT, HAS_ROLE, MEMBER_OF, LIVES_IN, REPORTS_TO, SCHEDULED_FOR.
-- Both endpoints must be entities of this text or known entities. When a statement is about one
-  entity's attribute (a date, a price, a status), connect it to the person, team, organisation or
-  event that owns or decided it, and keep the value in the sentence.
+  role, title, team, organisation, amounts, dates, addresses. Write "Alice Chen joined Globex as a
+  Staff Engineer", never "Alice Chen --WORKS_AT--> Globex".
+- Both endpoints must be named entities of this text or known entities. A property of one entity with
+  no second named entity involved (its address, port, version, whether it needs a login) goes into that
+  entity's summary, not into a fact to a value.
+- relation is a short label such as WORKS_AT, HAS_ROLE, MEMBER_OF, LIVES_IN, REPORTS_TO, RUNS_ON, USES.
+  It reads from sourceName to targetName as "subject RELATION object": for "Billing uses Redis",
+  Billing --USES--> Redis is correct; Billing --PROVIDES--> Redis and Redis --USES--> Billing are wrong.
+- State each relationship once: never repeat a fact sentence under another relation.
 - Never invent facts that the text does not support.
 
 facts vs invalidations — this distinction is critical:
@@ -88,8 +99,10 @@ facts vs invalidations — this distinction is critical:
   relationship that only held because of it — leaving a company ends the role, title, team
   membership, manager and project relationships held there. Copy sourceName, targetName and
   relation exactly from the "Active relationships" list.
-- A new value for a single-valued attribute (employer, title, role, team, home city, manager,
-  status) replaces the old one: emit the new fact and invalidate the old one.
+- A new value for a single-valued relationship (employer, title, role, team, home city, manager)
+  replaces the old one: emit the new fact and invalidate the old one. A new value for a property of
+  one entity (its status, address, port, version) is not a fact: it replaces the old value in that
+  entity's summary.
 - invalidAt = when it ended, resolved against the reference time; null when the text gives no clue.
 - If a relationship both starts and ends within this text, put it in "facts" with invalidAt.
 - Emit empty arrays when a category has no entries.

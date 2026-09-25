@@ -81,11 +81,17 @@ test('provider: the extraction prompt carries the reference time, known summarie
 
       const system = systemOf(req);
       assert.match(system, /Resolve every relative expression against the reference time/);
-      assert.match(system, /NEVER entities/);
+      assert.match(system, /Literal values are NEVER entities: IP addresses, host:port, ports, URLs/);
+      assert.match(system, /goes into that\s+entity's summary, not into a fact to a value/);
+      assert.match(system, /"subject RELATION object"/);
+      assert.match(system, /State each relationship once/);
       assert.match(system, /language of the text/);
       assert.match(system, /self-contained natural-language sentence/);
       assert.match(system, /Dependent relationships end with it/);
       assert.match(system, /UPDATED\s+summary/);
+      // a changed property of one entity replaces its value in the summary, it is not a fact
+      assert.match(system, /A summary states current values/);
+      assert.match(system, /is not a fact: it replaces the old value in that\s+entity's summary/);
     },
   );
 });

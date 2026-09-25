@@ -44,7 +44,7 @@ test('rest: POST /v1/memories reports processed (201), then duplicate (200)', as
     assert.equal(first.body.error, null);
     assert.equal(first.body.facts[0].fact, 'Alice works at Acme');
     assert.equal(first.body.facts[0].valid_at, '2024-03-01T09:00:00.000Z');
-    assert.deepEqual(first.body.dropped, { facts: 0, invalidations: 0 });
+    assert.deepEqual(first.body.dropped, { entities: 0, facts: 0, invalidations: 0 });
 
     const again = await api(srv.base, 'POST', '/v1/memories', { token: 'tokA', body });
     assert.equal(again.status, 200);

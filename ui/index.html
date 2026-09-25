@@ -754,7 +754,7 @@ const S = {
   newFacts: (n) => `New facts (${n})`,
   reinforced: (n) => `Reinforced (${n})`,
   invalidated: (n) => `Invalidated (${n})`,
-  dropped: (d) => `dropped: ${d.facts ?? 0} facts, ${d.invalidations ?? 0} invalidations`,
+  dropped: (d) => `dropped: ${d.entities ?? 0} entities, ${d.facts ?? 0} facts, ${d.invalidations ?? 0} invalidations`,
   viewEpisode: 'View episode',
   addAnother: 'Add another',
   done: 'Done',
@@ -3884,7 +3884,7 @@ function outcomeCard(o) {
     factList(S.newFacts(arr(o.facts).length), o.facts, { interactive: false }),
     factList(S.reinforced(arr(o.reinforced).length), o.reinforced, { interactive: false }),
     factList(S.invalidated(arr(o.invalidated).length), o.invalidated, { interactive: false }),
-    d.facts || d.invalidations ? h('div', { class: 'muted small' }, S.dropped(d)) : null);
+    d.entities || d.facts || d.invalidations ? h('div', { class: 'muted small' }, S.dropped(d)) : null);
 }
 function openAddMemory(groupArg) {
   const group0 = groupArg || (state.view !== 'groups' && state.group) || defaultGroup();
