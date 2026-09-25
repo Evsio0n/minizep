@@ -89,6 +89,9 @@ test('provider: the extraction prompt carries the reference time, known summarie
       assert.match(system, /self-contained natural-language sentence/);
       assert.match(system, /Dependent relationships end with it/);
       assert.match(system, /UPDATED\s+summary/);
+      // a changed property of one entity replaces its value in the summary, it is not a fact
+      assert.match(system, /A summary states current values/);
+      assert.match(system, /is not a fact: it replaces the old value in that\s+entity's summary/);
     },
   );
 });

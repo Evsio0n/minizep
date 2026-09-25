@@ -71,8 +71,10 @@ Entities:
   Grafana --RUNS_ON--> web-1), or in the summary of the one entity it describes.
 - Reuse the exact name of a known entity when the text refers to it, also by a shorter or longer form.
 - summary: one or two sentences on who or what the entity is, with the properties the text gives it.
-  For a known entity return an UPDATED summary that keeps everything its known summary says and adds
-  what this text says; if the text adds nothing about it, return "".
+  For a known entity return an UPDATED summary that keeps what its known summary says and adds what
+  this text says; if the text adds nothing about it, return "". A summary states current values: when
+  the text gives a property a new value (another address, port, version or status), the new value
+  replaces the old one, which stays at most as history ("moved from port 3000 to 3001 on 2026-03-02").
 
 Facts:
 - "fact" is one self-contained natural-language sentence that keeps every detail the text gives:
@@ -97,8 +99,10 @@ facts vs invalidations — this distinction is critical:
   relationship that only held because of it — leaving a company ends the role, title, team
   membership, manager and project relationships held there. Copy sourceName, targetName and
   relation exactly from the "Active relationships" list.
-- A new value for a single-valued attribute (employer, title, role, team, home city, manager,
-  status) replaces the old one: emit the new fact and invalidate the old one.
+- A new value for a single-valued relationship (employer, title, role, team, home city, manager)
+  replaces the old one: emit the new fact and invalidate the old one. A new value for a property of
+  one entity (its status, address, port, version) is not a fact: it replaces the old value in that
+  entity's summary.
 - invalidAt = when it ended, resolved against the reference time; null when the text gives no clue.
 - If a relationship both starts and ends within this text, put it in "facts" with invalidAt.
 - Emit empty arrays when a category has no entries.
