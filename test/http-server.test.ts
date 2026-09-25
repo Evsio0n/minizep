@@ -304,7 +304,7 @@ test('add_memory: facts whose entities could not be resolved are counted as drop
   try {
     const a = await connect(srv.base, 'tokA');
     const r = await call(a.client, 'add_memory', { content: 'Alice works at Acme, which Ghost haunts.' });
-    assert.deepEqual(r.structured.dropped, { facts: 1, invalidations: 0 });
+    assert.deepEqual(r.structured.dropped, { entities: 0, facts: 1, invalidations: 0 });
     assert.match(r.text, /dropped: 1 fact, 0 invalidations/);
   } finally {
     await srv.close();

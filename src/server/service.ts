@@ -124,8 +124,11 @@ export interface AddMemoryOutcome {
   facts: FactRow[];
   reinforced: FactRow[];
   invalidated: FactRow[];
-  /** extracted candidates discarded because an endpoint could not be resolved */
-  dropped: { facts: number; invalidations: number };
+  /**
+   * extracted candidates discarded: entities that are only a literal value with
+   * no fact on them, facts and invalidations naming an unresolvable entity
+   */
+  dropped: { entities: number; facts: number; invalidations: number };
 }
 
 const iso = (d: Date | undefined): string | null => (d ? d.toISOString() : null);
@@ -849,7 +852,7 @@ function emptyResult(episode: EpisodicNode): IngestResult {
     facts: [],
     reinforced: [],
     invalidated: [],
-    dropped: { facts: 0, invalidations: 0 },
+    dropped: { entities: 0, facts: 0, invalidations: 0 },
   };
 }
 

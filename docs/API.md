@@ -182,14 +182,16 @@ curl -s -X POST http://127.0.0.1:8787/v1/memories \
   "facts": [ { "uuid": "160f2ea7-…", "relation": "WORKS_AT", "source": "Alice", "target": "Acme", "…": "…" } ],
   "reinforced": [],
   "invalidated": [],
-  "dropped": { "facts": 0, "invalidations": 0 }
+  "dropped": { "entities": 0, "facts": 0, "invalidations": 0 }
 }
 ```
 
 - `facts`: new facts; `reinforced`: existing facts this text restated; `invalidated`: existing
   facts this text ended.
-- `dropped`: extracted candidates that were discarded because one of their entities could not be
-  resolved. Non-zero means the text said more than the graph recorded.
+- `dropped`: extracted candidates that were discarded. `facts` and `invalidations` name an entity
+  that could not be resolved: non-zero means the text said more than the graph recorded. `entities`
+  are names that are only a literal value (an IP address, a number, a URL, a version) with no fact
+  on them: the extraction noise that is kept out of the graph.
 
 Other outcomes:
 
@@ -207,7 +209,7 @@ Other outcomes:
   "job_id": null,
   "error": "extraction failed: LLM HTTP 500: upstream error (episode stored for retry)",
   "entities": [], "facts": [], "reinforced": [], "invalidated": [],
-  "dropped": { "facts": 0, "invalidations": 0 }
+  "dropped": { "entities": 0, "facts": 0, "invalidations": 0 }
 }
 ```
 
