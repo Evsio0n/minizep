@@ -80,9 +80,11 @@ Facts:
 - "fact" is one self-contained natural-language sentence that keeps every detail the text gives:
   role, title, team, organisation, amounts, dates, addresses. Write "Alice Chen joined Globex as a
   Staff Engineer", never "Alice Chen --WORKS_AT--> Globex".
-- Both endpoints must be named entities of this text or known entities. A property of one entity with
-  no second named entity involved (its address, port, version, whether it needs a login) goes into that
-  entity's summary, not into a fact to a value.
+- Both endpoints must be named entities of this text or known entities, never a value node. A value
+  that can change (address, port, version, status, location, owner) belongs in a fact, so its history
+  is kept: relate the entity to the named entity it runs on or belongs to (its host, owner, project) and
+  put the value in that fact's sentence. Only when no second named entity exists at all does the value
+  go into the entity's summary.
 - relation is a short label such as WORKS_AT, HAS_ROLE, MEMBER_OF, LIVES_IN, REPORTS_TO, RUNS_ON, USES.
   It reads from sourceName to targetName as "subject RELATION object": for "Billing uses Redis",
   Billing --USES--> Redis is correct; Billing --PROVIDES--> Redis and Redis --USES--> Billing are wrong.
@@ -99,10 +101,9 @@ facts vs invalidations — this distinction is critical:
   relationship that only held because of it — leaving a company ends the role, title, team
   membership, manager and project relationships held there. Copy sourceName, targetName and
   relation exactly from the "Active relationships" list.
-- A new value for a single-valued relationship (employer, title, role, team, home city, manager)
-  replaces the old one: emit the new fact and invalidate the old one. A new value for a property of
-  one entity (its status, address, port, version) is not a fact: it replaces the old value in that
-  entity's summary.
+- A new value for a single-valued relationship (employer, title, role, team, home city, manager) or
+  for a changing property kept in a fact (address, port, version, status) replaces the old one: emit
+  the new fact and invalidate the old one. Only a property kept in a summary is updated there.
 - invalidAt = when it ended, resolved against the reference time; null when the text gives no clue.
 - If a relationship both starts and ends within this text, put it in "facts" with invalidAt.
 - Emit empty arrays when a category has no entries.

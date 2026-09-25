@@ -488,10 +488,11 @@ class EpisodeRun {
   async execute(finish?: (store: GraphStore) => Promise<void>): Promise<Omit<IngestResult, 'episode' | 'status'>> {
     const extraction = await this.extract();
 
-    const endpoints = new Set(
-      (extraction.facts ?? []).flatMap((f) => [f.sourceName, f.targetName]).map((n) => (n ?? '').trim().toLowerCase()),
-    );
-    for (const cand of extraction.entities ?? []) await this.resolveEntity(cand, endpoints);
+    const names = (rows: { sourceName: string; targetName: string }[]) =>
+      new Set(rows.flatMap((f) => [f.sourceName, f.targetName]).map((n) => (n ?? '').trim().toLowerCase()));
+    const endpoints = names(extraction.facts ?? []);
+    const related = new Set([...endpoints, ...names(extraction.invalidations ?? [])]);
+    for (const cand of extraction.entities ?? []) await this.resolveEntity(cand, endpoints, related);
     const plans: FactPlan[] = [];
     for (const cand of extraction.facts ?? []) {
       const plan = await this.planFact(cand);
@@ -609,12 +610,15 @@ class EpisodeRun {
     return node;
   }
 
-  private async resolveEntity(cand: ExtractedEntity, factEndpoints: Set<string>): Promise<void> {
+  private async resolveEntity(cand: ExtractedEntity, factEndpoints: Set<string>, related: Set<string>): Promise<void> {
     const name = (cand.name ?? '').trim();
     if (!name) return;
     const summary = (cand.summary ?? '').trim();
     const labels = cand.labels ?? [];
     let node = await this.lookup(name);
+    // the LLM sometimes echoes every known entity it was shown: one this text
+    // neither mentions nor relates is not updated (its summary would drift)
+    if (node && !related.has(name.toLowerCase()) && !mentions(this.episode.content, name)) return;
     if (node) {
       // merge: keep node, extend labels, and only replace the summary with a
       // real one (an empty candidate summary must never erase what we know)
