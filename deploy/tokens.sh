@@ -77,8 +77,10 @@ trap 'rm -f "$tmp"' EXIT
 cp -p "$ENV_FILE" "$tmp"
 
 # Rewrites the MINIZEP_TOKENS line with the entry added (keeping its quotes), or adds the
-# line at the end when there is none.
-awk -v entry="$ENTRY" -v key_re="$KEY_RE" '
+# line at the end when there is none. The entry reaches awk and grep through the
+# environment, not argv: any local user can read a process's command line.
+MINIZEP_NEW_ENTRY="$ENTRY" awk -v key_re="$KEY_RE" '
+  BEGIN { entry = ENVIRON["MINIZEP_NEW_ENTRY"] }
   $0 ~ key_re {
     v = $0
     sub(key_re, "", v)
@@ -99,7 +101,8 @@ awk -v entry="$ENTRY" -v key_re="$KEY_RE" '
 # Sanity check before replacing anything: one MINIZEP_TOKENS line, carrying the entry,
 # and every other line untouched.
 [ "$(grep -c -E "$KEY_RE" "$tmp")" = 1 ] || die "rewrite failed; $ENV_FILE left unchanged"
-grep -E "$KEY_RE" "$tmp" | grep -qF -e "$ENTRY" || die "rewrite failed; $ENV_FILE left unchanged"
+grep -E "$KEY_RE" "$tmp" | MINIZEP_NEW_ENTRY="$ENTRY" awk 'index($0, ENVIRON["MINIZEP_NEW_ENTRY"]) { found = 1 } END { exit !found }' ||
+  die "rewrite failed; $ENV_FILE left unchanged"
 [ "$(grep -v -E "$KEY_RE" "$ENV_FILE")" = "$(grep -v -E "$KEY_RE" "$tmp")" ] ||
   die "rewrite changed other lines; $ENV_FILE left unchanged"
 

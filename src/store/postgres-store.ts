@@ -37,6 +37,13 @@ const KEYWORD_STATS_SAMPLE = 10_000;
  */
 export class PostgresStore implements GraphStore {
   private pool: Pool;
+  /** set only on the view transaction() hands out: its queries share one connection */
+  private client?: PoolClient;
+
+  /** where data statements go: the transaction's connection, else the pool */
+  private get db(): Pick<Pool, 'query'> {
+    return this.client ?? this.pool;
+  }
   readonly embeddingDims: number;
   private ready: Promise<void> | null = null;
 
@@ -298,9 +305,32 @@ export class PostgresStore implements GraphStore {
 
   /* ---------------- episodes ---------------- */
 
+  /**
+   * Writes in `fn` commit together: a view of this store bound to one
+   * connection inside BEGIN/COMMIT, rolled back when `fn` throws.
+   */
+  async transaction<T>(fn: (tx: GraphStore) => Promise<T>): Promise<T> {
+    if (this.client) return fn(this); // already inside one
+    await this.ensure();
+    const client = await this.pool.connect();
+    const tx = Object.create(this) as PostgresStore;
+    tx.client = client;
+    try {
+      await client.query('BEGIN');
+      const result = await fn(tx);
+      await client.query('COMMIT');
+      return result;
+    } catch (err) {
+      await client.query('ROLLBACK').catch(() => undefined);
+      throw err;
+    } finally {
+      client.release();
+    }
+  }
+
   async addEpisode(ep: EpisodicNode): Promise<void> {
     await this.ensure();
-    await this.pool.query(
+    await this.db.query(
       `INSERT INTO episodes (uuid, group_id, name, source, source_description, content,
                              valid_at, created_at, status, error, content_hash)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
@@ -327,28 +357,28 @@ export class PostgresStore implements GraphStore {
     // the column is UUID-typed: anything else would be a query error, not a miss
     if (!UUID_RE.test(uuid)) return undefined;
     await this.ensure();
-    const r = await this.pool.query('SELECT * FROM episodes WHERE uuid=$1', [uuid]);
+    const r = await this.db.query('SELECT * FROM episodes WHERE uuid=$1', [uuid]);
     return r.rows[0] ? rowToEpisode(r.rows[0]) : undefined;
   }
 
   async getEpisodes(groupId?: string): Promise<EpisodicNode[]> {
     await this.ensure();
     const r = groupId
-      ? await this.pool.query('SELECT * FROM episodes WHERE group_id=$1 ORDER BY created_at', [groupId])
-      : await this.pool.query('SELECT * FROM episodes ORDER BY created_at');
+      ? await this.db.query('SELECT * FROM episodes WHERE group_id=$1 ORDER BY created_at', [groupId])
+      : await this.db.query('SELECT * FROM episodes ORDER BY created_at');
     return r.rows.map(rowToEpisode);
   }
 
   async removeEpisode(uuid: UUID): Promise<void> {
     await this.ensure();
-    await this.pool.query('DELETE FROM episodes WHERE uuid=$1', [uuid]);
+    await this.db.query('DELETE FROM episodes WHERE uuid=$1', [uuid]);
   }
 
   /* ---------------- entities ---------------- */
 
   async upsertEntity(node: EntityNode): Promise<void> {
     await this.ensure();
-    await this.pool.query(
+    await this.db.query(
       `INSERT INTO entities (uuid, group_id, name, labels, summary, attributes, created_at, name_embedding)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
        ON CONFLICT (group_id, lower(name)) DO UPDATE SET
@@ -369,13 +399,13 @@ export class PostgresStore implements GraphStore {
 
   async getEntity(uuid: UUID): Promise<EntityNode | undefined> {
     await this.ensure();
-    const r = await this.pool.query('SELECT * FROM entities WHERE uuid=$1', [uuid]);
+    const r = await this.db.query('SELECT * FROM entities WHERE uuid=$1', [uuid]);
     return r.rows[0] ? rowToEntity(r.rows[0]) : undefined;
   }
 
   async findEntityByName(groupId: string, name: string): Promise<EntityNode | undefined> {
     await this.ensure();
-    const r = await this.pool.query(
+    const r = await this.db.query(
       'SELECT * FROM entities WHERE group_id=$1 AND lower(name)=lower($2) LIMIT 1',
       [groupId, name],
     );
@@ -385,8 +415,8 @@ export class PostgresStore implements GraphStore {
   async getEntities(groupId?: string): Promise<EntityNode[]> {
     await this.ensure();
     const r = groupId
-      ? await this.pool.query('SELECT * FROM entities WHERE group_id=$1 ORDER BY created_at', [groupId])
-      : await this.pool.query('SELECT * FROM entities ORDER BY created_at');
+      ? await this.db.query('SELECT * FROM entities WHERE group_id=$1 ORDER BY created_at', [groupId])
+      : await this.db.query('SELECT * FROM entities ORDER BY created_at');
     return r.rows.map(rowToEntity);
   }
 
@@ -394,7 +424,7 @@ export class PostgresStore implements GraphStore {
 
   async addFact(edge: EntityEdge): Promise<void> {
     await this.ensure();
-    await this.pool.query(
+    await this.db.query(
       `INSERT INTO facts (uuid, group_id, source_node_uuid, target_node_uuid, name, fact, episodes,
                           valid_at, invalid_at, created_at, expired_at, attributes, fact_embedding,
                           search_text)
@@ -430,21 +460,21 @@ export class PostgresStore implements GraphStore {
 
   async getFact(uuid: UUID): Promise<EntityEdge | undefined> {
     await this.ensure();
-    const r = await this.pool.query('SELECT * FROM facts WHERE uuid=$1', [uuid]);
+    const r = await this.db.query('SELECT * FROM facts WHERE uuid=$1', [uuid]);
     return r.rows[0] ? rowToFact(r.rows[0]) : undefined;
   }
 
   async getFacts(groupId?: string): Promise<EntityEdge[]> {
     await this.ensure();
     const r = groupId
-      ? await this.pool.query('SELECT * FROM facts WHERE group_id=$1 ORDER BY created_at', [groupId])
-      : await this.pool.query('SELECT * FROM facts ORDER BY created_at');
+      ? await this.db.query('SELECT * FROM facts WHERE group_id=$1 ORDER BY created_at', [groupId])
+      : await this.db.query('SELECT * FROM facts ORDER BY created_at');
     return r.rows.map(rowToFact);
   }
 
   async getFactsForEntity(uuid: UUID): Promise<EntityEdge[]> {
     await this.ensure();
-    const r = await this.pool.query(
+    const r = await this.db.query(
       'SELECT * FROM facts WHERE source_node_uuid=$1 OR target_node_uuid=$1',
       [uuid],
     );
@@ -489,7 +519,7 @@ export class PostgresStore implements GraphStore {
     const scope = this.keywordScope(params, covered);
     params.push(KEYWORD_CANDIDATES);
     // candidates in creation order, like getFacts(), so ties rank as in memory
-    const found = await this.pool.query(
+    const found = await this.db.query(
       `SELECT uuid, search_text FROM (
          SELECT uuid, search_text, created_at FROM facts
           WHERE to_tsvector('simple', search_text) @@ to_tsquery('simple', $1)${scope}
@@ -524,7 +554,7 @@ export class PostgresStore implements GraphStore {
     const scope = this.keywordScope(params, opts);
     params.push(KEYWORD_STATS_SAMPLE);
     // search_text is tokens joined by single spaces: tokens = spaces + 1
-    const r = await this.pool.query(
+    const r = await this.db.query(
       `SELECT count(*)::int AS size,
               coalesce(avg(CASE WHEN search_text = '' THEN 0
                                 ELSE length(search_text) - length(replace(search_text, ' ', '')) + 1 END),
@@ -551,7 +581,7 @@ export class PostgresStore implements GraphStore {
   async getFactsByUuids(uuids: UUID[]): Promise<EntityEdge[]> {
     if (uuids.length === 0) return [];
     await this.ensure();
-    const r = await this.pool.query('SELECT * FROM facts WHERE uuid = ANY($1::uuid[])', [uuids]);
+    const r = await this.db.query('SELECT * FROM facts WHERE uuid = ANY($1::uuid[])', [uuids]);
     return r.rows.map(rowToFact);
   }
 
@@ -607,7 +637,7 @@ export class PostgresStore implements GraphStore {
     sql += this.temporalPredicate(params, opts.activeAt, ' AND ', opts.asOf);
     params.push(opts.limit ?? 20);
     sql += ` ORDER BY fact_embedding <=> $1::vector LIMIT $${params.length}`;
-    const r = await this.pool.query(sql, params);
+    const r = await this.db.query(sql, params);
     return r.rows.map((row) => ({ edge: rowToFact(row), distance: Number(row.distance) }));
   }
 }

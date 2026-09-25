@@ -221,8 +221,13 @@ export class IngestPipeline {
         f.attributes.retracted = true;
       } else {
         const at = input.at ?? now;
-        if (f.invalidAt && f.invalidAt <= at) {
-          throw new InvalidationError(`fact already ended at ${f.invalidAt.toISOString()}`, 'conflict');
+        // an end in the past is history: moving it would rewrite what as_of
+        // queries report was known (one row per fact); retract to correct it
+        if (f.invalidAt && (f.invalidAt <= at || f.invalidAt <= now)) {
+          throw new InvalidationError(
+            `fact already ended at ${f.invalidAt.toISOString()} (retract it to correct the record)`,
+            'conflict',
+          );
         }
         if (f.validAt && at <= f.validAt) {
           throw new InvalidationError(
@@ -289,10 +294,13 @@ export class IngestPipeline {
   /** Only ever executed while holding the group's lock. */
   private async processLocked(episode: EpisodicNode): Promise<IngestResult> {
     try {
-      const outcome = await new EpisodeRun(this.store, this.llm, this.embedder, episode).execute();
-      episode.status = 'processed';
-      episode.error = undefined;
-      await this.store.addEpisode(episode);
+      // the 'processed' mark commits with the graph writes: a retry must never
+      // find half an episode already in the graph
+      const outcome = await new EpisodeRun(this.store, this.llm, this.embedder, episode).execute(async (store) => {
+        episode.status = 'processed';
+        episode.error = undefined;
+        await store.addEpisode(episode);
+      });
       return { episode, status: 'processed', ...outcome };
     } catch (err) {
       // failure isolation: keep the raw episode (it is the most valuable thing
@@ -451,7 +459,8 @@ class EpisodeRun {
     this.groupId = episode.groupId;
   }
 
-  async execute(): Promise<Omit<IngestResult, 'episode' | 'status'>> {
+  /** `finish` runs in the same transaction as the graph writes (when the store has one). */
+  async execute(finish?: (store: GraphStore) => Promise<void>): Promise<Omit<IngestResult, 'episode' | 'status'>> {
     const extraction = await this.extract();
 
     const endpoints = new Set(
@@ -476,7 +485,12 @@ class EpisodeRun {
     for (const inv of extraction.invalidations ?? []) await this.applyInvalidation(inv);
 
     await this.repairStaleVectors();
-    await this.write();
+    const commit = async (store: GraphStore) => {
+      await this.write(store);
+      await finish?.(store);
+    };
+    if (this.store.transaction) await this.store.transaction(commit);
+    else await commit(this.store);
     return {
       entities: this.touched,
       facts: [...this.created],
@@ -873,7 +887,7 @@ class EpisodeRun {
     }
   }
 
-  private async write(): Promise<void> {
+  private async write(store: GraphStore): Promise<void> {
     // a wrong-length vector would be rejected halfway through the writes;
     // refuse the whole episode up front instead
     const outgoing = [
@@ -892,8 +906,8 @@ class EpisodeRun {
       }
     }
 
-    for (const node of this.dirtyEntities) await this.store.upsertEntity(node);
-    for (const edge of this.created) await this.store.addFact(edge);
-    for (const edge of this.dirtyFacts) await this.store.updateFact(edge);
+    for (const node of this.dirtyEntities) await store.upsertEntity(node);
+    for (const edge of this.created) await store.addFact(edge);
+    for (const edge of this.dirtyFacts) await store.updateFact(edge);
   }
 }

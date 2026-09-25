@@ -32,6 +32,13 @@ export interface GraphStore {
   getFacts(groupId?: string): Promise<EntityEdge[]>;
   getFactsForEntity(uuid: UUID): Promise<EntityEdge[]>;
   getFactsBetween(a: UUID, b: UUID): Promise<EntityEdge[]>;
+
+  /**
+   * Run `fn` against a view of this store whose writes commit together or not
+   * at all. Optional: a store without it has no partial-write failure mode
+   * worth guarding (the in-memory graph).
+   */
+  transaction?<T>(fn: (tx: GraphStore) => Promise<T>): Promise<T>;
 }
 
 /** Stores that can dump/restore themselves as JSON (used by FilePersistence). */

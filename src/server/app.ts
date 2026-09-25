@@ -169,12 +169,24 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
     if (!isMcp && !isRest) return sendJson(res, 404, { error: 'not found' });
 
     const auth = authorize(req.headers.authorization, opts.tokens, opts.allowAnonymous ?? false);
+    if (auth.ok && opts.tokens.size === 0 && !fromLocalClient(req)) {
+      // anonymous (development) mode: without a token a browser page could
+      // write into the graph cross-site, or read it via DNS rebinding
+      return sendJson(res, 403, { error: 'anonymous mode only serves local, non-browser clients' });
+    }
     if (!auth.ok) {
       return sendJson(res, auth.status, { error: auth.error }, auth.status === 401 ? { 'www-authenticate': 'Bearer' } : {});
     }
     if (closing) return sendJson(res, 503, { error: 'server is shutting down' });
     if (isRest) return rest(req, res, url, auth.principal);
     return handleMcp(req, res, auth.principal);
+  }
+
+  /** No Origin header (not a browser page) and a loopback Host. */
+  function fromLocalClient(req: IncomingMessage): boolean {
+    if (req.headers.origin !== undefined) return false;
+    const host = (req.headers.host ?? '').replace(/:\d+$/, '').replace(/^\[|\]$/g, '').toLowerCase();
+    return host === 'localhost' || host === '::1' || /^127\.\d+\.\d+\.\d+$/.test(host);
   }
 
   const handler = (req: IncomingMessage, res: ServerResponse) => {

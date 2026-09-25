@@ -41,6 +41,13 @@ export function sendJson(
  * limit, after which the connection is cut.
  */
 export async function readJsonBody(req: IncomingMessage, limit = MAX_BODY_BYTES): Promise<unknown> {
+  // anything but application/json is a CORS "simple" request a web page can
+  // send without a preflight; refusing it keeps cross-site writes out
+  const type = (req.headers['content-type'] ?? '').split(';')[0].trim().toLowerCase();
+  const hasBody = Number(req.headers['content-length'] ?? 0) > 0 || req.headers['transfer-encoding'] !== undefined;
+  if (hasBody && type !== 'application/json') {
+    throw new ServiceError(415, 'Content-Type must be application/json');
+  }
   const chunks: Buffer[] = [];
   let size = 0;
   for await (const chunk of req as AsyncIterable<Buffer>) {

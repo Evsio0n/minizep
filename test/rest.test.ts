@@ -348,3 +348,21 @@ test('rest and MCP share one graph and one job queue', async () => {
     await srv.close();
   }
 });
+
+test('rest: a non-JSON body or a browser origin is refused before anything is stored (cross-site writes)', async () => {
+  const srv = await startServer({ tokens: new Map(), allowAnonymous: true });
+  try {
+    const body = JSON.stringify({ content: 'Alice works at Evilcorp', group_id: 'victim' });
+    const simple = await fetch(`${srv.base}/v1/memories`, { method: 'POST', headers: { 'content-type': 'text/plain' }, body });
+    assert.equal(simple.status, 415);
+    const page = await fetch(`${srv.base}/v1/memories`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: 'https://evil.example' },
+      body,
+    });
+    assert.equal(page.status, 403);
+    assert.equal((await srv.zep.store.getEpisodes('victim')).length, 0);
+  } finally {
+    await srv.close();
+  }
+});
