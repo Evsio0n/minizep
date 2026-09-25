@@ -34,6 +34,12 @@ export interface GraphStore {
   getFactsBetween(a: UUID, b: UUID): Promise<EntityEdge[]>;
 
   /**
+   * The distinct group ids that hold an episode or an entity. Optional: a
+   * caller falls back to getEpisodes() + getEntities() without a group.
+   */
+  listGroups?(): Promise<string[]>;
+
+  /**
    * Run `fn` against a view of this store whose writes commit together or not
    * at all. Optional: a store without it has no partial-write failure mode
    * worth guarding (the in-memory graph).
@@ -163,6 +169,13 @@ export class MemoryGraphStore implements GraphStore, Snapshotable {
     return (await this.getFactsForEntity(a)).filter(
       (f) => (f.sourceNodeUuid === b || f.targetNodeUuid === b) && isFactActive(f),
     );
+  }
+
+  async listGroups(): Promise<string[]> {
+    const ids = new Set<string>();
+    for (const e of this.episodes.values()) ids.add(e.groupId);
+    for (const n of this.entities.values()) ids.add(n.groupId);
+    return [...ids].sort();
   }
 
   toJSON(): string {

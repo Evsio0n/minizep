@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Minizep } from '../src/index.js';
-import { isFactActive } from '../src/model/types.js';
+import { factView, isFactActive, isFactKnown, type EntityEdge } from '../src/model/types.js';
 import { ScriptedLLM, deterministicEmbedder, entity, fact, invalidation } from './helpers.js';
 import type { LLMProvider } from '../src/provider/interfaces.js';
 
@@ -760,6 +760,49 @@ test('temporal: isFactActive separates valid time from knowledge time', () => {
   const retracted = { ...f, invalidAt: undefined };
   assert.equal(isFactActive(retracted, d('2024-06-01')), false);
   assert.equal(isFactActive(retracted, d('2024-06-01'), d('2025-05-01')), true);
+});
+
+test('temporal: factView agrees with isFactActive and tells future, ended and retracted apart', () => {
+  const base = {
+    validAt: d('2024-01-01'),
+    invalidAt: d('2025-03-01'),
+    createdAt: d('2025-01-01'),
+    expiredAt: d('2025-06-01'),
+    attributes: {},
+  } as unknown as EntityEdge;
+  const open = { ...base, invalidAt: undefined, expiredAt: undefined };
+  const fixtures: Record<string, EntityEdge> = {
+    'ended, end learned later': base,
+    'end came with the fact': { ...base, expiredAt: undefined },
+    'retracted as a whole': { ...base, invalidAt: undefined },
+    'retracted: empty window': { ...base, invalidAt: base.validAt },
+    'stored with an empty window': { ...base, invalidAt: base.validAt, expiredAt: undefined },
+    'open': open,
+    'start unknown': { ...open, validAt: undefined },
+    'starts later': { ...open, validAt: d('2026-01-01') },
+    'end scheduled': { ...base, invalidAt: d('2026-01-01') },
+    'no createdAt': { ...open, createdAt: undefined } as unknown as EntityEdge,
+  };
+  const instants = ['2023-06-01', '2024-01-01', '2024-06-01', '2025-01-01', '2025-03-01', '2025-04-01', '2025-06-01', '2026-01-01', '2027-01-01'].map(d);
+  for (const [name, f] of Object.entries(fixtures)) {
+    for (const at of [...instants, undefined]) {
+      for (const asOf of [...instants, undefined]) {
+        const view = factView(f, at, asOf);
+        const where = `${name} at ${at?.toISOString() ?? 'now'} as of ${asOf?.toISOString() ?? 'now'}`;
+        assert.equal(view?.state === 'active', isFactActive(f, at, asOf), where);
+        assert.equal(view === undefined, !isFactKnown(f, asOf ?? new Date()), where);
+      }
+    }
+  }
+
+  assert.deepEqual(factView(base, d('2025-04-01')), { state: 'ended', endsAt: d('2025-03-01'), revisedLater: false });
+  assert.deepEqual(factView(base, d('2025-04-01'), d('2025-05-01')), { state: 'active', endsAt: undefined, revisedLater: true });
+  assert.equal(factView(base, d('2023-06-01'))?.state, 'future');
+  assert.equal(factView(fixtures['end scheduled'], d('2025-04-01'))?.endsAt?.toISOString(), '2026-01-01T00:00:00.000Z');
+  assert.equal(factView(fixtures['retracted as a whole'], d('2024-06-01'))?.state, 'retracted');
+  assert.equal(factView(fixtures['retracted: empty window'], d('2023-06-01'))?.state, 'retracted', 'at every valid time');
+  assert.equal(factView(fixtures['retracted: empty window'], d('2024-06-01'), d('2025-05-01'))?.state, 'active', 'before the retraction');
+  assert.equal(factView(base, d('2024-06-01'), d('2024-12-01')), undefined, 'not known yet');
 });
 
 test('temporal: factsAt with asOf answers "what did we believe back then"', async () => {

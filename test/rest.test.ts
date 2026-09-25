@@ -151,6 +151,8 @@ test('rest: every route applies the token\'s group rules', async () => {
       ['POST', '/v1/facts/00000000/invalidate', { reason: 'x', group_id: 'teamB' }],
       ['POST', '/v1/episodes/retry-failed', { group_id: 'teamB' }],
       ['GET', '/v1/stats?group_id=teamB'],
+      ['GET', '/v1/graph?group_id=teamB'],
+      ['GET', '/v1/entities/00000000?group_id=teamB'],
     ];
     for (const [method, path, body] of refused) {
       const r = await api(srv.base, method, path, { token: 'tokA', body });
@@ -212,6 +214,51 @@ test('rest: search, entities, facts about an entity, facts at an instant', async
     assert.equal(july.body.facts.length, 1);
     const knownBefore = await api(srv.base, 'GET', `/v1/facts?at=2024-01-20T00:00:00Z&as_of=2000-01-01T00:00:00Z`, tok);
     assert.equal(knownBefore.body.facts.length, 0, 'nothing was known in 2000');
+
+    // the graph at one (at, as_of) instant: active facts only, unless history is asked for
+    type Edge = { relation: string; state: string; [k: string]: any };
+    const relations = (r: { body: { edges: Edge[] } }) => r.body.edges.map((e) => `${e.relation}:${e.state}`).sort();
+    const graphNow = await api(srv.base, 'GET', '/v1/graph', tok);
+    assert.equal(graphNow.status, 200);
+    assert.deepEqual(relations(graphNow), ['LIKES:active']);
+    assert.deepEqual(graphNow.body.counts, { entities: 3, facts: 2, nodes: 2, edges: 1, hidden_edges: 1 });
+    assert.deepEqual(graphNow.body.labels, [{ label: 'Organization', count: 2 }, { label: 'Person', count: 1 }]);
+    assert.deepEqual(graphNow.body.timeline.valid, ['2024-01-15T00:00:00.000Z', '2024-06-01T00:00:00.000Z']);
+    const history = await api(srv.base, 'GET', '/v1/graph?history=true&isolated=1', tok);
+    assert.deepEqual(relations(history), ['LIKES:active', 'WORKS_AT:ended']);
+    const worksAt = history.body.edges.find((e: Edge) => e.relation === 'WORKS_AT');
+    assert.equal(worksAt.ends_at, '2024-06-01T00:00:00.000Z');
+    assert.equal(worksAt.reason, 'text states "left"');
+    const alice = history.body.nodes.find((n: { name: string }) => n.name === 'Alice');
+    assert.deepEqual([alice.label, alice.degree, worksAt.source_uuid], ['Person', 2, alice.uuid]);
+    assert.deepEqual(relations(await api(srv.base, 'GET', '/v1/graph?at=2024-03-01T00:00:00Z', tok)), [
+      'LIKES:active',
+      'WORKS_AT:active',
+    ]);
+    const believed = await api(srv.base, 'GET', `/v1/graph?history=1&as_of=${worksAt.created_at}`, tok);
+    const before = believed.body.edges.find((e: Edge) => e.relation === 'WORKS_AT');
+    assert.deepEqual([before.state, before.ends_at, before.revised_later], ['active', null, true]);
+    const one = await api(srv.base, 'GET', '/v1/graph?history=1&limit=1', tok);
+    assert.deepEqual([relations(one), one.body.truncated], [['LIKES:active'], true]);
+    assert.equal((await api(srv.base, 'GET', '/v1/graph?limit=2001', tok)).status, 400);
+
+    // one entity by uuid prefix, with every fact touching it and their evidence
+    const node = await api(srv.base, 'GET', `/v1/entities/${alice.uuid.slice(0, 8)}`, tok);
+    assert.equal(node.status, 200);
+    assert.equal(node.body.entity.name, 'Alice');
+    assert.deepEqual(node.body.facts.map((f: Edge) => `${f.relation}:${f.state}`), ['LIKES:active', 'WORKS_AT:ended']);
+    assert.equal(node.body.episodes.length, 1, 'the second episode only ended a fact; it is not its evidence');
+    assert.equal((await api(srv.base, 'GET', `/v1/entities/${alice.uuid}`, { token: 'tokB' })).status, 404);
+    assert.equal((await api(srv.base, 'GET', '/v1/entities/Alice', tok)).status, 400, 'names are not ids');
+
+    // the groups a token may open, and the server's time zone
+    const groups = await api(srv.base, 'GET', '/v1/groups', tok);
+    assert.equal(groups.body.default_group, 'teamA');
+    assert.deepEqual(
+      groups.body.groups.map((g: Record<string, unknown>) => ({ ...g, last_episode_at: typeof g.last_episode_at })),
+      [{ group_id: 'teamA', entities: 3, facts: 2, active_facts: 1, episodes: 2, failed_episodes: 0, last_episode_at: 'string' }],
+    );
+    assert.equal(typeof (await api(srv.base, 'GET', '/v1/status', tok)).body.timezone, 'string');
   } finally {
     await srv.close();
   }

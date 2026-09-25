@@ -8,8 +8,9 @@
  */
 import { z } from 'zod';
 import type { Minizep } from '../index.js';
-import type { EntityEdge, EntityNode, EpisodicNode, FactWithContext } from '../model/types.js';
-import { isFactActive } from '../model/types.js';
+import type { EntityEdge, EntityNode, EpisodicNode, FactState, FactWithContext } from '../model/types.js';
+import { factView, isFactActive } from '../model/types.js';
+import { displayTimeZone } from '../util/time.js';
 import { InvalidationError, type EpisodeInput, type IngestResult } from '../pipeline/ingest.js';
 import type { Job, JobQueue } from '../jobs/queue.js';
 import { permits, resolveGroup, type Principal } from './auth.js';
@@ -46,6 +47,8 @@ export interface FactRow {
   relation: string;
   source: string;
   target: string;
+  source_uuid: string;
+  target_uuid: string;
   fact: string;
   valid_at: string | null;
   invalid_at: string | null;
@@ -55,6 +58,24 @@ export interface FactRow {
   episodes: string[];
   /** fused retrieval score, on search results only */
   score: number | null;
+  /** why the fact was ended or retracted (attributes.invalidatedBy) */
+  reason: string | null;
+}
+
+/** A fact as the graph shows it at one (at, as_of) instant. */
+export interface GraphEdge extends Omit<FactRow, 'score'> {
+  state: FactState;
+  /** invalid_at as it was known at as_of (null: no end known then) */
+  ends_at: string | null;
+  /** a correction made after as_of exists (expired_at > as_of) */
+  revised_later: boolean;
+}
+
+export interface GraphNode extends EntityRow {
+  /** the first label that is not "Entity", else "Entity" */
+  label: string;
+  /** number of returned edges touching this node */
+  degree: number;
 }
 
 export interface EntityRow {
@@ -116,6 +137,8 @@ export function factRow(r: FactWithContext): FactRow {
     relation: f.name,
     source: r.sourceName,
     target: r.targetName,
+    source_uuid: f.sourceNodeUuid,
+    target_uuid: f.targetNodeUuid,
     fact: f.fact,
     valid_at: iso(f.validAt),
     invalid_at: iso(f.invalidAt),
@@ -123,7 +146,39 @@ export function factRow(r: FactWithContext): FactRow {
     expired_at: iso(f.expiredAt),
     episodes: [...f.episodes],
     score: r.score ?? null,
+    reason: typeof f.attributes?.invalidatedBy === 'string' ? f.attributes.invalidatedBy : null,
   };
+}
+
+/** The fact row plus its state at (at, asOf); undefined when it was not known at asOf. */
+function graphEdge(r: FactWithContext, at: Date, asOf: Date): GraphEdge | undefined {
+  const view = factView(r.fact, at, asOf);
+  if (!view) return undefined;
+  const { score: _score, ...row } = factRow(r);
+  return { ...row, state: view.state, ends_at: iso(view.endsAt), revised_later: view.revisedLater };
+}
+
+/** The first label that is not the generic "Entity" (the graph colours by it). */
+function primaryLabel(labels: readonly string[]): string {
+  return labels.find((l) => l !== 'Entity') ?? 'Entity';
+}
+
+const STATE_ORDER: Record<FactState, number> = { active: 0, future: 1, ended: 2, retracted: 3 };
+
+/** Plain code-unit order (ISO timestamps sort chronologically this way). */
+const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
+/** At most `n` items spread evenly over the sorted list, keeping its first and last. */
+function spread<T>(sorted: T[], n: number): T[] {
+  if (sorted.length <= n) return sorted;
+  return Array.from({ length: n }, (_, i) => sorted[Math.round((i * (sorted.length - 1)) / (n - 1))]);
+}
+
+/** Distinct instants as sorted ISO strings. */
+function instants(dates: (Date | undefined)[]): string[] {
+  return [...new Set(dates.filter((d): d is Date => !!d).map((d) => d.getTime()))]
+    .sort((a, b) => a - b)
+    .map((ms) => new Date(ms).toISOString());
 }
 
 function entityRow(e: EntityNode): EntityRow {
@@ -233,6 +288,20 @@ export const shapes = {
   group: {
     group_id: groupId,
   },
+  graph: {
+    group_id: groupId,
+    at: instant('the valid time to look at (default now)'),
+    as_of: asOf,
+    history: z.boolean().optional().describe('Also facts that are not active at `at`, each with its state'),
+    isolated: z.boolean().optional().describe('Also entities known at `as_of` that no returned fact touches'),
+    limit: z.number().int().min(1).max(2000).optional().describe('Maximum facts returned (default 500)'),
+  },
+  entity: {
+    id: z.string().min(1).describe('Entity uuid, or a prefix of at least 8 characters'),
+    group_id: groupId,
+    at: instant('the valid time the fact states refer to (default now)'),
+    as_of: asOf,
+  },
 };
 
 type Input<S extends z.ZodRawShape> = z.infer<z.ZodObject<S>>;
@@ -245,6 +314,8 @@ export type EpisodesInput = Input<typeof shapes.episodes>;
 export type EpisodeInputShape = Input<typeof shapes.episode>;
 export type InvalidateFactInputShape = Input<typeof shapes.invalidateFact>;
 export type GroupInput = Input<typeof shapes.group>;
+export type GraphInput = Input<typeof shapes.graph>;
+export type EntityInput = Input<typeof shapes.entity>;
 
 /** An ISO-8601 instant from a request, or undefined when absent. */
 function parseInstant(value: string | undefined, field: string): Date | undefined {
@@ -502,6 +573,175 @@ export class MemoryService {
     };
   }
 
+  /**
+   * Nodes and edges of one group at one bi-temporal instant, for the graph
+   * view. Without `history` only active facts are returned; with it, every
+   * fact known at `as_of`, each with its state. `labels` and `timeline` cover
+   * the whole group, so colours and time ticks stay put while time moves.
+   */
+  async graph(p: Principal, input: GraphInput) {
+    const group = resolveGroup(p, input.group_id);
+    const at = parseInstant(input.at, 'at') ?? new Date();
+    const asOf = parseInstant(input.as_of, 'as_of') ?? new Date();
+    const history = input.history ?? false;
+    const limit = input.limit ?? 500;
+    const [facts, entities] = await Promise.all([this.zep.store.getFacts(group), this.zep.store.getEntities(group)]);
+    const byId = new Map(entities.map((e) => [e.uuid, e]));
+
+    let edges: GraphEdge[] = [];
+    for (const f of facts) {
+      const source = byId.get(f.sourceNodeUuid);
+      const target = byId.get(f.targetNodeUuid);
+      if (!source || !target) continue; // not drawable
+      const edge = graphEdge({ fact: f, sourceName: source.name, targetName: target.name }, at, asOf);
+      if (edge && (history || edge.state === 'active')) edges.push(edge);
+    }
+    // active first, then the most recently learned
+    edges.sort(
+      (a, b) =>
+        Number(b.state === 'active') - Number(a.state === 'active') || cmp(b.created_at, a.created_at),
+    );
+    const truncated = edges.length > limit;
+    if (truncated) edges = edges.slice(0, limit);
+
+    const degree = new Map<string, number>();
+    for (const e of edges) {
+      degree.set(e.source_uuid, (degree.get(e.source_uuid) ?? 0) + 1);
+      degree.set(e.target_uuid, (degree.get(e.target_uuid) ?? 0) + 1);
+    }
+    const shown = entities.filter(
+      (e) => degree.has(e.uuid) || (input.isolated === true && e.createdAt <= asOf),
+    );
+    const nodes: GraphNode[] = shown.map((e) => ({
+      ...entityRow(e),
+      label: primaryLabel(e.labels),
+      degree: degree.get(e.uuid) ?? 0,
+    }));
+
+    const labelCounts = new Map<string, number>();
+    for (const e of entities) {
+      const label = primaryLabel(e.labels);
+      labelCounts.set(label, (labelCounts.get(label) ?? 0) + 1);
+    }
+    const labels = [...labelCounts]
+      .sort(([a], [b]) => Number(b === 'Entity') - Number(a === 'Entity') || cmp(a, b))
+      .map(([label, count]) => ({ label, count }));
+
+    return {
+      group_id: group,
+      at: at.toISOString(),
+      as_of: asOf.toISOString(),
+      history,
+      nodes,
+      edges,
+      labels,
+      timeline: {
+        valid: spread(instants(facts.flatMap((f) => [f.validAt, f.invalidAt])), 1000),
+        known: spread(instants(facts.flatMap((f) => [f.createdAt, f.expiredAt])), 1000),
+      },
+      counts: {
+        entities: entities.length,
+        facts: facts.length,
+        nodes: nodes.length,
+        edges: edges.length,
+        hidden_edges: facts.length - edges.length,
+      },
+      truncated,
+    };
+  }
+
+  /**
+   * One entity by uuid (or a prefix of at least 8 characters), with every
+   * fact touching it that was known at `as_of`, each with its state at `at`,
+   * and the episodes those facts came from.
+   */
+  async entity(p: Principal, input: EntityInput) {
+    const group = resolveGroup(p, input.group_id);
+    const id = normaliseId(input.id, 'entity');
+    const at = parseInstant(input.at, 'at') ?? new Date();
+    const asOf = parseInstant(input.as_of, 'as_of') ?? new Date();
+    const entity = UUID_RE.test(id)
+      ? await this.zep.store.getEntity(id).then((e) => (e && e.groupId === group ? e : undefined))
+      : pickByPrefix(await this.zep.store.getEntities(group), id, 'entity');
+    if (!entity) throw new ServiceError(404, 'entity not found');
+
+    const touching = (await this.zep.store.getFactsForEntity(entity.uuid)).filter((f) => f.groupId === group);
+    const names = await this.nameMap(touching, new Map([[entity.uuid, entity.name]]));
+    const facts = touching
+      .map((f) => {
+        const named = { fact: f, sourceName: names.get(f.sourceNodeUuid)!, targetName: names.get(f.targetNodeUuid)! };
+        return graphEdge(named, at, asOf);
+      })
+      .filter((e): e is GraphEdge => e !== undefined)
+      .sort(
+        (a, b) =>
+          STATE_ORDER[a.state] - STATE_ORDER[b.state] ||
+          cmp(b.valid_at ?? '', a.valid_at ?? '') || // newest start first, unknown starts last
+          cmp(b.created_at, a.created_at),
+      );
+
+    const ids = [...new Set(facts.flatMap((f) => f.episodes))];
+    const episodes = (await Promise.all(ids.map((uuid) => this.zep.store.getEpisode(uuid))))
+      .filter((e): e is EpisodicNode => !!e && e.groupId === group && e.createdAt <= asOf)
+      .sort((a, b) => b.validAt.getTime() - a.validAt.getTime());
+    return {
+      group_id: group,
+      at: at.toISOString(),
+      as_of: asOf.toISOString(),
+      entity: { ...entityRow(entity), label: primaryLabel(entity.labels), attributes: entity.attributes ?? {} },
+      facts,
+      episodes: episodes.slice(0, 50).map((e) => ({
+        uuid: e.uuid,
+        name: e.name,
+        source: e.source,
+        valid_at: e.validAt.toISOString(),
+        created_at: e.createdAt.toISOString(),
+        status: e.status ?? 'processed',
+      })),
+      episodes_truncated: episodes.length > 50,
+    };
+  }
+
+  /**
+   * The groups the caller may open, most recently active first: its own list,
+   * or for a principal allowed any group, every group that holds data.
+   */
+  async groups(p: Principal) {
+    const store = this.zep.store;
+    let ids: string[];
+    if (p.groups !== 'any') ids = [...p.groups];
+    else if (store.listGroups) ids = await store.listGroups();
+    else {
+      const [episodes, entities] = await Promise.all([store.getEpisodes(), store.getEntities()]);
+      ids = [...new Set([...episodes.map((e) => e.groupId), ...entities.map((e) => e.groupId)])];
+    }
+    const now = new Date();
+    const rows = await Promise.all(
+      ids.map(async (group) => {
+        const [episodes, entities, facts] = await Promise.all([
+          store.getEpisodes(group),
+          store.getEntities(group),
+          store.getFacts(group),
+        ]);
+        const last = episodes.reduce<Date | undefined>((m, e) => (!m || e.createdAt > m ? e.createdAt : m), undefined);
+        return {
+          group_id: group,
+          entities: entities.length,
+          facts: facts.length,
+          active_facts: facts.filter((f) => isFactActive(f, now)).length,
+          episodes: episodes.length,
+          failed_episodes: episodes.filter((e) => e.status === 'failed').length,
+          last_episode_at: iso(last),
+        };
+      }),
+    );
+    rows.sort(
+      (a, b) =>
+        cmp(b.last_episode_at ?? '', a.last_episode_at ?? '') || cmp(a.group_id, b.group_id),
+    );
+    return { default_group: p.defaultGroup, groups: rows };
+  }
+
   /** Server details for an authenticated caller (what /health used to expose). */
   status(p: Principal) {
     return {
@@ -511,6 +751,8 @@ export class MemoryService {
       default_group: p.defaultGroup,
       groups: p.groups === 'any' ? null : [...p.groups],
       jobs: this.jobs.statsFor((j) => this.canSee(p, j)),
+      /** the zone relative dates in ingested text are resolved in */
+      timezone: displayTimeZone(),
     };
   }
 
@@ -567,15 +809,21 @@ export class MemoryService {
 
   /** Fact rows with endpoint names, looking up only the entities not already known. */
   private async withNames(edges: EntityEdge[], known = new Map<string, string>()): Promise<FactRow[]> {
+    const names = await this.nameMap(edges, known);
+    return edges.map((f) =>
+      factRow({ fact: f, sourceName: names.get(f.sourceNodeUuid)!, targetName: names.get(f.targetNodeUuid)! }),
+    );
+  }
+
+  /** uuid -> name for every endpoint of `edges` (a missing entity shows its uuid). */
+  private async nameMap(edges: EntityEdge[], known = new Map<string, string>()): Promise<Map<string, string>> {
     const names = new Map(known);
     for (const f of edges) {
       for (const id of [f.sourceNodeUuid, f.targetNodeUuid]) {
         if (!names.has(id)) names.set(id, (await this.zep.store.getEntity(id))?.name ?? id);
       }
     }
-    return edges.map((f) =>
-      factRow({ fact: f, sourceName: names.get(f.sourceNodeUuid)!, targetName: names.get(f.targetNodeUuid)! }),
-    );
+    return names;
   }
 }
 

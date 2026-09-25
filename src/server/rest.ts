@@ -78,7 +78,7 @@ function parse<S extends z.ZodRawShape>(shape: S, value: unknown): z.infer<z.Zod
 }
 
 const INT_PARAMS = new Set(['limit']);
-const BOOL_PARAMS = new Set(['include_historical']);
+const BOOL_PARAMS = new Set(['include_historical', 'history', 'isolated']);
 
 /** Query string -> object with numbers and booleans converted (zod reports the rest). */
 function queryOf(url: URL): Record<string, unknown> {
@@ -171,6 +171,23 @@ function routes(ctx: RestContext): Route[] {
         if (!r.entity) throw new ServiceError(404, `no entity matches "${entity}"`);
         return { body: r };
       },
+    },
+    {
+      method: 'GET',
+      pattern: /^\/v1\/entities\/([^/]+)$/,
+      handler: async ({ p, params, url }) => ({
+        body: await s.entity(p, parse(shapes.entity, { ...queryOf(url), id: pathParam(params[0]) })),
+      }),
+    },
+    {
+      method: 'GET',
+      pattern: /^\/v1\/graph$/,
+      handler: async ({ p, url }) => ({ body: await s.graph(p, parse(shapes.graph, queryOf(url))) }),
+    },
+    {
+      method: 'GET',
+      pattern: /^\/v1\/groups$/,
+      handler: async ({ p }) => ({ body: await s.groups(p) }),
     },
     {
       method: 'GET',
