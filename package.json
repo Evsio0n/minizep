@@ -41,6 +41,7 @@
   "files": [
     "dist",
     "infra",
+    "ui",
     "README.md"
   ],
   "scripts": {
@@ -59,7 +60,8 @@
     "migrate": "tsx src/cli/migrate.ts",
     "serve": "tsx src/server/http.ts",
     "serve:dist": "node dist/server/http.js",
-    "http:smoke": "tsx demo/http-smoke.ts"
+    "http:smoke": "tsx demo/http-smoke.ts",
+    "ui:dev": "tsx demo/ui-dev.ts"
   },
   "devDependencies": {
     "@types/node": "^26.6.2",

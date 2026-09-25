@@ -1,13 +1,15 @@
 # minizep HTTP API
 
-One server (`minizep-serve`, `src/server/http.ts`) exposes three surfaces that share one graph,
-one ingestion queue and one set of credentials:
+One server (`minizep-serve`, `src/server/http.ts`) exposes these surfaces, which share one graph
+and one ingestion queue:
 
-| Path      | What                                         | Auth   |
-|-----------|----------------------------------------------|--------|
-| `/health` | liveness probe, always `{"ok":true}`         | none   |
-| `/mcp`    | MCP over Streamable HTTP (tools, see below)  | bearer |
-| `/v1/...` | REST API, JSON in / JSON out                 | bearer |
+| Path              | What                                                   | Auth   |
+|-------------------|--------------------------------------------------------|--------|
+| `/health`         | liveness probe, always `{"ok":true}`                   | none   |
+| `/mcp`            | MCP over Streamable HTTP (tools, see below)            | bearer |
+| `/v1/...`         | REST API, JSON in / JSON out                           | bearer |
+| `/ui`             | web UI page, only when `MINIZEP_UI_GROUPS` is set      | none, see [Web UI](#web-ui) |
+| `/ui/api/v1/...`  | the same REST API for the UI, limited to the UI groups | none, see [Web UI](#web-ui) |
 
 Everything below applies to both `/mcp` and `/v1`: the MCP tools and the REST routes call the
 same operations with the same validation.
@@ -101,13 +103,16 @@ Every error is `{"error": "<message>"}`:
   "relation": "WORKS_AT",
   "source": "Alice",
   "target": "Acme",
+  "source_uuid": "066914c3-5b1e-4a52-9d7e-2f0c1a9b8e11",
+  "target_uuid": "8d2b7f40-93c1-4e1a-b6f2-5a0e7c3d9f24",
   "fact": "Alice works at Acme",
   "valid_at": "2024-03-01T09:00:00.000Z",
   "invalid_at": null,
   "created_at": "2026-09-25T06:14:54.414Z",
   "expired_at": null,
   "episodes": ["6eeafffa-6fc3-483f-9132-e47ae67eafc2"],
-  "score": null
+  "score": null,
+  "reason": null
 }
 ```
 
@@ -115,9 +120,24 @@ Every error is `{"error": "<message>"}`:
 `created_at` is when the graph learned it, `expired_at` when the graph learned it had ended (or
 was retracted). A retracted fact has `invalid_at == valid_at` (or no `invalid_at` but an
 `expired_at`). `episodes` lists the evidence, oldest first. `score` is the fused retrieval score on
-search results, `null` elsewhere.
+search results, `null` elsewhere. `source_uuid`/`target_uuid` are the endpoint entities (see
+[GET /v1/entities/:id](#get-v1entitiesid)); `reason` is why the fact was ended or retracted, when
+that is known (the invalidation reason, or the extractor's), else `null`.
 
 **Entity**: `{uuid, name, labels, summary, created_at}`.
+
+**Fact states.** The graph endpoints below also give each fact its state at one (`at`,
+`as_of`) instant; a fact the graph did not know at `as_of` is left out altogether:
+
+| `state`     | Meaning |
+|-------------|---------|
+| `active`    | true at `at`, as known at `as_of` (exactly the facts `GET /v1/facts` returns) |
+| `future`    | starts after `at` (`valid_at > at`) |
+| `ended`     | its end, known at `as_of`, is at or before `at` |
+| `retracted` | it was never true (empty window, or expired without any end), and that was known at `as_of` |
+
+plus `ends_at` (`invalid_at` as it was known at `as_of`: `null` when that end was learned
+later) and `revised_later` (`expired_at > as_of`: a later correction exists).
 
 **Episode**: `{uuid, group_id, name, source, source_description, content, valid_at, created_at,
 status, error}`. `status` is `pending` (saved, not processed yet), `processed` or `failed` (with
@@ -162,14 +182,16 @@ curl -s -X POST http://127.0.0.1:8787/v1/memories \
   "facts": [ { "uuid": "160f2ea7-…", "relation": "WORKS_AT", "source": "Alice", "target": "Acme", "…": "…" } ],
   "reinforced": [],
   "invalidated": [],
-  "dropped": { "facts": 0, "invalidations": 0 }
+  "dropped": { "entities": 0, "facts": 0, "invalidations": 0 }
 }
 ```
 
 - `facts`: new facts; `reinforced`: existing facts this text restated; `invalidated`: existing
   facts this text ended.
-- `dropped`: extracted candidates that were discarded because one of their entities could not be
-  resolved. Non-zero means the text said more than the graph recorded.
+- `dropped`: extracted candidates that were discarded. `facts` and `invalidations` name an entity
+  that could not be resolved: non-zero means the text said more than the graph recorded. `entities`
+  are names that are only a literal value (an IP address, a number, a URL, a version) with no fact
+  on them: the extraction noise that is kept out of the graph.
 
 Other outcomes:
 
@@ -187,7 +209,7 @@ Other outcomes:
   "job_id": null,
   "error": "extraction failed: LLM HTTP 500: upstream error (episode stored for retry)",
   "entities": [], "facts": [], "reinforced": [], "invalidated": [],
-  "dropped": { "facts": 0, "invalidations": 0 }
+  "dropped": { "entities": 0, "facts": 0, "invalidations": 0 }
 }
 ```
 
@@ -220,7 +242,10 @@ another group is 404.
 
 ### POST /v1/search
 
-Hybrid search (keyword BM25 + embeddings, rank fusion) over facts.
+Hybrid search (keyword BM25 + embeddings, rank fusion) over facts. Facts on an entity the query
+names, or one hop from it, get a small boost. A fact that shares no keyword with the query, is not
+near an entity it names and whose embedding is not similar enough (`MINIZEP_SEARCH_MIN_COSINE`,
+default 0.4) is left out, so `facts` can be empty.
 
 | Field                | Type    | Notes |
 |----------------------|---------|-------|
@@ -272,6 +297,82 @@ curl -s "http://127.0.0.1:8787/v1/entities/Alice/facts?include_historical=true" 
 ```
 
 404 when no entity matches.
+
+### GET /v1/entities/:id
+
+One entity by uuid (or a prefix of at least 8 characters, no names), with every fact touching it
+that was known at `as_of`. Query: `group_id`, `at`, `as_of`.
+
+```json
+{ "group_id": "teamA", "at": "2026-09-25T08:00:00.000Z", "as_of": "2026-09-25T08:00:00.000Z",
+  "entity": { "uuid": "066914c3-…", "name": "Alice", "labels": ["Person"], "label": "Person",
+              "summary": "…", "created_at": "…", "attributes": {} },
+  "facts": [ { "relation": "WORKS_AT", "state": "ended", "ends_at": "2024-06-01T00:00:00.000Z",
+               "revised_later": false, "reason": "text states \"left\"", "…": "fact row" } ],
+  "episodes": [ { "uuid": "6eeafffa-…", "name": "…", "source": "text", "valid_at": "…",
+                  "created_at": "…", "status": "processed" } ],
+  "episodes_truncated": false }
+```
+
+- `label`: the first label that is not `Entity`, else `Entity`.
+- `facts`: fact rows (without `score`) plus [state fields](#rows), ordered `active`, `future`,
+  `ended`, `retracted`, then newest `valid_at` first (unknown starts last).
+- `episodes`: the evidence of those facts known at `as_of`, newest `valid_at` first, at most 50
+  (`episodes_truncated` says whether there were more).
+- 404 when no entity of the group has that id.
+
+### GET /v1/graph
+
+The nodes and edges of one group at one (`at`, `as_of`) instant, for drawing the graph.
+
+| Query      | Notes |
+|------------|-------|
+| `group_id` | |
+| `at`       | valid time, default now |
+| `as_of`    | knowledge time, default now |
+| `history`  | `true`: every fact known at `as_of`, each with its state; default: `active` facts only |
+| `isolated` | `true`: also entities known at `as_of` that no returned fact touches, most recently learned first, only while the node count stays within `limit` |
+| `limit`    | maximum edges, 1-2000, default 500; beyond it `active` facts are kept first, then the most recently learned |
+
+```json
+{ "group_id": "teamA", "at": "2024-04-01T00:00:00.000Z", "as_of": "2026-09-25T08:00:00.000Z",
+  "history": false,
+  "nodes": [ { "uuid": "066914c3-…", "name": "Alice", "labels": ["Person"], "label": "Person",
+               "summary": "…", "created_at": "…", "degree": 1 } ],
+  "edges": [ { "uuid": "160f2ea7-…", "source_uuid": "066914c3-…", "target_uuid": "8d2b7f40-…",
+               "source": "Alice", "target": "Acme", "relation": "WORKS_AT", "fact": "Alice works at Acme",
+               "valid_at": "…", "invalid_at": null, "created_at": "…", "expired_at": null,
+               "episodes": ["…"], "reason": null,
+               "state": "active", "ends_at": null, "revised_later": false } ],
+  "labels": [ { "label": "Entity", "count": 1 }, { "label": "Person", "count": 2 } ],
+  "timeline": { "valid": ["2024-03-01T09:00:00.000Z", "…"], "known": ["2026-09-25T06:14:54.414Z", "…"] },
+  "counts": { "entities": 3, "facts": 2, "nodes": 2, "edges": 1, "hidden_edges": 1 },
+  "truncated": false }
+```
+
+- `nodes`: the endpoints of the returned edges (plus isolated entities on request); `degree`
+  counts the returned edges.
+- `labels`: every entity of the group by primary label (`Entity` first, then alphabetical), not
+  just this time slice, so colours stay stable while `at`/`as_of` move.
+- `timeline.valid`: the distinct `valid_at`/`invalid_at` of all facts of the group;
+  `timeline.known`: their distinct `created_at`/`expired_at`. Sorted, at most 1000 each (evenly
+  sampled beyond that).
+- `counts`: `entities`/`facts` for the whole group, `nodes`/`edges` returned,
+  `hidden_edges = facts - edges`.
+- `truncated`: `limit` left out edges, or isolated entities (with `isolated=true`).
+
+### GET /v1/groups
+
+The groups the caller may open, most recent episode first:
+
+```json
+{ "default_group": "teamA",
+  "groups": [ { "group_id": "teamA", "entities": 4, "facts": 2, "active_facts": 1,
+                "episodes": 3, "failed_episodes": 0, "last_episode_at": "2026-09-25T06:14:54.414Z" } ] }
+```
+
+A token lists its own groups (empty ones included). A caller allowed any group (anonymous mode,
+or the UI with `MINIZEP_UI_GROUPS=*`) lists every group that holds an episode or an entity.
 
 ### GET /v1/facts
 
@@ -369,11 +470,13 @@ Server details for an authenticated caller (what `/health` used to expose):
   "default_group": "teamA",
   "groups": ["teamA"],
   "jobs": { "queued": 0, "running": 0 },
-  "sessions": 0 }
+  "sessions": 0,
+  "timezone": "Asia/Shanghai" }
 ```
 
 `groups` is `null` in anonymous mode (any group). `jobs` and `sessions` count only what this
-token can see.
+token can see. `timezone` is the zone relative dates in ingested text are resolved in
+(`MINIZEP_TIMEZONE`, else the server's zone).
 
 ### GET /health
 
@@ -438,6 +541,41 @@ MINIZEP_HTTP_URL=http://127.0.0.1:8787/mcp MINIZEP_TOKEN=$TOKEN minizep-proxy
 
 ---
 
+## Web UI
+
+A single page for browsing and editing the graph: groups, the graph at any (`at`, `as_of`)
+instant, facts, entities, episodes, adding memories and ending or retracting facts. It is off
+unless `MINIZEP_UI_GROUPS` is set.
+
+```bash
+MINIZEP_UI_GROUPS='teamA|shared'      # or '*' for every group
+# open http://127.0.0.1:8787/ui  (or http://<VPN address>:8787/ui)
+```
+
+- **No login.** The page (`GET /ui`) and its API (`/ui/api/v1/...`, the REST routes above) need
+  no token: they act as one fixed caller whose groups are `MINIZEP_UI_GROUPS` (the first is its
+  default; `*` = any group, default `default`). Anyone who can reach the listen address can read
+  and write those groups, so enable it only on a private network (loopback or a VPN), and list
+  only the groups meant to be browsed. Token auth on `/v1` and `/mcp` is unchanged.
+- `GET /` and `GET /ui/` redirect to `/ui` (the page calls the relative `ui/api/v1`, so it also
+  works behind a path prefix). The page is `ui/index.html`, read on each request and served with
+  a restrictive `Content-Security-Policy`, `X-Content-Type-Options: nosniff` and
+  `Cache-Control: no-cache`.
+- Every `/`, `/ui` and `/ui/api` request is refused with **403** unless:
+  - the `Host` header (without port) is an IP address, `localhost`, or a name listed in
+    `MINIZEP_UI_HOSTS` (a DNS-rebinding page arrives under the attacker's own domain name); and
+  - when the browser sends an `Origin`, it is exactly `http://<Host header>` and
+    `Sec-Fetch-Site` is absent or `same-origin` (a page on another site can neither write nor
+    read). Request bodies must be `application/json`, as everywhere.
+- Anonymous mode (`MINIZEP_ALLOW_ANONYMOUS=1`) keeps its rules for `/v1` and `/mcp` (loopback
+  `Host`, no browser `Origin`); the UI works there too, through `/ui/api`.
+- Working on the page: `npm run ui:dev` serves it on http://127.0.0.1:8788/ui from an in-memory
+  graph seeded with every fact state (active, ended, future, retracted), a failed episode and a
+  Chinese group, using a scripted LLM and the hash embedder, so nothing leaves the machine. Edits
+  to `ui/index.html` show on reload. See `demo/ui-dev.ts` for its settings.
+
+---
+
 ## Durability and shutdown
 
 - `async` ingestion stores the episode as `pending` **before** answering (the JSON snapshot is
@@ -461,6 +599,8 @@ MINIZEP_HTTP_URL=http://127.0.0.1:8787/mcp MINIZEP_TOKEN=$TOKEN minizep-proxy
 | `MINIZEP_MAX_SESSIONS`     | `256`        | MCP session cap |
 | `MINIZEP_DRAIN_TIMEOUT_MS` | `120000`     | shutdown wait for queued ingestion (HTTP and stdio) |
 | `MINIZEP_JOB_CONCURRENCY`  | `2`          | ingestion jobs run at once |
+| `MINIZEP_UI_GROUPS`        |              | `group[\|group...]` or `*`: serve the [web UI](#web-ui) on `/ui` without a token for these groups; unset = no UI |
+| `MINIZEP_UI_HOSTS`         |              | comma-separated host names the UI may be opened under, besides IP addresses and `localhost` (e.g. a MagicDNS name) |
 
 Storage, LLM and embedding settings (`MINIZEP_DATABASE_URL`, `MINIZEP_DB`, `MINIZEP_LLM_*`,
 `MINIZEP_EMBED_*`, …) are described in the README.

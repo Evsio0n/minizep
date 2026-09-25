@@ -418,7 +418,7 @@ test('ingest: candidates whose endpoints cannot be resolved are counted as dropp
   const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'x' });
 
   assert.equal(res.status, 'processed');
-  assert.deepEqual(res.dropped, { facts: 1, invalidations: 1 });
+  assert.deepEqual(res.dropped, { entities: 0, facts: 1, invalidations: 1 });
   assert.equal((await zep.store.getFacts('g')).length, 0);
 });
 
@@ -433,7 +433,50 @@ test('ingest: an invalidation naming an entity outside the graph creates no plac
   const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob left Initrode' });
 
   assert.equal((await zep.store.getEntities('g')).length, 0);
-  assert.deepEqual(res.dropped, { facts: 0, invalidations: 1 });
+  assert.deepEqual(res.dropped, { entities: 0, facts: 0, invalidations: 1 });
+});
+
+test('ingest: one reply repeating a statement makes one fact; a literal value no fact uses is not an entity', async () => {
+  const runsOn = 'The API gateway runs on web-1';
+  const stint = 'The API gateway ran on web-1 for a year';
+  const d = (iso: string) => new Date(iso);
+  const literals = ['192.0.2.10:8080', '[2001:db8::1]:8080', '4242', 'https://web-1.example/ui', 'v1.2.3', '8080'];
+  const llm = new ScriptedLLM(() => ({
+    entities: [entity('API gateway', ['Product']), entity('web-1', ['Host']), ...literals.map((n) => entity(n, []))],
+    facts: [
+      { sourceName: 'API gateway', targetName: 'web-1', relation: 'RUNS_ON', fact: runsOn },
+      // the same sentence under other relations, verbatim and near-identical
+      { sourceName: 'API gateway', targetName: 'web-1', relation: 'DEPLOYED_ON', fact: runsOn },
+      { sourceName: 'API gateway', targetName: 'web-1', relation: 'HOSTED_BY', fact: `${runsOn}!` },
+      // under the same relation with a start the first one lacks: merged in time, the start is kept
+      { sourceName: 'API gateway', targetName: 'web-1', relation: 'RUNS_ON', fact: runsOn, validAt: d('2024-01-01') },
+      // another statement about the same pair
+      { sourceName: 'API gateway', targetName: 'web-1', relation: 'MOVED_TO', fact: 'The API gateway was moved to web-1 in March' },
+      // one sentence for two stints under two relations: two facts, each with its window
+      { sourceName: 'API gateway', targetName: 'web-1', relation: 'RAN_ON', fact: stint, validAt: d('2019-01-01'), invalidAt: d('2020-01-01') },
+      { sourceName: 'API gateway', targetName: 'web-1', relation: 'HOSTED_ON', fact: stint, validAt: d('2021-01-01'), invalidAt: d('2022-01-01') },
+      // a literal value that a fact uses stays an entity
+      { sourceName: 'API gateway', targetName: '8080', relation: 'LISTENS_ON', fact: 'The API gateway listens on port 8080' },
+    ],
+    invalidations: [],
+  }));
+  const zep = new Minizep({ llm, embedder: deterministicEmbedder() });
+  const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'x' });
+
+  assert.deepEqual(
+    res.facts.map((f) => [f.name, f.validAt?.toISOString().slice(0, 10), f.invalidAt?.toISOString().slice(0, 10)]),
+    [
+      ['RUNS_ON', '2024-01-01', undefined],
+      ['MOVED_TO', res.episode.validAt.toISOString().slice(0, 10), undefined],
+      ['RAN_ON', '2019-01-01', '2020-01-01'],
+      ['HOSTED_ON', '2021-01-01', '2022-01-01'],
+      ['LISTENS_ON', res.episode.validAt.toISOString().slice(0, 10), undefined],
+    ],
+  );
+  assert.equal((await zep.store.getFacts('g')).length, 5);
+  assert.deepEqual(res.entities.map((e) => e.name), ['API gateway', 'web-1', '8080']);
+  assert.deepEqual((await zep.store.getEntities('g')).map((e) => e.name).sort(), ['8080', 'API gateway', 'web-1']);
+  assert.deepEqual(res.dropped, { entities: 5, facts: 0, invalidations: 0 });
 });
 
 test('ingest: the episode time is the reference time handed to the LLM', async () => {

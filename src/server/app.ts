@@ -1,7 +1,8 @@
 /**
  * The HTTP server as a factory: MCP (Streamable HTTP) on /mcp, the REST API
- * on /v1/*, and an unauthenticated liveness probe on /health, all sharing one
- * Minizep instance, job queue and persistence.
+ * on /v1/*, an unauthenticated liveness probe on /health and, when enabled,
+ * the web UI on /ui (see ui.ts), all sharing one Minizep instance, job queue
+ * and persistence.
  *
  * `http.ts` is the CLI around this; tests start it in-process on an ephemeral
  * port with fake providers.
@@ -21,6 +22,7 @@ import { createRestHandler, readJsonBody, sendJson } from './rest.js';
 import { MemoryService, type SnapshotWriter } from './service.js';
 import { SessionRegistry } from './sessions.js';
 import { registerTools, SERVER_INFO } from './tools.js';
+import { sendUiPage, uiPrincipal, uiRefusal, type UiOptions } from './ui.js';
 
 export interface HttpAppOptions {
   zep: Minizep;
@@ -28,6 +30,8 @@ export interface HttpAppOptions {
   tokens: Map<string, string[]>;
   /** with no tokens configured, serve everyone as one trusted user (local development only) */
   allowAnonymous?: boolean;
+  /** serve the web UI on /ui, without a token, limited to these groups (see ui.ts) */
+  ui?: UiOptions;
   jobs?: JobQueue;
   persistence?: SnapshotWriter;
   llmLabel?: string;
@@ -92,6 +96,8 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
     sessionsOf: (p) => sessions.countFor(p.id),
     log,
   });
+
+  const ui = opts.ui && { principal: uiPrincipal(opts.ui), hosts: new Set(opts.ui.hosts ?? []) };
 
   const servers: Server[] = [];
   const retries: RetryingListen[] = [];
@@ -164,6 +170,9 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
       // liveness only: server details are for authenticated callers (/v1/status)
       return sendJson(res, 200, { ok: true });
     }
+    if (ui && (url.pathname === '/' || url.pathname === '/ui' || url.pathname.startsWith('/ui/'))) {
+      return handleUi(req, res, url, ui);
+    }
     const isMcp = url.pathname === '/mcp';
     const isRest = url.pathname === '/v1' || url.pathname.startsWith('/v1/');
     if (!isMcp && !isRest) return sendJson(res, 404, { error: 'not found' });
@@ -180,6 +189,37 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
     if (closing) return sendJson(res, 503, { error: 'server is shutting down' });
     if (isRest) return rest(req, res, url, auth.principal);
     return handleMcp(req, res, auth.principal);
+  }
+
+  /**
+   * The UI page and its API. No token: the fixed UI principal keeps it to the
+   * configured groups, and uiRefusal() to its own page on an allowed Host.
+   */
+  async function handleUi(
+    req: IncomingMessage,
+    res: ServerResponse,
+    url: URL,
+    ui: { principal: Principal; hosts: ReadonlySet<string> },
+  ): Promise<void> {
+    const refused = uiRefusal(req, ui.hosts);
+    if (refused) return sendJson(res, 403, { error: refused });
+    const path = url.pathname;
+    if (path === '/ui/api/v1' || path.startsWith('/ui/api/v1/')) {
+      if (closing) return sendJson(res, 503, { error: 'server is shutting down' });
+      res.setHeader('x-content-type-options', 'nosniff');
+      res.setHeader('cache-control', 'no-store');
+      return rest(req, res, new URL(path.slice('/ui/api'.length) + url.search, 'http://localhost'), ui.principal);
+    }
+    // The page lives at /ui, so the relative "ui/api/v1" it calls resolves to
+    // /ui/api/v1 (also behind a path prefix). "/" and "/ui/" lead there.
+    const target = path === '/ui' ? 'page' : path === '/' ? 'ui' : path === '/ui/' ? '../ui' : undefined;
+    if (!target) return sendJson(res, 404, { error: 'not found' });
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      return sendJson(res, 405, { error: 'method not allowed (use GET)' }, { allow: 'GET, HEAD' });
+    }
+    if (target === 'page') return sendUiPage(req, res);
+    res.writeHead(302, { location: target + url.search, 'cache-control': 'no-cache', 'content-length': '0' });
+    res.end();
   }
 
   /** No Origin header (not a browser page) and a loopback Host. */
@@ -219,10 +259,10 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
       const addr = await attempt.first;
       if (addr) {
         bound.push(addr);
-        log(`listening on ${describe(addr)}`);
+        log(`listening on ${describe(addr, !!ui)}`);
       } else {
         attempt.bound.then(
-          (a) => log(`listening on ${describe(a)}`),
+          (a) => log(`listening on ${describe(a, !!ui)}`),
           () => undefined,
         );
       }
@@ -253,7 +293,7 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
   return { handler, service, jobs, sessions, listen, addresses, close };
 }
 
-function describe(a: AddressInfo): string {
+function describe(a: AddressInfo, ui: boolean): string {
   const host = a.family === 'IPv6' ? `[${a.address}]` : a.address;
-  return `http://${host}:${a.port} (mcp: /mcp, rest: /v1, health: /health)`;
+  return `http://${host}:${a.port} (mcp: /mcp, rest: /v1, health: /health${ui ? ', ui: /ui' : ''})`;
 }

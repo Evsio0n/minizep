@@ -91,7 +91,11 @@ export interface FactWithContext {
   fact: EntityEdge;
   sourceName: string;
   targetName: string;
-  /** fused retrieval score (RRF), present on search results */
+  /**
+   * retrieval score on search results: the keyword and vector ranks fused
+   * with RRF, plus a bonus when the fact is on or next to an entity the query
+   * names (see search/rerank.ts)
+   */
   score?: number;
 }
 
@@ -122,6 +126,39 @@ export function isFactActive(fact: EntityEdge, at?: Date, asOf?: Date): boolean 
     return false;
   }
   return true;
+}
+
+/** How a known fact stands at one bi-temporal instant (see factView). */
+export type FactState = 'active' | 'future' | 'ended' | 'retracted';
+
+export interface FactView {
+  state: FactState;
+  /** invalidAt as it was known at asOf: undefined while that end was not known yet */
+  endsAt?: Date;
+  /** the fact was expired after asOf: a later correction exists */
+  revisedLater: boolean;
+}
+
+/**
+ * The state of `fact` at valid time `at` as known at `asOf` (both default to
+ * now), or undefined when the fact was not known yet. Refines isFactActive:
+ * the state is 'active' exactly when isFactActive is true, and otherwise says
+ * why not (not started yet, ended, or retracted as a whole). The web UI ships
+ * an identical copy for rows that come from other endpoints.
+ */
+export function factView(fact: EntityEdge, at?: Date, asOf?: Date): FactView | undefined {
+  const t = at ?? new Date();
+  const known = asOf ?? new Date();
+  if (fact.createdAt && fact.createdAt > known) return undefined;
+  const revisedLater = !!fact.expiredAt && fact.expiredAt > known;
+  // the two shapes a retraction leaves: an empty window, or an expiry without any end
+  const retractedShape = fact.invalidAt ? !!fact.validAt && fact.invalidAt <= fact.validAt : !!fact.expiredAt;
+  const endKnownAt = fact.expiredAt ?? fact.createdAt;
+  const endsAt = fact.invalidAt && (!endKnownAt || endKnownAt <= known) ? fact.invalidAt : undefined;
+  if (retractedShape && fact.expiredAt && fact.expiredAt <= known) return { state: 'retracted', endsAt, revisedLater };
+  if (endsAt && endsAt <= t) return { state: 'ended', endsAt, revisedLater };
+  if (fact.validAt && fact.validAt > t) return { state: 'future', endsAt, revisedLater };
+  return { state: 'active', endsAt, revisedLater };
 }
 
 /** Did the system know about `fact` at knowledge time `asOf` (default: always)? */

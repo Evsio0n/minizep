@@ -16,7 +16,7 @@ minizep 的做法（对标 Graphiti）：
 | **矛盾消解** | 新事实与旧事实冲突时，旧事实被标记 `expiredAt`，**保留在历史中可追溯** |
 | **关系终止** | "Alice 离职了"不是新建一条 `LEFT` 边，而是给原 `WORKS_AT` 打上 `invalidAt` |
 | **完整溯源** | 每个实体和事实都能追溯回产生它的 episode（原始文本） |
-| **混合检索** | BM25 关键词 + 向量余弦，用 RRF 融合排序，支持时间旅行查询 |
+| **混合检索** | BM25 关键词 + 向量余弦，用 RRF 融合排序；靠近查询所提实体的事实略微加分（图距离），无关结果被截掉；支持时间旅行查询 |
 
 ## 架构
 
@@ -33,6 +33,7 @@ src/
   store/persistence.ts      原子化落盘 + 防抖
   pipeline/ingest.ts        摄取管线：抽取 → 去重 → 矛盾消解 → 失效
   search/retrieval.ts       手写 BM25 / 余弦 / RRF 融合
+  search/rerank.ts          图距离加分 + 相关度截断（内存与 Postgres 两条路径共用）
   provider/                 可插拔的 LLM 与 Embedding 实现
   server/mcp.ts             MCP server（stdio）
 ```
@@ -59,8 +60,8 @@ sudo deploy/install.sh --user minizep     # 启用、重启、等 /health 就绪
 ```
 
 - [docs/DEPLOY.md](docs/DEPLOY.md)：拓扑、只在 VPN 上暴露、token 与 group、轮换 token、接入 MCP 客户端、
-  REST 快速上手、测试数据库、升级与回滚、embedding 换班
-- [docs/API.md](docs/API.md)：MCP 工具与 REST（`/v1`）接口
+  REST 快速上手、Web UI、测试数据库、升级与回滚、embedding 换班
+- [docs/API.md](docs/API.md)：MCP 工具与 REST（`/v1`）接口，以及可选的 Web UI（`/ui`，`MINIZEP_UI_GROUPS`）
 
 ## 生产化状态
 
@@ -239,6 +240,7 @@ npm run build
 | `MINIZEP_LLM_API_KEY` / `MINIZEP_LLM_BASE_URL` | — | 显式覆盖，优先于配置文件 |
 | `MINIZEP_EMBED_URL` | `http://127.0.0.1:11435` | llama.cpp / vLLM / 任意 OpenAI 兼容端点 |
 | `MINIZEP_EMBED_MODEL` | `qwen3-embed` | |
+| `MINIZEP_SEARCH_MIN_COSINE` | `0.4` | 检索的相关度下限：既没有关键词命中、也不靠近查询所提实体的事实，余弦低于它就不返回（见下） |
 
 ### 关于 LLM 选择
 
@@ -268,7 +270,16 @@ llama-server -m qwen3-embed-q8.gguf --embedding --pooling last -ngl 99 --port 11
    （返回冲突，只能撤回）；撤回一条已结束的事实后，撤回之前那段时间的 `as_of` 查询会看不到它原来的结束时间。
 8. **补录旧文档时依附事实可能漏关** —— 旧文档里的主关系（如 `WORKS_AT`）能正确落在已结束的窗口内，
    但同一篇里只在那段关系期间成立的附属事实（如"带领某团队"）不一定跟着关闭，LLM 在抽取旧文档时看不到后来的结束。
-9. **检索没有相关度阈值** —— 结果按 RRF 融合排序后取前 `limit` 条，图很小时会带上不相关的事实；调用方可用返回的 `score` 自行截断。
+9. **检索的相关度截断是粗粒度的** —— 只截掉“没有关键词命中、不靠近查询所提实体、余弦低于 `MINIZEP_SEARCH_MIN_COSINE`”
+   的事实。下限 0.4 按 Qwen3-Embedding-0.6B 标定（无关事实约 0.15–0.40，换语言或换说法的相关事实约 0.40–0.65），
+   换模型要重新标定；英文查询里的 the/is 这类常见词也算关键词命中，英文图谱里截断因此很少生效。
+10. **图距离加分认不出“枢纽”实体** —— 查询里点名的实体（及其一跳邻居）上的事实都加同样的分。点名的是项目这类
+    所有组件都挂在它上面的实体时，加分落到它的每条事实上，分不出问题真正问的那个组件；所以加分刻意很小
+    （约等于一个排名里第 1 名与第 10 名的差距），只在文本相关度相近的候选之间调整次序。实体按名字识别，
+    查询里一个名字都没出现时才退到名称向量：换了叫法（查询说“那个服务”，实体叫“API 网关”）通常认不出来。
+11. **没有第二个实体的事件只进摘要** —— 抽取规则要求事实的两端都是具名实体，所以"作业 X 被取消了"这类
+    只涉及一个实体的事件会写进该实体的摘要，而不是一条事实；`search_facts` 查不到它，要用
+    `facts_about`/实体摘要或原始 episode 才能看到。
 
 ## 打包与部署
 

@@ -2,6 +2,7 @@
  * In-process servers for tests: the HTTP app on an ephemeral loopback port and
  * MCP clients talking to it, with offline providers only.
  */
+import { request } from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { Minizep, MockLLMProvider } from '../src/index.js';
@@ -165,6 +166,38 @@ export async function api(
     // not JSON: keep the text
   }
   return { status: res.status, body, headers: res.headers };
+}
+
+/**
+ * One request with exactly these headers (fetch does not let a test choose
+ * Host), answering the status and the parsed JSON body (or the text).
+ */
+export function rawRequest(
+  base: string,
+  method: string,
+  path: string,
+  headers: Record<string, string> = {},
+  body?: string,
+): Promise<{ status: number; body: any }> {
+  const { hostname, port } = new URL(base);
+  return new Promise((resolve, reject) => {
+    const req = request({ hostname, port, method, path, headers }, (res) => {
+      let text = '';
+      res.setEncoding('utf8');
+      res.on('data', (chunk: string) => (text += chunk));
+      res.on('end', () => {
+        let parsed: unknown = text;
+        try {
+          parsed = JSON.parse(text);
+        } catch {
+          // not JSON: keep the text
+        }
+        resolve({ status: res.statusCode ?? 0, body: parsed });
+      });
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
 }
 
 /** Poll until `check` holds (or fail after `timeoutMs`). */

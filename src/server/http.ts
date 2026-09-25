@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Minizep HTTP server: MCP (Streamable HTTP) on /mcp and a REST API on /v1.
+ * Minizep HTTP server: MCP (Streamable HTTP) on /mcp, a REST API on /v1 and,
+ * when MINIZEP_UI_GROUPS is set, a web UI on /ui.
  *
  *   npm run serve                       # 127.0.0.1:8787
  *   MINIZEP_TOKENS="tok1:teamA,tok2:teamB|shared" npm run serve
@@ -23,11 +24,16 @@
  *   MINIZEP_SESSION_TTL_MS     idle MCP sessions expire (default 1800000)
  *   MINIZEP_MAX_SESSIONS       MCP session cap, oldest idle evicted (default 256)
  *   MINIZEP_DRAIN_TIMEOUT_MS   how long shutdown waits for queued ingestion (default 120000)
+ *   MINIZEP_UI_GROUPS          "group[|group...]" or "*": serve the web UI on /ui, WITHOUT a
+ *                              token, for these groups (private networks only; unset = off)
+ *   MINIZEP_UI_HOSTS           comma-separated host names the UI may be opened under, besides
+ *                              IP addresses and localhost
  */
 import { parseTokens } from './auth.js';
 import { createHttpApp } from './app.js';
 import { parseHosts } from './listen.js';
 import { envInt, onShutdownSignal, runtimeFromEnv } from './runtime.js';
+import { uiFromEnv } from './ui.js';
 
 const log = (...args: unknown[]) => console.error('[minizep-http]', ...args);
 
@@ -45,6 +51,14 @@ if (tokens.size === 0 && !allowAnonymous) {
 }
 log(`auth: ${tokens.size} token(s)${tokens.size === 0 ? ', anonymous access (any group)' : ''}`);
 
+const ui = uiFromEnv();
+if (ui) {
+  const groups = ui.groups === 'any' ? 'every group' : `groups ${ui.groups.join('|')}`;
+  log(`ui: /ui without a token for ${groups}: anyone who can reach this server can read and write them`);
+} else if (process.env.MINIZEP_UI_HOSTS) {
+  log('MINIZEP_UI_HOSTS is set but MINIZEP_UI_GROUPS is not: the UI is off');
+}
+
 const hosts = parseHosts(process.env.MINIZEP_HOST);
 if (tokens.size === 0 && hosts.some((h) => !/^(127\.|::1$|localhost$)/.test(h))) {
   log('WARNING: anonymous access on a non-loopback address: anyone who can reach it can read and write every group');
@@ -60,6 +74,7 @@ const app = createHttpApp({
   zep: rt.zep,
   tokens,
   allowAnonymous,
+  ui,
   jobs: rt.jobs,
   persistence: rt.persistence,
   llmLabel: rt.llmLabel,

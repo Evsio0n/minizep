@@ -481,6 +481,14 @@ export class PostgresStore implements GraphStore {
     return r.rows.map(rowToFact);
   }
 
+  async listGroups(): Promise<string[]> {
+    await this.ensure();
+    const r = await this.db.query(
+      'SELECT group_id FROM episodes UNION SELECT group_id FROM entities ORDER BY group_id',
+    );
+    return r.rows.map((row: { group_id: string }) => row.group_id);
+  }
+
   async getFactsBetween(a: UUID, b: UUID): Promise<EntityEdge[]> {
     // same contract as the in-memory backend: only currently-true facts
     return (await this.getFactsForEntity(a)).filter(
@@ -516,7 +524,7 @@ export class PostgresStore implements GraphStore {
       asOf: opts.asOf ?? (opts.activeAt === null ? undefined : now),
     };
     const params: unknown[] = [[...new Set(qTerms)].map((t) => `'${t}'`).join(' | ')];
-    const scope = this.keywordScope(params, covered);
+    const scope = this.searchScope(params, covered);
     params.push(KEYWORD_CANDIDATES);
     // candidates in creation order, like getFacts(), so ties rank as in memory
     const found = await this.db.query(
@@ -551,7 +559,7 @@ export class PostgresStore implements GraphStore {
    */
   private async keywordCorpus(opts: { groupId?: string; activeAt?: Date | null; asOf?: Date }): Promise<Bm25Corpus> {
     const params: unknown[] = [];
-    const scope = this.keywordScope(params, opts);
+    const scope = this.searchScope(params, opts);
     params.push(KEYWORD_STATS_SAMPLE);
     // search_text is tokens joined by single spaces: tokens = spaces + 1
     const r = await this.db.query(
@@ -567,8 +575,8 @@ export class PostgresStore implements GraphStore {
     return { size: Number(r.rows[0].size), avgLength: Number(r.rows[0].avg_length) };
   }
 
-  /** Group and time-window predicates of a keyword search, each starting with AND. */
-  private keywordScope(params: unknown[], opts: { groupId?: string; activeAt?: Date | null; asOf?: Date }): string {
+  /** Group and time-window predicates of a search, each starting with AND. */
+  private searchScope(params: unknown[], opts: { groupId?: string; activeAt?: Date | null; asOf?: Date }): string {
     let sql = '';
     if (opts.groupId) {
       params.push(opts.groupId);
@@ -639,6 +647,59 @@ export class PostgresStore implements GraphStore {
     sql += ` ORDER BY fact_embedding <=> $1::vector LIMIT $${params.length}`;
     const r = await this.db.query(sql, params);
     return r.rows.map((row) => ({ edge: rowToFact(row), distance: Number(row.distance) }));
+  }
+
+  /**
+   * Facts touching any of `entityUuids` (the graph neighbourhood a search adds
+   * to its candidates), under the same group and time filter as the searches,
+   * the most recently learned first. The source and target indexes can find
+   * them; no vector is compared, and as nothing is ordered by one, pgvector's
+   * HNSW index (which filters after its approximate scan) cannot serve this
+   * query and cut it short.
+   */
+  async searchFactsByEntities(
+    entityUuids: UUID[],
+    opts: { groupId?: string; limit?: number; activeAt?: Date | null; asOf?: Date } = {},
+  ): Promise<EntityEdge[]> {
+    const ids = entityUuids.filter((id) => UUID_RE.test(id));
+    if (ids.length === 0) return [];
+    await this.ensure();
+    const params: unknown[] = [ids];
+    const where = this.touching(params, opts);
+    params.push(opts.limit ?? 200);
+    const r = await this.db.query(
+      `SELECT * FROM facts WHERE ${where} ORDER BY created_at DESC, uuid LIMIT $${params.length}`,
+      params,
+    );
+    return r.rows.map(rowToFact);
+  }
+
+  /**
+   * Every entity linked to one of `entityUuids` by a fact visible under the
+   * filter, without a limit: a search's graph distances must hold for any
+   * candidate. No vector is read, and one row comes back per entity.
+   */
+  async getNeighbourIds(
+    entityUuids: UUID[],
+    opts: { groupId?: string; activeAt?: Date | null; asOf?: Date } = {},
+  ): Promise<UUID[]> {
+    const ids = entityUuids.filter((id) => UUID_RE.test(id));
+    if (ids.length === 0) return [];
+    await this.ensure();
+    const params: unknown[] = [ids];
+    const where = this.touching(params, opts);
+    const r = await this.db.query(
+      `SELECT DISTINCT CASE WHEN source_node_uuid = ANY($1::uuid[]) THEN target_node_uuid
+                            ELSE source_node_uuid END AS uuid
+         FROM facts WHERE ${where}`,
+      params,
+    );
+    return r.rows.map((row) => row.uuid as string);
+  }
+
+  /** WHERE clause for the facts touching the entities bound as $1, under a search's scope. */
+  private touching(params: unknown[], opts: { groupId?: string; activeAt?: Date | null; asOf?: Date }): string {
+    return `(source_node_uuid = ANY($1::uuid[]) OR target_node_uuid = ANY($1::uuid[]))${this.searchScope(params, opts)}`;
   }
 }
 

@@ -91,6 +91,12 @@ function describeAdd(o: AddMemoryOutcome, ms: number) {
         '(an entity they name could not be resolved)',
     );
   }
+  if (o.dropped.entities) {
+    lines.push(
+      `dropped: ${plural(o.dropped.entities, 'literal value')} ` +
+        '(an address, a number, a URL or a version extracted as an entity, used by no fact)',
+    );
+  }
   return ok(lines.join('\n'), o);
 }
 
@@ -113,8 +119,10 @@ function describeJob(job: JobRow): string {
       `reinforced: ${r.reinforced.length}`,
       `invalidated: ${r.invalidated.length}`,
     );
-    if (r.dropped.facts || r.dropped.invalidations) {
-      lines.push(`dropped  : ${r.dropped.facts} facts, ${r.dropped.invalidations} invalidations`);
+    if (r.dropped.entities || r.dropped.facts || r.dropped.invalidations) {
+      lines.push(
+        `dropped  : ${r.dropped.entities} entities, ${r.dropped.facts} facts, ${r.dropped.invalidations} invalidations`,
+      );
     }
   }
   return lines.join('\n');

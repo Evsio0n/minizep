@@ -1,6 +1,7 @@
 import { MemoryGraphStore, isSnapshotable, type GraphStore } from './store/memory-store.js';
-import { IngestPipeline } from './pipeline/ingest.js';
-import { bm25Scores, cosineSimilarity, rrfFuseScored } from './search/retrieval.js';
+import { IngestPipeline, mentions } from './pipeline/ingest.js';
+import { bm25Scores, cosineSimilarity } from './search/retrieval.js';
+import { DEFAULT_MIN_COSINE, graphDistances, neighboursOf, rerank, type SearchCandidate } from './search/rerank.js';
 import { HashEmbedder, MockLLMProvider, type Embedder, type LLMProvider } from './provider/index.js';
 import type { EntityEdge, EntityNode, FactWithContext } from './model/types.js';
 import { isFactActive, isFactKnown } from './model/types.js';
@@ -20,6 +21,23 @@ export interface SearchCapableStore extends GraphStore {
     opts: { groupId?: string; limit?: number; activeAt?: Date | null; asOf?: Date },
   ): Promise<{ edge: EntityEdge; score: number }[]>;
   getFactsByUuids(uuids: string[]): Promise<EntityEdge[]>;
+  /**
+   * Facts touching any of `entityUuids`, under the same group and time filter
+   * as the two searches, the most recently learned first (created_at, then
+   * uuid: rerank's order for equal scores).
+   */
+  searchFactsByEntities(
+    entityUuids: string[],
+    opts: { groupId?: string; limit?: number; activeAt?: Date | null; asOf?: Date },
+  ): Promise<EntityEdge[]>;
+  /**
+   * Every entity linked to one of `entityUuids` by a fact visible under the
+   * same filter, without a limit (the list may include `entityUuids` too).
+   */
+  getNeighbourIds(
+    entityUuids: string[],
+    opts: { groupId?: string; activeAt?: Date | null; asOf?: Date },
+  ): Promise<string[]>;
 }
 
 function isSearchCapable(store: GraphStore): store is SearchCapableStore {
@@ -27,7 +45,9 @@ function isSearchCapable(store: GraphStore): store is SearchCapableStore {
   return (
     typeof s.searchFactsByVector === 'function' &&
     typeof s.searchFactsByText === 'function' &&
-    typeof s.getFactsByUuids === 'function'
+    typeof s.getFactsByUuids === 'function' &&
+    typeof s.searchFactsByEntities === 'function' &&
+    typeof s.getNeighbourIds === 'function'
   );
 }
 
@@ -40,6 +60,13 @@ export interface SearchOptions {
   asOf?: Date;
   /** include facts that were true once but no longer */
   includeHistorical?: boolean;
+  /**
+   * Cosine a result needs when it shares no keyword with the query and is not
+   * near an entity the query names (default: MINIZEP_SEARCH_MIN_COSINE, else
+   * 0.4). Such results below it are dropped, so an unrelated query can return
+   * nothing. -1 keeps everything.
+   */
+  minCosine?: number;
 }
 
 /** Search results plus whether they came from a reduced (keyword-only) ranking. */
@@ -62,6 +89,18 @@ export interface FactsAboutResult {
 const ENTITY_NAME_COSINE = 0.75;
 
 /**
+ * Query-to-name similarity for a search query to be about an entity it does
+ * not name. Lower than ENTITY_NAME_COSINE: the question's other words pull a
+ * whole query away from a bare name ("Who runs Acme?" and "Acme Corporation"
+ * score about 0.72 on Qwen3-Embedding-0.6B).
+ */
+const QUERY_ENTITY_COSINE = 0.7;
+/** most entities a query is matched to by name embedding */
+const QUERY_ENTITY_MAX = 3;
+/** most facts the graph neighbourhood adds to a database search's candidates */
+const MAX_NEIGHBOURHOOD_FACTS = 200;
+
+/**
  * Minizep — a minimal temporal knowledge-graph memory for AI agents.
  *
  * Layers (mirroring Graphiti):
@@ -69,13 +108,18 @@ const ENTITY_NAME_COSINE = 0.75;
  *   L1 entities  — extracted nodes with evolving summaries
  *   L1 facts     — edges with validity windows; superseded, never deleted
  *
- * Retrieval: BM25 + cosine, fused with RRF, filtered by temporal validity.
+ * Retrieval: BM25 + cosine, fused with RRF, nudged towards facts near the
+ * entities the query names, cut to the relevant ones, filtered by temporal
+ * validity.
  */
 export class Minizep {
   readonly store: GraphStore;
   readonly ingest: IngestPipeline;
   /** the embedder used for BOTH document and query vectors — they must match */
   readonly embedder: Embedder;
+
+  /** default SearchOptions.minCosine: MINIZEP_SEARCH_MIN_COSINE, else DEFAULT_MIN_COSINE */
+  readonly minCosine: number;
 
   constructor(opts?: { store?: GraphStore; llm?: LLMProvider; embedder?: Embedder }) {
     this.store = opts?.store ?? new MemoryGraphStore();
@@ -85,6 +129,7 @@ export class Minizep {
       opts?.llm ?? new MockLLMProvider(),
       this.embedder,
     );
+    this.minCosine = envCosine('MINIZEP_SEARCH_MIN_COSINE', DEFAULT_MIN_COSINE);
   }
 
   /** Hybrid search over facts (edges). Returns facts with resolved names. */
@@ -96,14 +141,18 @@ export class Minizep {
    * Hybrid search that also reports degradation. Search degrades instead of
    * failing: when the query cannot be embedded (embedding service down), the
    * keyword ranking alone is returned with `degraded: true`.
+   *
+   * Both backends rank the same way (search/rerank.ts): keyword and vector
+   * rankings fused with RRF, plus a bonus for facts on or next to an entity
+   * the query names, then a relevance cut.
    */
   async searchFactsDetailed(query: string, opts: SearchOptions = {}): Promise<SearchResult> {
-    const { groupId, limit = 10, at, asOf, includeHistorical = false } = opts;
+    const { groupId, limit = 10, at, asOf, includeHistorical = false, minCosine = this.minCosine } = opts;
     // Prefer a store that can run retrieval itself: it avoids loading the whole
     // graph into memory, which is the difference between working at a thousand
     // facts and at a million.
     if (isSearchCapable(this.store)) {
-      return this.searchNatively(query, { groupId, limit, at, asOf, includeHistorical });
+      return this.searchNatively(query, { groupId, limit, at, asOf, includeHistorical, minCosine });
     }
 
     const all = await this.store.getFacts(groupId);
@@ -115,30 +164,35 @@ export class Minizep {
     const queryVec = await this.embedQuery(query);
 
     // ranking 1: BM25 over fact text + entity names
-    const nameOf = new Map((await this.store.getEntities(groupId)).map((e) => [e.uuid, e.name]));
+    const entities = await this.store.getEntities(groupId);
+    const nameOf = new Map(entities.map((e) => [e.uuid, e.name]));
     const docOf = (f: EntityEdge) => ({
       id: f.uuid,
       text: `${f.name} ${f.fact} ${nameOf.get(f.sourceNodeUuid) ?? ''} ${nameOf.get(f.targetNodeUuid) ?? ''}`,
     });
     const bm25 = bm25Scores(query, facts.map(docOf));
-    const bm25Ranking = [...bm25.entries()]
-      .filter(([, s]) => s > 0)
-      .sort((a, b) => b[1] - a[1])
-      .map(([id]) => id);
+    const byText = facts
+      .filter((f) => (bm25.get(f.uuid) ?? 0) > 0)
+      .sort((a, b) => bm25.get(b.uuid)! - bm25.get(a.uuid)!);
 
     // ranking 2: cosine over fact embeddings (skipped when the query has no vector)
-    const cosRanking = queryVec
-      ? facts
-          .map((f) => ({ id: f.uuid, score: f.factEmbedding ? cosineSimilarity(f.factEmbedding, queryVec) : 0 }))
-          .filter((r) => r.score > 0)
-          .sort((a, b) => b.score - a.score)
-          .map((r) => r.id)
-      : [];
+    const cosine = new Map<string, number>();
+    if (queryVec) {
+      for (const f of facts) {
+        if (f.factEmbedding?.length) cosine.set(f.uuid, cosineSimilarity(f.factEmbedding, queryVec));
+      }
+    }
+    const byVector = facts
+      .filter((f) => (cosine.get(f.uuid) ?? 0) > 0)
+      .sort((a, b) => cosine.get(b.uuid)! - cosine.get(a.uuid)!);
 
-    // RRF fusion
-    const fused = rrfFuseScored([bm25Ranking, cosRanking]).slice(0, limit);
-    const byId = new Map(facts.map((f) => [f.uuid, f]));
-    return { results: withContext(fused, byId, nameOf), degraded: !queryVec };
+    // every visible fact is a candidate here, so the whole graph around the
+    // query's entities is in reach
+    const anchors = new Set(queryEntities(query, entities, queryVec).map((e) => e.uuid));
+    const distance = graphDistances(anchors, neighboursOf(anchors, facts), facts);
+    const candidates = mergeCandidates(byText, byVector, facts, cosine);
+    const ranked = rerank(candidates, distance, { limit, minCosine });
+    return { results: withContext(ranked, nameOf), degraded: !queryVec };
   }
 
   /** The query vector, or undefined when the embedder is unavailable. */
@@ -152,30 +206,81 @@ export class Minizep {
   }
 
   /**
-   * Database-side hybrid retrieval: BM25-ish full-text + pgvector cosine,
-   * fused with RRF. Only the fused candidates are fetched back.
+   * Database-side hybrid retrieval: BM25-ish full-text and pgvector cosine
+   * find the candidates, plus the facts around the entities the query names;
+   * they are ranked in Node like the in-memory ones.
    */
   private async searchNatively(
     query: string,
-    opts: Required<Pick<SearchOptions, 'limit'>> & SearchOptions,
+    opts: Required<Pick<SearchOptions, 'limit' | 'minCosine'>> & SearchOptions,
   ): Promise<SearchResult> {
     const store = this.store as SearchCapableStore;
-    const { groupId, limit, at, asOf, includeHistorical } = opts;
+    const { groupId, limit, at, asOf, includeHistorical, minCosine } = opts;
     // null activeAt means "do not filter by valid time" (history requested)
-    const activeAt = includeHistorical ? null : at;
+    const scope = { groupId, activeAt: includeHistorical ? null : at, asOf };
     const depth = Math.max(limit * 4, 50);
 
     const queryVec = await this.embedQuery(query);
-    const [byText, byVector] = await Promise.all([
-      store.searchFactsByText(query, { groupId, limit: depth, activeAt, asOf }),
-      queryVec ? store.searchFactsByVector(queryVec, { groupId, limit: depth, activeAt, asOf }) : [],
+    const [byText, byVector, entities] = await Promise.all([
+      store.searchFactsByText(query, { ...scope, limit: depth }),
+      queryVec ? store.searchFactsByVector(queryVec, { ...scope, limit: depth }) : [],
+      this.store.getEntities(groupId),
     ]);
 
-    const fused = rrfFuseScored([byText.map((r) => r.edge.uuid), byVector.map((r) => r.edge.uuid)]).slice(0, limit);
-    const edges = await store.getFactsByUuids(fused.map((r) => r.id));
-    const byId = new Map(edges.map((e) => [e.uuid, e]));
-    const nameOf = new Map((await this.store.getEntities(groupId)).map((e) => [e.uuid, e.name]));
-    return { results: withContext(fused, byId, nameOf), degraded: !queryVec };
+    // The neighbourhood: facts touching a query entity, then facts touching
+    // one of their neighbours, the most recently learned first (the order
+    // rerank gives equal scores). No vector is compared here: a hub entity
+    // touches most of its group. These facts are candidates too, as every
+    // visible fact is in memory; that matters when the embedder is down.
+    const anchors = new Set(queryEntities(query, entities, queryVec).map((e) => e.uuid));
+    const around: EntityEdge[] = [];
+    let neighbours = new Set<string>();
+    if (anchors.size > 0) {
+      around.push(...(await store.searchFactsByEntities([...anchors], { ...scope, limit: MAX_NEIGHBOURHOOD_FACTS })));
+      const room = MAX_NEIGHBOURHOOD_FACTS - around.length;
+      if (room > 0) {
+        // every fact touching an anchor is in `around`: its other endpoints
+        // are all the neighbours, at most one per fact
+        neighbours = neighboursOf(anchors, around);
+        if (neighbours.size > 0) {
+          // the facts already found touch these neighbours too: ask for
+          // enough that `room` new ones are left once they are skipped
+          const seen = new Set(around.map((f) => f.uuid));
+          const next = await store.searchFactsByEntities([...neighbours], { ...scope, limit: room + seen.size });
+          around.push(...next.filter((f) => !seen.has(f.uuid)).slice(0, room));
+        }
+      } else {
+        // the first hop was cut: the neighbours come from a query that is
+        // not, so that distance 1 is exact for every candidate
+        const ids = await store.getNeighbourIds([...anchors], scope);
+        neighbours = new Set(ids.filter((id) => !anchors.has(id)));
+      }
+    }
+
+    // pgvector returned the `depth` nearest facts; those with a positive
+    // cosine are ranked, as in memory. Any other candidate is further away,
+    // so it ranks after them, by its own cosine
+    const cosine = new Map<string, number>(byVector.map((r) => [r.edge.uuid, 1 - r.distance]));
+    const vectorRanked = byVector.filter((r) => 1 - r.distance > 0).map((r) => r.edge);
+    if (queryVec) {
+      const extra = [...byText.map((r) => r.edge), ...around].filter(
+        (f) => !cosine.has(f.uuid) && f.factEmbedding?.length,
+      );
+      for (const f of extra) cosine.set(f.uuid, cosineSimilarity(f.factEmbedding!, queryVec));
+      vectorRanked.push(
+        ...unique(extra)
+          .filter((f) => cosine.get(f.uuid)! > 0)
+          .sort((a, b) => cosine.get(b.uuid)! - cosine.get(a.uuid)!),
+      );
+    }
+
+    // distances from each candidate's own endpoints, whichever search found it
+    const others = [...around, ...byVector.map((r) => r.edge)];
+    const candidates = mergeCandidates(byText.map((r) => r.edge), vectorRanked, others, cosine);
+    const distance = graphDistances(anchors, neighbours, candidates.map((c) => c.edge));
+    const ranked = rerank(candidates, distance, { limit, minCosine });
+    const nameOf = new Map(entities.map((e) => [e.uuid, e.name]));
+    return { results: withContext(ranked, nameOf), degraded: !queryVec };
   }
 
   /**
@@ -295,24 +400,70 @@ export class Minizep {
   }
 }
 
-/** Fused ids -> facts with names and scores, dropping ids that did not resolve. */
-function withContext(
-  fused: { id: string; score: number }[],
-  byId: Map<string, EntityEdge>,
-  nameOf: Map<string, string>,
-): FactWithContext[] {
-  const out: FactWithContext[] = [];
-  for (const { id, score } of fused) {
-    const f = byId.get(id);
-    if (!f) continue;
-    out.push({
-      fact: f,
-      sourceName: nameOf.get(f.sourceNodeUuid) ?? f.sourceNodeUuid,
-      targetName: nameOf.get(f.targetNodeUuid) ?? f.targetNodeUuid,
-      score,
-    });
-  }
-  return out;
+/** Ranked facts with their endpoint names and scores. */
+function withContext(ranked: { edge: EntityEdge; score: number }[], nameOf: Map<string, string>): FactWithContext[] {
+  return ranked.map(({ edge: f, score }) => ({
+    fact: f,
+    sourceName: nameOf.get(f.sourceNodeUuid) ?? f.sourceNodeUuid,
+    targetName: nameOf.get(f.targetNodeUuid) ?? f.targetNodeUuid,
+    score,
+  }));
+}
+
+/**
+ * The entities a search query is about: those whose name it contains (the
+ * rule ingestion uses for the entities a text mentions: whole words for Latin
+ * names, anywhere for CJK ones, two characters at least), else the few whose
+ * name embedding is nearest the query. As in findEntities, the embedding tier
+ * only runs when no name matched: a name that merely shares words with the
+ * question can score high by embedding without being what it asks about.
+ */
+function queryEntities(query: string, entities: EntityNode[], queryVec?: number[]): EntityNode[] {
+  const text = fold(query);
+  const named = entities.filter((e) => mentions(text, fold(e.name)));
+  if (named.length > 0 || !queryVec) return named;
+  return entities
+    .filter((e) => e.nameEmbedding?.length)
+    .map((e) => ({ e, score: cosineSimilarity(e.nameEmbedding!, queryVec) }))
+    .filter((r) => r.score >= QUERY_ENTITY_COSINE)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, QUERY_ENTITY_MAX)
+    .map((r) => r.e);
+}
+
+/** Case- and width-insensitive form for name matching ("ＧＰＴ" is "gpt"). */
+const fold = (s: string) => s.normalize('NFKC').toLowerCase();
+
+/** One candidate per fact, with its place in each ranking. */
+function mergeCandidates(
+  byText: EntityEdge[],
+  byVector: EntityEdge[],
+  others: EntityEdge[],
+  cosine: Map<string, number>,
+): SearchCandidate[] {
+  const keywordRank = new Map(byText.map((f, i) => [f.uuid, i + 1]));
+  const vectorRank = new Map(byVector.map((f, i) => [f.uuid, i + 1]));
+  return unique([...byText, ...byVector, ...others]).map((edge) => ({
+    edge,
+    keywordRank: keywordRank.get(edge.uuid),
+    vectorRank: vectorRank.get(edge.uuid),
+    cosine: cosine.get(edge.uuid),
+  }));
+}
+
+/** The first fact of each uuid, in order. */
+function unique(facts: EntityEdge[]): EntityEdge[] {
+  const seen = new Set<string>();
+  return facts.filter((f) => !seen.has(f.uuid) && seen.add(f.uuid));
+}
+
+/** A cosine threshold from the environment, or `fallback` when unset. */
+function envCosine(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < -1 || n > 1) throw new Error(`${name} must be a number from -1 to 1, got "${raw}"`);
+  return n;
 }
 
 /** when a fact starts (or was learned, when its start is unknown) */

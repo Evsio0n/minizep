@@ -28,8 +28,12 @@ export interface IngestResult {
   reinforced: EntityEdge[];
   /** existing facts closed by this episode (terminations / contradictions) */
   invalidated: EntityEdge[];
-  /** extracted candidates discarded because an endpoint could not be resolved */
-  dropped: { facts: number; invalidations: number };
+  /**
+   * extracted candidates discarded: entities that are only a literal value
+   * (an address, a number, a URL, a version) with no fact on them, and facts
+   * and invalidations naming an entity that could not be resolved
+   */
+  dropped: { entities: number; facts: number; invalidations: number };
   /** true when processing failed and the episode was stored for retry */
   failed?: boolean;
   /** why processing failed (present when failed === true) */
@@ -89,6 +93,8 @@ export interface IngestOptions {
 
 /** same endpoints + relation and fact texts at least this similar: one fact */
 const PARAPHRASE_COSINE = 0.92;
+/** one reply, same source and target, other relation, same dates, fact texts at least this similar: one fact */
+const REPEAT_COSINE = 0.95;
 /** known entities sent to the LLM beyond the ones named in the text */
 const MAX_RANKED_ENTITIES = 50;
 /** entities named in the text that are sent to the LLM */
@@ -104,10 +110,13 @@ const RANKING_TEXT_CHARS = 2000;
  *   1. persist the episode as 'pending' (L0 provenance)
  *   2. LLM extraction of candidate entities, facts and invalidations, with the
  *      episode's validAt as the reference time for relative dates
- *   3. node resolution: dedupe against existing entities by name
+ *   3. node resolution: dedupe against existing entities by name; a literal
+ *      value (an address, a number) that no fact uses is not an entity
  *   4. every embedding (entity names + facts) is computed
  *   5. edge resolution, still in memory:
- *        a. paraphrase dedupe, including out-of-order (older) episodes
+ *        a. paraphrase dedupe: within the reply (one statement with the same
+ *           dates under several relations), then against the graph,
+ *           including out-of-order (older) episodes
  *        b. contradiction detection -> temporal supersede
  *           (old fact gets invalidAt/expiredAt, NEVER deleted)
  *        c. explicit invalidations -> close the named relation, no new edge
@@ -337,7 +346,7 @@ function emptyResult(episode: EpisodicNode): Omit<IngestResult, 'status'> {
     facts: [],
     reinforced: [],
     invalidated: [],
-    dropped: { facts: 0, invalidations: 0 },
+    dropped: { entities: 0, facts: 0, invalidations: 0 },
   };
 }
 
@@ -357,6 +366,8 @@ function validDate(d: unknown): Date | undefined {
   return d instanceof Date && !Number.isNaN(d.getTime()) ? d : undefined;
 }
 
+const sameInstant = (a: Date | undefined, b: Date | undefined) => a?.getTime() === b?.getTime();
+
 /**
  * Does the text name the entity? Latin-script names must match whole words
  * ("AI" is not in "said"); scripts written without spaces (CJK) match anywhere.
@@ -373,6 +384,20 @@ export function mentions(text: string, name: string): boolean {
 }
 
 const isWordChar = (c: string | undefined) => !!c && /[\p{Script=Latin}\p{M}\p{N}_]/u.test(c);
+
+const LITERAL_VALUES = [
+  /^\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?$/, // IPv4, with a port
+  /^\[?[\da-f]*:[\da-f]*:[\da-f:.]*\]?(?::\d{1,5})?$/i, // IPv6 ("::1", "[fe80::1]:8080")
+  /^[+-]?\d+(?:[.,]\d+)*$/, // a bare number
+  /^https?:\/\/\S+$/i, // a URL
+  /^v?\d+(?:\.\d+)+(?:-[\w.]+)?$/i, // a version ("v1.2.3", "2.0.1-rc1")
+];
+
+/** Is the name only a literal value, which the extraction prompt says is never an entity? */
+function isLiteralValue(name: string): boolean {
+  const s = name.trim();
+  return LITERAL_VALUES.some((re) => re.test(s));
+}
 
 /** Does the fact's (half-open) window contain instant t? */
 function covers(f: EntityEdge, t: Date): boolean {
@@ -447,7 +472,7 @@ class EpisodeRun {
   private dirtyFacts = new Set<EntityEdge>();
   private reinforced: EntityEdge[] = [];
   private invalidated: EntityEdge[] = [];
-  private dropped = { facts: 0, invalidations: 0 };
+  private dropped = { entities: 0, facts: 0, invalidations: 0 };
   private vectors = new Map<string, number[]>();
 
   constructor(
@@ -463,16 +488,20 @@ class EpisodeRun {
   async execute(finish?: (store: GraphStore) => Promise<void>): Promise<Omit<IngestResult, 'episode' | 'status'>> {
     const extraction = await this.extract();
 
-    const endpoints = new Set(
-      (extraction.facts ?? []).flatMap((f) => [f.sourceName, f.targetName]).map((n) => (n ?? '').trim().toLowerCase()),
-    );
-    for (const cand of extraction.entities ?? []) await this.resolveEntity(cand, endpoints);
+    const names = (rows: { sourceName: string; targetName: string }[]) =>
+      new Set(rows.flatMap((f) => [f.sourceName, f.targetName]).map((n) => (n ?? '').trim().toLowerCase()));
+    const endpoints = names(extraction.facts ?? []);
+    const related = new Set([...endpoints, ...names(extraction.invalidations ?? [])]);
+    for (const cand of extraction.entities ?? []) await this.resolveEntity(cand, endpoints, related);
     const plans: FactPlan[] = [];
     for (const cand of extraction.facts ?? []) {
       const plan = await this.planFact(cand);
       if (plan) plans.push(plan);
       else this.dropped.facts++;
     }
+    // (collapsing repeats below keeps every endpoint pair, so `plans` already
+    // tells which entities a kept fact uses)
+    this.dropUnusedLiterals(plans);
 
     // every vector before any write: an embedding outage must not leave half
     // an episode in the graph
@@ -481,7 +510,7 @@ class EpisodeRun {
     }
     for (const plan of plans) await this.vector(plan.text);
 
-    for (const plan of plans) await this.resolveFact(plan);
+    for (const plan of this.collapseRepeats(plans)) await this.resolveFact(plan);
     for (const inv of extraction.invalidations ?? []) await this.applyInvalidation(inv);
 
     await this.repairStaleVectors();
@@ -581,12 +610,15 @@ class EpisodeRun {
     return node;
   }
 
-  private async resolveEntity(cand: ExtractedEntity, factEndpoints: Set<string>): Promise<void> {
+  private async resolveEntity(cand: ExtractedEntity, factEndpoints: Set<string>, related: Set<string>): Promise<void> {
     const name = (cand.name ?? '').trim();
     if (!name) return;
     const summary = (cand.summary ?? '').trim();
     const labels = cand.labels ?? [];
     let node = await this.lookup(name);
+    // the LLM sometimes echoes every known entity it was shown: one this text
+    // neither mentions nor relates is not updated (its summary would drift)
+    if (node && !related.has(name.toLowerCase()) && !mentions(this.episode.content, name)) return;
     if (node) {
       // merge: keep node, extend labels, and only replace the summary with a
       // real one (an empty candidate summary must never erase what we know)
@@ -616,6 +648,23 @@ class EpisodeRun {
     if (!this.touched.includes(node)) this.touched.push(node);
   }
 
+  /**
+   * An entity named only by a literal value ("192.0.2.10:8080", "4242", a URL)
+   * is noise unless a fact uses it as an endpoint: it is not written, and is
+   * counted as dropped.
+   */
+  private dropUnusedLiterals(plans: FactPlan[]): void {
+    const used = new Set(plans.flatMap((p) => [p.src, p.tgt]));
+    this.touched = this.touched.filter((node) => {
+      if (used.has(node) || !isLiteralValue(node.name)) return true;
+      this.dirtyEntities.delete(node);
+      // a new one is forgotten, so an invalidation naming it is dropped too
+      if (this.newEntities.delete(node.uuid)) this.byName.delete(node.name.toLowerCase());
+      this.dropped.entities++;
+      return false;
+    });
+  }
+
   /* ---------------- facts ---------------- */
 
   private async planFact(cand: ExtractedFact): Promise<FactPlan | undefined> {
@@ -625,6 +674,31 @@ class EpisodeRun {
     const relation = normaliseRelation(cand.relation);
     const text = (cand.fact ?? '').trim() || `${src.name} ${relation} ${tgt.name}`;
     return { cand, src, tgt, relation, text };
+  }
+
+  /**
+   * One reply can state the same thing twice between the same pair, under two
+   * relation names. Between the same source and target, an identical or
+   * near-identical sentence under another relation with the same validity
+   * window is one fact: the first one is kept. Sentences that differ in their
+   * dates ("from 2015 to 2017", "from 2019 to 2021") stay separate facts, and
+   * repeats under the same relation are left to resolveFact, which merges
+   * them in time.
+   */
+  private collapseRepeats(plans: FactPlan[]): FactPlan[] {
+    const kept: FactPlan[] = [];
+    for (const plan of plans) {
+      const vec = this.vectors.get(plan.text)!;
+      const { validAt, invalidAt } = this.window(plan.cand);
+      const repeat = kept.some((k) => {
+        if (k.src !== plan.src || k.tgt !== plan.tgt || k.relation === plan.relation) return false;
+        const w = this.window(k.cand);
+        if (!sameInstant(w.validAt, validAt) || !sameInstant(w.invalidAt, invalidAt)) return false;
+        return k.text === plan.text || cosineSimilarity(this.vectors.get(k.text)!, vec) >= REPEAT_COSINE;
+      });
+      if (!repeat) kept.push(plan);
+    }
+    return kept;
   }
 
   /** Working copies of every fact touching the entity (cloned from the store once). */

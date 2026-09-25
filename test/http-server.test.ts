@@ -10,7 +10,8 @@ import { MemoryGraphStore, type GraphStore } from '../src/store/memory-store.js'
 import { PostgresStore } from '../src/store/postgres-store.js';
 import type { EpisodicNode } from '../src/model/types.js';
 import { ScriptedLLM, deterministicEmbedder, entity, fact } from './helpers.js';
-import { ControlledLLM, api, call, connect, rawMcp, startServer, waitFor } from './server-helpers.js';
+import { parseUiHosts, uiFromEnv } from '../src/server/ui.js';
+import { ControlledLLM, api, call, connect, rawMcp, rawRequest, startServer, waitFor } from './server-helpers.js';
 
 const DAY = 86_400_000;
 
@@ -265,11 +266,14 @@ test('add_memory: reports processed with complete fact rows, then duplicate', as
     assert.deepEqual(first.structured.entities.sort(), ['Acme', 'Alice']);
     const row = first.structured.facts[0];
     assert.deepEqual(Object.keys(row).sort(), [
-      'created_at', 'episodes', 'expired_at', 'fact', 'invalid_at', 'relation', 'score', 'source', 'target',
-      'uuid', 'valid_at',
+      'created_at', 'episodes', 'expired_at', 'fact', 'invalid_at', 'reason', 'relation', 'score', 'source',
+      'source_uuid', 'target', 'target_uuid', 'uuid', 'valid_at',
     ]);
     assert.equal(row.source, 'Alice');
     assert.equal(row.target, 'Acme');
+    assert.equal(row.source_uuid, (await srv.zep.store.findEntityByName('teamA', 'Alice'))?.uuid);
+    assert.equal(row.target_uuid, (await srv.zep.store.findEntityByName('teamA', 'Acme'))?.uuid);
+    assert.equal(row.reason, null);
     assert.equal(row.relation, 'WORKS_AT');
     assert.equal(row.valid_at, '2024-03-01T00:00:00.000Z');
     assert.deepEqual(row.episodes, [first.structured.episode_uuid]);
@@ -300,7 +304,7 @@ test('add_memory: facts whose entities could not be resolved are counted as drop
   try {
     const a = await connect(srv.base, 'tokA');
     const r = await call(a.client, 'add_memory', { content: 'Alice works at Acme, which Ghost haunts.' });
-    assert.deepEqual(r.structured.dropped, { facts: 1, invalidations: 0 });
+    assert.deepEqual(r.structured.dropped, { entities: 0, facts: 1, invalidations: 0 });
     assert.match(r.text, /dropped: 1 fact, 0 invalidations/);
   } finally {
     await srv.close();
@@ -635,5 +639,131 @@ test('listen: several addresses serve the same app', async () => {
     assert.equal(listed.body.episodes.length, 1, 'both addresses share one graph');
   } finally {
     await srv.close();
+  }
+});
+
+/* ================================================================
+ * Web UI (MINIZEP_UI_GROUPS): no token, fixed groups, own page only
+ * ================================================================ */
+
+test('ui: the page is served without a token, and nothing is served while the UI is off', async () => {
+  const srv = await startServer({ ui: { groups: ['teamA'] } });
+  try {
+    const page = await fetch(`${srv.base}/ui`);
+    assert.equal(page.status, 200);
+    assert.equal(page.headers.get('content-type'), 'text/html; charset=utf-8');
+    assert.equal(page.headers.get('x-content-type-options'), 'nosniff');
+    assert.equal(page.headers.get('cache-control'), 'no-cache');
+    assert.match(page.headers.get('content-security-policy') ?? '', /default-src 'self';.*frame-ancestors 'none'/);
+    assert.match(await page.text(), /minizep/i);
+    for (const path of ['/', '/ui/']) {
+      const r = await fetch(`${srv.base}${path}?x=1`, { redirect: 'manual' });
+      assert.equal(r.status, 302, path);
+      assert.equal(new URL(r.headers.get('location')!, `${srv.base}${path}`).href, `${srv.base}/ui?x=1`, path);
+    }
+    assert.equal((await fetch(`${srv.base}/ui/`)).status, 200, 'followed to the page');
+    assert.equal((await fetch(`${srv.base}/ui`, { method: 'POST' })).status, 405);
+    assert.equal((await fetch(`${srv.base}/ui/elsewhere`)).status, 404);
+    assert.equal((await api(srv.base, 'GET', '/v1/stats')).status, 401, '/v1 still needs a token');
+  } finally {
+    await srv.close();
+  }
+  const off = await startServer();
+  try {
+    for (const path of ['/', '/ui', '/ui/', '/ui/api/v1/stats']) {
+      assert.equal((await fetch(`${off.base}${path}`)).status, 404, path);
+    }
+  } finally {
+    await off.close();
+  }
+});
+
+test('ui: other sites and foreign host names (DNS rebinding) are refused', async () => {
+  const srv = await startServer({ ui: { groups: ['teamA'], hosts: parseUiHosts(' Minizep.Example ') } });
+  try {
+    const port = new URL(srv.base).port;
+    const self = `127.0.0.1:${port}`;
+    const json = { 'content-type': 'application/json' };
+    const add = (headers: Record<string, string>) =>
+      rawRequest(srv.base, 'POST', '/ui/api/v1/memories', { ...json, ...headers }, '{"content":"Mallory works at Evilcorp."}');
+
+    const crossSite = await add({ origin: 'http://evil.example', 'sec-fetch-site': 'cross-site' });
+    assert.deepEqual([crossSite.status, crossSite.body], [403, { error: 'cross-origin request refused' }]);
+    assert.equal((await add({ origin: `http://${self}`, 'sec-fetch-site': 'cross-site' })).status, 403);
+    assert.equal((await add({ origin: `https://${self}` })).status, 403);
+    // a rebinding page is same-origin for the browser, but under the attacker's name
+    const evil = `evil.test:${port}`;
+    assert.equal((await add({ host: evil, origin: `http://${evil}`, 'sec-fetch-site': 'same-origin' })).status, 403);
+    assert.equal((await rawRequest(srv.base, 'GET', '/ui/api/v1/episodes', { host: evil })).status, 403);
+    assert.equal((await rawRequest(srv.base, 'GET', '/ui', { host: evil })).status, 403);
+    assert.equal((await rawRequest(srv.base, 'GET', '/ui', { host: `[::1]evil:${port}` })).status, 403);
+    assert.equal((await srv.zep.store.getEpisodes()).length, 0, 'nothing was written');
+
+    // the page itself: same origin under an IP address, localhost or a listed name
+    const own = await add({ host: self, origin: `http://${self}`, 'sec-fetch-site': 'same-origin' });
+    assert.equal(own.status, 201);
+    assert.equal(own.body.group_id, 'teamA');
+    for (const host of [`localhost:${port}`, `[::1]:${port}`, `minizep.example:${port}`, 'minizep.example']) {
+      const r = await rawRequest(srv.base, 'GET', '/ui/api/v1/stats', { host, origin: `http://${host}` });
+      assert.equal(r.status, 200, host);
+    }
+    assert.equal((await rawRequest(srv.base, 'GET', '/ui/api/v1/stats', { host: self })).status, 200, 'no Origin');
+    assert.equal((await add({ host: self, 'content-type': 'text/plain' })).status, 415, 'no form posts');
+  } finally {
+    await srv.close();
+  }
+});
+
+test('ui: the UI acts only on the groups in MINIZEP_UI_GROUPS', async () => {
+  assert.equal(uiFromEnv({}), undefined);
+  assert.equal(uiFromEnv({ MINIZEP_UI_GROUPS: '  ' }), undefined);
+  assert.throws(() => uiFromEnv({ MINIZEP_UI_GROUPS: 'teamA||shared' }), /MINIZEP_UI_GROUPS/);
+  assert.throws(() => uiFromEnv({ MINIZEP_UI_GROUPS: 'teamA', MINIZEP_UI_HOSTS: 'minizep.example:8787' }), /MINIZEP_UI_HOSTS/);
+
+  const srv = await startServer({ ui: uiFromEnv({ MINIZEP_UI_GROUPS: 'teamA|shared' }) });
+  try {
+    await api(srv.base, 'POST', '/v1/memories', { token: 'tokB', body: { content: 'Bob works at Borealis.' } });
+    const ui = (method: string, path: string, body?: unknown) => api(srv.base, method, `/ui/api${path}`, { body });
+
+    const added = await ui('POST', '/v1/memories', { content: 'Alice works at Acme.' });
+    assert.equal(added.status, 201);
+    assert.equal(added.body.group_id, 'teamA', 'the first group is the default');
+    assert.equal((await ui('GET', '/v1/stats?group_id=shared')).status, 200);
+    const refused: [string, string, unknown?][] = [
+      ['GET', '/v1/graph?group_id=teamB'],
+      ['GET', '/v1/episodes?group_id=teamB'],
+      ['POST', '/v1/search', { query: 'Bob', group_id: 'teamB' }],
+      ['POST', '/v1/memories', { content: 'Eve works at Borealis.', group_id: 'teamB' }],
+    ];
+    for (const [method, path, body] of refused) {
+      const r = await ui(method, path, body);
+      assert.deepEqual([r.status, r.body], [403, { error: 'group not permitted for this token' }], `${method} ${path}`);
+    }
+    const groups = await ui('GET', '/v1/groups');
+    assert.equal(groups.body.default_group, 'teamA');
+    assert.deepEqual(groups.body.groups.map((g: { group_id: string }) => g.group_id), ['teamA', 'shared']);
+    const graph = await ui('GET', '/v1/graph');
+    assert.deepEqual(graph.body.edges.map((e: { fact: string }) => e.fact), ['Alice works at Acme']);
+    const status = await ui('GET', '/v1/status');
+    assert.deepEqual([status.body.groups, status.body.sessions], [['teamA', 'shared'], 0]);
+    assert.equal((await ui('POST', '/mcp', {})).status, 404, 'the UI path reaches REST only');
+    assert.equal((await srv.zep.store.getEpisodes('teamB')).length, 1, 'team B untouched');
+  } finally {
+    await srv.close();
+  }
+
+  // "*": every group that holds data; the UI also works in anonymous mode, whose /v1 stays local-only
+  const any = await startServer({ tokens: new Map(), allowAnonymous: true, ui: uiFromEnv({ MINIZEP_UI_GROUPS: '*' }) });
+  try {
+    await api(any.base, 'POST', '/v1/memories', { body: { content: 'Bob works at Borealis.', group_id: 'teamB' } });
+    const groups = await api(any.base, 'GET', '/ui/api/v1/groups');
+    assert.equal(groups.body.default_group, 'default');
+    assert.deepEqual(groups.body.groups.map((g: { group_id: string }) => g.group_id), ['teamB']);
+    const page = { 'content-type': 'application/json', origin: any.base, 'sec-fetch-site': 'same-origin' };
+    const search = JSON.stringify({ query: 'Bob', group_id: 'teamB' });
+    assert.equal((await rawRequest(any.base, 'POST', '/ui/api/v1/search', page, search)).status, 200);
+    assert.equal((await rawRequest(any.base, 'POST', '/v1/search', page, search)).status, 403);
+  } finally {
+    await any.close();
   }
 });

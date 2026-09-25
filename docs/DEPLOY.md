@@ -18,6 +18,7 @@ Linux 主机
     /mcp     MCP（Streamable HTTP）
     /v1/*    REST
     /health  存活检查，只返回 {"ok":true}，不需要 token
+    /ui      Web UI（可选，设置 MINIZEP_UI_GROUPS 才有，不需要 token，见第 8 节）
       │
       ├──► Postgres + pgvector 容器，127.0.0.1:5433（只在回环上）
       ├──► embedding 网关 http://100.64.0.20:11435（经 VPN）──► Slurm 作业里的 llama.cpp
@@ -285,7 +286,50 @@ curl -sS "${auth[@]}" "$MINIZEP_URL/v1/facts/<uuid>/invalidate" \
 curl -sS "${auth[@]}" "$MINIZEP_URL/v1/stats?group_id=teamA"
 ```
 
-## 8. 测试只连一次性数据库
+## 8. Web UI（可选）
+
+服务可以附带一个浏览器页面：按 group 浏览图谱（有效时间 `at` 和知识时间 `as_of` 都可以拖动）、事实、实体和
+episode，写入记忆，手动结束或撤回事实。默认关闭，在 env 文件里设置 `MINIZEP_UI_GROUPS` 才开启：
+
+```
+MINIZEP_UI_GROUPS=teamA|shared
+```
+
+- 值是 `|` 分隔的 group 列表，第一个是页面的默认 group；`*` 表示所有 group。不设（或为空）就没有 UI，
+  `/` 和 `/ui` 都是 404。
+- 改完 `sudo systemctl restart minizep`，然后在 VPN 上的浏览器里打开 `http://100.64.0.10:8787/ui`
+  （`/` 和 `/ui/` 会跳转过去）。页面文件是 checkout 里的 `ui/index.html`，npm 包和容器镜像里也带着。
+
+**UI 没有登录。** `/ui` 页面和它调用的 `/ui/api/v1/*` 都不需要 token：服务端把这些请求当成一个固定的调用方，
+只能读写 `MINIZEP_UI_GROUPS` 里的 group。换句话说，**能连上监听地址的任何人都能读写这些 group**。所以：
+
+- 只在私有网络上开启：回环地址，或者按第 3 节只监听 VPN 地址、再用 ACL 限定能访问 8787 的设备。
+  不要在公网能访问到的地址上开启。
+- 只列出需要在页面上看的 group。`*` 会把所有 group（包括只发给别的 token 的 group）交给能打开页面的人。
+- `/v1` 和 `/mcp` 的 token 鉴权不变，UI 不改变任何 token 的权限。
+
+服务端对每个 UI 请求做两项检查，不满足就返回 403：
+
+- `Host`（去掉端口）必须是 IP 地址、`localhost`，或者 `MINIZEP_UI_HOSTS` 里列出的名字。DNS rebinding
+  攻击的页面用的是攻击者自己的域名，所以会被挡住。要用主机名打开 UI（例如 MagicDNS 名字），把它加进去，
+  多个用逗号分隔，不带端口：
+
+  ```
+  MINIZEP_UI_HOSTS=minizep.tailnet.example
+  ```
+
+- 浏览器带了 `Origin` 时，它必须正好是 `http://<Host>`，并且 `Sec-Fetch-Site` 不存在或者是 `same-origin`：
+  别的网站上的页面既不能写，也读不到结果。请求体和其余接口一样只接受 `application/json`。
+
+UI 和其余接口一样是明文 HTTP，靠 VPN 加密传输。检查：
+
+```bash
+curl -sS -o /dev/null -w '%{http_code}\n' http://100.64.0.10:8787/ui                     # 200
+curl -sS -o /dev/null -w '%{http_code}\n' -H 'Origin: http://evil.example' \
+  http://100.64.0.10:8787/ui/api/v1/stats                                                # 403
+```
+
+## 9. 测试只连一次性数据库
 
 Postgres 相关的测试按这个顺序找数据库：`MINIZEP_TEST_DATABASE_URL` → `MINIZEP_DATABASE_URL` →
 `/var/tmp/minizep-pg/url`。在生产主机上后两个指向的就是**生产库**，而测试会在里面建 schema、
@@ -314,7 +358,7 @@ bash deploy/test/install.test.sh
 bash deploy/test/tokens.test.sh
 ```
 
-## 9. 升级与回滚
+## 10. 升级与回滚
 
 升级：
 
@@ -352,7 +396,7 @@ sudo cat /var/backups/minizep/<date>.dump |
 sudo systemctl start minizep
 ```
 
-## 10. Embedding 服务换班
+## 11. Embedding 服务换班
 
 minizep 只知道 `MINIZEP_EMBED_URL`。把它指向网关上的 `embed-proxy.py`（固定地址，经 VPN），
 不要指向计算节点上作业的端口，那个端口每个作业都不一样。
@@ -375,7 +419,7 @@ Slurm 作业有时限，"常驻"靠 `infra/embedding/supervise.sh` 提前换班�
 同一个模型换到新作业上，向量不变，什么都不用做。**换模型或换维度不是换班**：要改 `MINIZEP_EMBED_DIMS`
 并重建向量（README"数据库后端"一节）。可选的第二层 `MINIZEP_OLLAMA_URL` 必须是同样维度的模型。
 
-## 11. 排障
+## 12. 排障
 
 | 现象 | 原因和处理 |
 |---|---|
@@ -386,3 +430,6 @@ Slurm 作业有时限，"常驻"靠 `infra/embedding/supervise.sh` 提前换班�
 | 日志里 `store=memory + snapshot` | 没设 `MINIZEP_DATABASE_URL`（沙箱里读不到 `/var/tmp` 下的 url 文件） |
 | 日志里反复出现 `EADDRNOTAVAIL` | `MINIZEP_HOST` 里的 VPN 地址不对，或者 VPN 没起来：`tailscale ip -4` |
 | `install.sh` 等 `/health` 超时 | 看它打印的 `systemctl status` 和日志；数据库连不上时服务会按退避不断重启 |
+| `/ui` 返回 404 | 没设 `MINIZEP_UI_GROUPS`（改 env 文件后要重启） |
+| UI 返回 403 `host not allowed for the UI` | 用主机名打开了页面：把这个名字加进 `MINIZEP_UI_HOSTS`，或者用 IP 地址打开 |
+| UI 里提示 `group not permitted` | 打开的 group 不在 `MINIZEP_UI_GROUPS` 里 |
