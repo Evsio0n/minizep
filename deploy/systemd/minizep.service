@@ -1,0 +1,123 @@
+# minizep HTTP service: MCP at /mcp, REST at /v1, liveness at /health, all on one port.
+#
+# Template (deploy/systemd/minizep.service). deploy/install.sh renders it into
+# /etc/systemd/system/minizep.service, filling in these placeholders, each written
+# between two @ signs below:
+#   USER          unprivileged account the service runs as (owns the checkout)
+#   WORKDIR       absolute path of the built checkout (the one containing dist/)
+#   ENV_FILE      environment file with the configuration and tokens (root-owned, mode 600)
+#   NODE          absolute path of the node binary (>= 20.11)
+#   SNAPSHOT_DIR  in-memory store only, see ReadWritePaths= below
+# By hand: substitute them, install the result, then
+#   systemctl daemon-reload && systemctl enable --now minizep
+# Audit the sandbox on the host with: systemd-analyze security minizep.service
+
+[Unit]
+Description=minizep temporal knowledge-graph memory (MCP + REST over HTTP)
+Documentation=file:@WORKDIR@/docs/DEPLOY.md
+# Ordering, not a hard dependency. network-online.target waits for the configured
+# interfaces and tailscaled brings up the VPN address. Wants= is weak: minizep still
+# starts when tailscaled is missing or fails, and the listener keeps retrying an address
+# that is not assigned yet (see MINIZEP_HOST), so boot order is not load-bearing.
+# With WireGuard instead of Tailscale, name wg-quick@<iface>.service here.
+Wants=network-online.target tailscaled.service
+After=network-online.target tailscaled.service
+# The Postgres container runs under Docker. Start after it when it is installed (no
+# dependency: a database that is still starting is covered by Restart= below).
+After=docker.service
+# Never give up restarting. The default (5 starts in 10 s) would leave the unit failed
+# after a burst of early crashes, e.g. while the database container is still coming up.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=@USER@
+WorkingDirectory=@WORKDIR@
+# Read by systemd as root before privileges are dropped, so the file can stay root-owned
+# with mode 600 and the service user cannot read the tokens from disk.
+EnvironmentFile=@ENV_FILE@
+Environment=NODE_ENV=production
+# A missing LLM configuration is fatal instead of a silent fallback to the offline mock
+# extractor, which would write meaningless facts. The environment file can override it.
+Environment=MINIZEP_REQUIRE_REAL_PROVIDERS=1
+ExecStart=@NODE@ @WORKDIR@/dist/server/http.js
+SyslogIdentifier=minizep
+
+# Restart after any exit that systemctl did not ask for, with exponential backoff from
+# 2 s up to 60 s between attempts. RestartSteps=/RestartMaxDelaySec= need systemd >= 254;
+# older versions log "Unknown key name" and keep the fixed RestartSec=.
+Restart=always
+RestartSec=2
+RestartSteps=5
+RestartMaxDelaySec=60
+# On SIGTERM the server drains queued ingestion for up to MINIZEP_DRAIN_TIMEOUT_MS
+# (default 120 s) before it exits. Keep this above that value, or systemd kills a drain
+# in progress with SIGKILL.
+TimeoutStopSec=150
+
+# ---- sandbox ---------------------------------------------------------------------------
+# The service needs to read its checkout and node, read the LLM credentials file in the
+# service user's home (~/.openclaw/openclaw.json, used when MINIZEP_LLM_API_KEY and
+# MINIZEP_LLM_BASE_URL are not set), open outbound TCP connections (Postgres, embedding
+# endpoint, LLM API) and listen on its port. Everything else is taken away.
+
+# No privilege gain through setuid/setgid binaries or file capabilities, for the process
+# and anything it spawns.
+NoNewPrivileges=yes
+# No capabilities at all: the port is above 1024 and nothing needs root.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# The whole file system is read-only for the service (/usr, /etc, /var, ...).
+ProtectSystem=strict
+# /home, /root and /run/user are read-only rather than hidden: the checkout, a node
+# installed with nvm and the LLM credentials file may all live in the service user's
+# home. ProtectHome=yes is stricter and fine when none of them do.
+ProtectHome=read-only
+# Private /tmp and /var/tmp, removed on stop. This also hides /var/tmp/minizep-pg/url
+# (written by infra/postgres/setup.sh), so set MINIZEP_DATABASE_URL in the environment
+# file.
+PrivateTmp=yes
+# In-memory store only: the JSON snapshot (MINIZEP_DB) is written as <file>.tmp and then
+# renamed, so its directory must be writable. With Postgres the service writes nothing to
+# disk and this line stays commented out (install.sh --snapshot-dir enables it).
+#ReadWritePaths=@SNAPSHOT_DIR@
+# New files readable by the service user only (the snapshot holds the whole graph).
+UMask=0077
+# A minimal /dev (null, zero, urandom, ...) without physical devices.
+PrivateDevices=yes
+# No writes to /proc/sys and /sys, no kernel modules, no kernel log, no cgroup changes,
+# no clock or hostname changes.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+# Other users' processes are invisible in /proc.
+ProtectProc=invisible
+# No new namespaces, realtime scheduling, setuid/setgid files or execution-domain
+# changes; System V IPC objects are removed when the service stops.
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RemoveIPC=yes
+# Sockets: IPv4/IPv6 for the listener and the outbound connections, AF_UNIX for the local
+# resolver, AF_NETLINK because listing local addresses (getifaddrs) goes through netlink.
+# No raw or packet sockets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+# Only the system calls of an ordinary service. A blocked call fails with EPERM instead of
+# killing the process, so optional kernel features (e.g. io_uring in libuv) fall back.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+# Deliberately not set:
+#   MemoryDenyWriteExecute=yes  V8's JIT needs writable+executable memory; node aborts.
+#   PrivateNetwork=yes, IPAddressDeny=  the service must reach a remote embedding endpoint
+#                               and the LLM API. Limit who reaches the listener with the
+#                               bind addresses (MINIZEP_HOST) and the VPN's ACLs instead.
+#   DynamicUser=yes             the service user's home holds the LLM credentials file.
+
+[Install]
+WantedBy=multi-user.target
