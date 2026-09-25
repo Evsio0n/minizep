@@ -293,7 +293,10 @@ export const shapes = {
     at: instant('the valid time to look at (default now)'),
     as_of: asOf,
     history: z.boolean().optional().describe('Also facts that are not active at `at`, each with its state'),
-    isolated: z.boolean().optional().describe('Also entities known at `as_of` that no returned fact touches'),
+    isolated: z
+      .boolean()
+      .optional()
+      .describe('Also entities known at `as_of` that no returned fact touches, newest first, up to `limit` nodes in all'),
     limit: z.number().int().min(1).max(2000).optional().describe('Maximum facts returned (default 500)'),
   },
   entity: {
@@ -601,17 +604,28 @@ export class MemoryService {
       (a, b) =>
         Number(b.state === 'active') - Number(a.state === 'active') || cmp(b.created_at, a.created_at),
     );
-    const truncated = edges.length > limit;
-    if (truncated) edges = edges.slice(0, limit);
+    const edgesTruncated = edges.length > limit;
+    if (edgesTruncated) edges = edges.slice(0, limit);
 
     const degree = new Map<string, number>();
     for (const e of edges) {
       degree.set(e.source_uuid, (degree.get(e.source_uuid) ?? 0) + 1);
       degree.set(e.target_uuid, (degree.get(e.target_uuid) ?? 0) + 1);
     }
-    const shown = entities.filter(
-      (e) => degree.has(e.uuid) || (input.isolated === true && e.createdAt <= asOf),
+    // isolated entities only fill the room `limit` leaves in the node count,
+    // most recently learned first: a group of thousands of entities must not
+    // become thousands of nodes
+    const isolated =
+      input.isolated === true ? entities.filter((e) => !degree.has(e.uuid) && e.createdAt <= asOf) : [];
+    const room = Math.max(0, limit - degree.size);
+    const keep = new Set(
+      isolated
+        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
+        .slice(0, room)
+        .map((e) => e.uuid),
     );
+    const truncated = edgesTruncated || isolated.length > keep.size;
+    const shown = entities.filter((e) => degree.has(e.uuid) || keep.has(e.uuid));
     const nodes: GraphNode[] = shown.map((e) => ({
       ...entityRow(e),
       label: primaryLabel(e.labels),

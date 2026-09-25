@@ -907,7 +907,7 @@ function fromLocalInput(v) {
 }
 function relTime(t) {
   if (t === null || t === undefined) return '—';
-  const diff = Date.now() - t;
+  const diff = serverNow() - t;
   const a = Math.abs(diff);
   if (a < 45e3) return 'just now';
   const [n, u] =
@@ -994,6 +994,34 @@ function apiBase() {
   return root + API_PREFIX;
 }
 /**
+ * The server's clock. created_at, expired_at and as_of are stamped by the
+ * server, and a browser on another machine may run behind it; a fact ended a
+ * moment ago must not look active. "Now" is the browser clock plus the offset
+ * seen on the last response that stated the server's now (the as_of of a
+ * /graph or /entities/:id read that did not pin one; the Date header until
+ * then), and never earlier than the newest stamp of a change this page made.
+ * The offset takes the server's stamp as made the moment the request left, so
+ * it errs by at most a round trip, and ahead of the server rather than behind.
+ */
+const clock = { skew: 0, measured: false, floor: 0 };
+const serverNow = () => Math.max(Date.now() + clock.skew, clock.floor);
+function noteClock(res, data, q, sent) {
+  const stated = typeof data.as_of === 'string' && !q.as_of ? Date.parse(data.as_of) : NaN;
+  if (Number.isFinite(stated)) {
+    clock.skew = stated - sent;
+    clock.measured = true;
+  } else if (!clock.measured) {
+    const date = Date.parse(res.headers.get('date') || ''); // whole seconds
+    if (Number.isFinite(date)) clock.skew = date + 1000 - sent;
+  }
+}
+/** A change this page just made: its stamps are the server's now at the latest. */
+function noteChangeStamps(rows) {
+  for (const r of arr(rows)) {
+    for (const t of [ms(r && r.created_at), ms(r && r.expired_at)]) if (t !== null && t > clock.floor) clock.floor = t;
+  }
+}
+/**
  * Every request goes through here. Adds group_id (query for GET, body
  * otherwise), parses {error}, shows it as a toast unless `quiet`. A bearer
  * header, should the UI ever need one, would be added here and nowhere else.
@@ -1018,6 +1046,7 @@ async function api(method, path, opts = {}) {
   const headers = { accept: 'application/json' };
   if (payload !== undefined) headers['content-type'] = 'application/json';
   let res;
+  const sent = Date.now();
   try {
     res = await fetch(url, { method, headers, body: payload, signal, credentials: 'same-origin', cache: 'no-store' });
   } catch (err) {
@@ -1032,6 +1061,7 @@ async function api(method, path, opts = {}) {
   if (text) { try { data = JSON.parse(text); } catch { data = null; } }
   if (res.ok || accept.includes(res.status)) {
     const out = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+    noteClock(res, out, q, sent);
     Object.defineProperty(out, '_status', { value: res.status, enumerable: false });
     return out;
   }
@@ -1065,8 +1095,8 @@ function factView(f, at, asOf) {
   if (valid !== null && valid > at) return { state: 'future', endsAt, revisedLater };
   return { state: 'active', endsAt, revisedLater };
 }
-const atNow = () => (state.at === null ? Date.now() : state.at);
-const asOfNow = () => (state.asOf === null ? Date.now() : state.asOf);
+const atNow = () => (state.at === null ? serverNow() : state.at);
+const asOfNow = () => (state.asOf === null ? serverNow() : state.asOf);
 const timeKey = () => `${state.at}|${state.asOf}`;
 /** Marks rows computed by the server for the current (at, as_of). */
 function tagRows(rows, key) {
@@ -1653,12 +1683,12 @@ function timelinePoints(axis) {
 }
 function setAxis(axis, v) {
   let val = v === undefined ? null : v;
-  if (val !== null && axis === 'asOf' && val >= Date.now()) val = null; // knowledge time cannot be in the future
+  if (val !== null && axis === 'asOf' && val >= serverNow()) val = null; // knowledge time cannot be in the future
   setState({ [axis]: val });
 }
 /** Steps to the previous / next change point of an axis ([ ] for valid time, { } for knowledge time). */
 function stepAxis(axis, dir) {
-  const now = Date.now();
+  const now = serverNow();
   const cur = state[axis] === null ? now : state[axis];
   const stops = timelinePoints(axis).filter((p) => axis === 'at' || p < now);
   const cands = [...stops, now].sort((a, b) => a - b);
@@ -1698,7 +1728,7 @@ function makeTrack(axis) {
     if (!w) return;
     t.w = w;
     t.svg.setAttribute('viewBox', `0 0 ${w} 32`);
-    const now = Date.now();
+    const now = serverNow();
     const pts = timelinePoints(axis);
     const cur = state[axis] === null ? now : state[axis];
     let lo = Math.min(now, cur, pts.length ? pts[0] : now);
@@ -1722,7 +1752,7 @@ function makeTrack(axis) {
   };
   t.sync = () => {
     const v = state[axis];
-    const cur = v === null ? Date.now() : v;
+    const cur = v === null ? serverNow() : v;
     if (t.w) {
       const x = clamp(t.x(cur), PADX, t.w - PADX);
       t.curLine.setAttribute('x1', x);
@@ -1739,7 +1769,7 @@ function makeTrack(axis) {
   const setFromEvent = (ev) => {
     const r = t.svg.getBoundingClientRect();
     const x = clamp(ev.clientX - r.left, PADX, t.w - PADX);
-    const now = Date.now();
+    const now = serverNow();
     // snap to a change point (or now) within 8px
     let best = null;
     let bestD = 8.0001;
@@ -2025,7 +2055,7 @@ const G = {
   OVERLAY_TOP: 44, OVERLAY_BOTTOM: 36, // px of the card covered by the search bar / zoom buttons
   ZOOM_MIN: 0.1, ZOOM_MAX: 4, ZOOM_INIT: 0.8,
   NODE_LABELS_MAX: 150, EDGE_LABELS_MAX: 120, LABEL_ZOOM: 1.2,
-  SYNC_TICKS_ABOVE: 300, SYNC_TICKS: 150,
+  SYNC_TICKS_ABOVE: 300, SYNC_TICKS: 150, SYNC_BUDGET_MS: 120, // the warm-up never holds the first paint longer
 };
 const PILL_FONT = () => `600 9px ${getComputedStyle(document.body).fontFamily}`;
 const SUB_FONT = () => `500 8px ${getComputedStyle(document.body).fontFamily}`;
@@ -2311,7 +2341,15 @@ class GraphView {
       const key = e.s.uuid < e.t.uuid ? `${e.s.uuid}|${e.t.uuid}` : `${e.t.uuid}|${e.s.uuid}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      links.push({ s: e.s, t: e.t });
+      links.push({ s: e.s, t: e.t, key });
+    }
+    // springs that appeared or went away since the last data (time moved, history toggled)
+    const oldKeys = new Set(this.sim.links.map((l) => l.key));
+    const moved = new Set(fresh);
+    for (const l of links) if (!oldKeys.has(l.key)) moved.add(l.s).add(l.t);
+    for (const l of this.sim.links) {
+      if (seen.has(l.key)) continue;
+      for (const n of [l.s, l.t]) if (this.nodes.get(n.uuid) === n) moved.add(n);
     }
     this.sim.set([...this.nodes.values()], links);
     if (first && !this.nodes.size) {
@@ -2319,13 +2357,22 @@ class GraphView {
     } else if (first) {
       this.sim.alpha = 1;
       this.sim.anchored = false;
-      if (this.nodes.size > G.SYNC_TICKS_ABOVE) for (let i = 0; i < G.SYNC_TICKS; i++) this.sim.tick();
-    } else if (fresh.length) {
-      // warm restart: survivors keep x/y/vx/vy and are held near their spot
-      for (const n of this.nodes.values()) {
-        if (fresh.includes(n)) { n.ax = null; n.ay = null; } else { n.ax = n.x; n.ay = n.y; }
+      if (this.nodes.size > G.SYNC_TICKS_ABOVE) {
+        const t0 = performance.now();
+        for (let i = 0; i < G.SYNC_TICKS && performance.now() - t0 < G.SYNC_BUDGET_MS; i++) this.sim.tick();
       }
-      this.sim.anchored = true;
+    } else if (moved.size) {
+      // warm restart: every node keeps x/y/vx/vy. Nodes whose springs changed
+      // (and new ones) move to their partners; the rest are held near their
+      // spot, unless the first layout is still running or they were still
+      // on their way from the previous restart
+      const settling = this.sim.running;
+      const hold = this.sim.anchored || !settling;
+      for (const n of this.nodes.values()) {
+        const free = !hold || moved.has(n) || (settling && n.ax === null);
+        if (free) { n.ax = null; n.ay = null; } else { n.ax = n.x; n.ay = n.y; }
+      }
+      this.sim.anchored = hold;
       this.sim.alpha = Math.max(this.sim.alpha, G.WARM_ALPHA);
     }
     this.applyFocus();
@@ -3845,7 +3892,7 @@ function openAddMemory(groupArg) {
   const counter = h('span', { class: 'help', 'aria-live': 'polite' });
   const name = h('input', { class: 'input', placeholder: S.optional });
   const source = h('select', { class: 'input' }, ['text', 'json', 'markdown'].map((v) => h('option', { value: v }, v)));
-  const when = h('input', { class: 'input', type: 'datetime-local', value: toLocalInput(Date.now()) });
+  const when = h('input', { class: 'input', type: 'datetime-local', value: toLocalInput(serverNow()) });
   let whenTouched = false;
   when.addEventListener('input', () => { whenTouched = true; });
   const bg = h('input', { type: 'checkbox', checked: true });
@@ -3894,6 +3941,7 @@ function openAddMemory(groupArg) {
         toast(S.queued);
         return;
       }
+      noteChangeStamps([...arr(r.facts), ...arr(r.invalidated)]);
       d.setTitle(S.addMemoryTo(g));
       d.setBody(outcomeCard(r));
       const view = r.episode_uuid ? h('button', { class: 'btn', type: 'button', onclick: () => { d.close(); openEpisode(g, r.episode_uuid); } }, S.viewEpisode) : null;
@@ -3916,7 +3964,7 @@ function openEpisode(group, id) {
 function openInvalidate(f, retract) {
   const group = state.group; // the fact's group, even if the view changes behind the dialog
   const reason = h('textarea', { class: 'input', rows: 3, placeholder: S.reasonPh, required: true });
-  const when = retract ? null : h('input', { class: 'input', type: 'datetime-local', value: toLocalInput(Date.now()) });
+  const when = retract ? null : h('input', { class: 'input', type: 'datetime-local', value: toLocalInput(serverNow()) });
   let touched = false;
   if (when) when.addEventListener('input', () => { touched = true; });
   const body = h('div', { class: 'form' },
@@ -3943,6 +3991,7 @@ function openInvalidate(f, retract) {
       d.setBusy(true);
       try {
         const r = await api('POST', `/facts/${encodeURIComponent(f.uuid)}/invalidate`, { body: payload, group, quiet: true });
+        noteChangeStamps([r.fact]);
         if (r.fact && r.fact.uuid && group === state.group) cacheFacts([r.fact]);
         d.close();
         toast(retract ? S.factRetracted : S.factEnded, 'ok');
@@ -4007,13 +4056,14 @@ async function pollJob(id) {
   j.timer = setTimeout(() => pollJob(id), Date.now() - j.added < 10000 ? 1000 : 3000);
 }
 function finishJob(j) {
-  emitData(j.group);
   if (j.status === 'succeeded') {
     const res = j.result || {};
+    noteChangeStamps([...arr(res.facts), ...arr(res.invalidated)]);
     const action = j.episode ? { label: S.view, fn: () => openEpisode(j.group, j.episode) } : null;
     toast(S.processedToast(arr(res.facts).length, arr(res.invalidated).length), 'ok', action);
     setTimeout(() => { jobs.delete(j.id); renderJobs(); }, 6000);
   } else toast(S.jobFailed(j.error), 'error');
+  emitData(j.group);
 }
 function renderJobs() {
   const host = $('#jobs');

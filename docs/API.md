@@ -326,7 +326,7 @@ The nodes and edges of one group at one (`at`, `as_of`) instant, for drawing the
 | `at`       | valid time, default now |
 | `as_of`    | knowledge time, default now |
 | `history`  | `true`: every fact known at `as_of`, each with its state; default: `active` facts only |
-| `isolated` | `true`: also entities known at `as_of` that no returned fact touches |
+| `isolated` | `true`: also entities known at `as_of` that no returned fact touches, most recently learned first, only while the node count stays within `limit` |
 | `limit`    | maximum edges, 1-2000, default 500; beyond it `active` facts are kept first, then the most recently learned |
 
 ```json
@@ -354,6 +354,7 @@ The nodes and edges of one group at one (`at`, `as_of`) instant, for drawing the
   sampled beyond that).
 - `counts`: `entities`/`facts` for the whole group, `nodes`/`edges` returned,
   `hidden_edges = facts - edges`.
+- `truncated`: `limit` left out edges, or isolated entities (with `isolated=true`).
 
 ### GET /v1/groups
 
