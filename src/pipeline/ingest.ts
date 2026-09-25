@@ -529,14 +529,23 @@ function earliest(a: Date | undefined, b: Date | undefined): Date | undefined {
 }
 
 /**
- * Which existing facts does the provider say are ended? Accepts the index
- * list of the current contract and the boolean of the old one (true = all).
+ * Which existing facts does the provider say are ended, and which does it say
+ * the candidate only restates? Accepts a verdict ({ended, same}), the index
+ * list of the earlier contract and the boolean of the old one (true = all).
+ * `same` is undefined when the provider did not tell restatements apart.
  */
-function pickContradicted<T>(answer: unknown, existing: T[]): T[] {
-  if (answer === true) return existing;
-  if (!Array.isArray(answer)) return [];
+function readVerdict<T>(answer: unknown, existing: T[]): { ended: T[]; same?: T[] } {
+  if (answer && typeof answer === 'object' && !Array.isArray(answer)) {
+    const v = answer as { ended?: unknown; same?: unknown };
+    return { ended: pickIndexes(v.ended, existing), ...(Array.isArray(v.same) ? { same: pickIndexes(v.same, existing) } : {}) };
+  }
+  return { ended: answer === true ? existing : pickIndexes(answer, existing) };
+}
+
+function pickIndexes<T>(indexes: unknown, existing: T[]): T[] {
+  if (!Array.isArray(indexes)) return [];
   const picked = new Set<T>();
-  for (const i of answer) {
+  for (const i of indexes) {
     if (Number.isInteger(i) && i >= 0 && i < existing.length) picked.add(existing[i as number]);
   }
   return [...picked];
@@ -902,12 +911,16 @@ class EpisodeRun {
     //    several datasets, uses several tools). A statement with an unknown
     //    start cannot end anything.
     let ended: EntityEdge[] = [];
+    // the records shown to the judge, and the ones it said this statement only
+    // restates (undefined when it was not asked or did not tell them apart)
+    let shown: EntityEdge[] = [];
+    let restates: EntityEdge[] | undefined;
     if (validAt) {
       const flagged = plan.cand.replacesPrevious === true;
       const oneValue = flagged || SINGLE_VALUED.has(relation);
       const exclusive = (f: EntityEdge) =>
         oneValue || (f.attributes?.replacesPrevious === true && !!f.validAt && f.validAt > validAt);
-      const candidates = pool.filter(
+      shown = pool.filter(
         (f) =>
           !this.created.has(f) &&
           !isRetracted(f) &&
@@ -915,21 +928,27 @@ class EpisodeRun {
           (isLive(f, this.now) || covers(f, validAt)) &&
           (connects(f, src, tgt) || (sameSlot(f) && f.targetNodeUuid !== tgt.uuid && exclusive(f))),
       );
-      if (candidates.length > 0) {
+      if (shown.length > 0) {
         const answer: unknown = await this.llm.detectContradiction(
           { sourceName: src.name, targetName: tgt.name, fact: text, relation, validAt, replacesPrevious: flagged },
-          candidates.map((f) => ({ fact: f.fact, validAt: f.validAt, invalidAt: f.invalidAt })),
+          shown.map((f) => ({ fact: f.fact, validAt: f.validAt, invalidAt: f.invalidAt })),
         );
-        ended = pickContradicted(answer, candidates);
+        ({ ended, same: restates } = readVerdict(answer, shown));
       }
     }
 
     // a record of this relationship that the statement does not end is the
     // same relationship described differently: it gains the evidence (and an
     // end the text states) instead of a second edge. For a record that has
-    // ended, a new open edge would bring the relation back.
-    const same = restated.find((f) => !ended.includes(f));
+    // ended, a new open edge would bring the relation back. When the judge
+    // told restatements apart, a record it saw and did not call one holds
+    // alongside this statement (another job evaluated on the same dataset):
+    // the statement becomes a fact of its own, within that record's known end.
+    const kept = restated.filter((f) => !ended.includes(f));
+    const alongside = restates ? kept.filter((f) => shown.includes(f) && !restates.includes(f)) : [];
+    const same = kept.find((f) => !alongside.includes(f));
     if (same) return this.reinforce(same, invalidAt, text);
+    for (const f of alongside) end = earliest(end, f.invalidAt);
 
     // (`ended` is only filled when validAt is known)
     for (const old of ended) {

@@ -1,6 +1,7 @@
 import type {
   ContradictionCandidate,
   ContradictionExisting,
+  ContradictionVerdict,
   Embedder,
   ExtractedFact,
   ExtractedInvalidation,
@@ -135,7 +136,8 @@ Output:
 const CONTRADICTION_SYSTEM = `You maintain a temporal knowledge graph. You get one NEW fact and a numbered
 list of EXISTING facts, and decide which existing facts stop being true once the new fact holds.
 An existing fact is ended ONLY when it and the new fact cannot both be true at the same time: another
-employer, title, manager, home, owner, status or value for a thing that has one at a time; a reversal.
+employer, title, manager, home, owner, status or value for a thing that has one at a time (a new
+version, port, address or status of the same thing ends the old one); a reversal.
 These are NOT contradictions, the existing fact stays true:
 - a restatement, elaboration or confirmation of the same relationship ("still valid", "remains",
   "confirmed", more detail about it);
@@ -143,18 +145,27 @@ These are NOT contradictions, the existing fact stays true:
   several tools, member of several teams, runs several jobs; working at a company and owning shares in
   it; a role and a team membership);
 - a statement that something does not replace, is separate from, or is in addition to another;
-- a fact about a different scope (another dataset, version or run) or a period that does not overlap.
+- a result for another dataset, split or experiment run.
 When unsure, the existing fact is not ended.
+"same" lists the existing facts that the new fact only restates, confirms or adds detail to: the same
+relationship, not a separate one that holds alongside it (another job, run or result between the same
+two things is separate).
 Examples:
 - NEW "Model M was also evaluated on benchmark B2"; EXISTING 1. "Model M was evaluated on benchmark B1"
-  -> {"contradicts": false, "which": []}
+  -> {"contradicts": false, "which": [], "same": []}
+- NEW "Job 12 evaluated model M on benchmark B1"; EXISTING 1. "Job 11 evaluated model M on benchmark B1"
+  -> {"contradicts": false, "which": [], "same": []}
 - NEW "The Q3 test result of service S still stands"; EXISTING 1. "Service S passed the Q3 test"
-  -> {"contradicts": false, "which": []}
-- NEW "Dana moved from Initech to Globex"; EXISTING 1. "Dana works at Initech" -> {"contradicts": true, "which": [1]}
-Dates in parentheses are when each fact started. The new fact may be OLDER than an existing one (a
-document added late): still list every existing fact it cannot hold together with; the order in time is
-taken from the dates.
-Return ONLY JSON: {"contradicts": true|false, "which": [numbers of the ended facts from the list]}`;
+  -> {"contradicts": false, "which": [], "same": [1]}
+- NEW "Service S on host H was upgraded to version 2.1"; EXISTING 1. "Service S version 2.0 runs on host H"
+  -> {"contradicts": true, "which": [1], "same": []}
+- NEW "Dana moved from Initech to Globex"; EXISTING 1. "Dana works at Initech"
+  -> {"contradicts": true, "which": [1], "same": []}
+Dates in parentheses are when each fact started. The system handles the order in time: decide as if both
+facts held at the same moment. The new fact may be OLDER than an existing one (a document added late):
+still list every existing fact it cannot hold together with.
+Return ONLY JSON: {"contradicts": true|false, "which": [numbers of the ended facts from the list],
+"same": [numbers of the facts it only restates]}`;
 
 export class OpenAICompatLLM implements LLMProvider {
   private readonly timeZone: string;
@@ -333,8 +344,8 @@ export class OpenAICompatLLM implements LLMProvider {
   async detectContradiction(
     candidate: ContradictionCandidate,
     existing: ContradictionExisting[],
-  ): Promise<number[]> {
-    if (existing.length === 0) return [];
+  ): Promise<ContradictionVerdict> {
+    if (existing.length === 0) return { ended: [], same: [] };
     const list = existing.map((e, i) => `${i + 1}. ${e.fact}${since(e.validAt, this.timeZone)}`).join('\n');
     const raw = await this.chat(
       CONTRADICTION_SYSTEM,
@@ -342,7 +353,9 @@ export class OpenAICompatLLM implements LLMProvider {
         `${candidate.fact}${since(candidate.validAt, this.timeZone)}\n\nExisting facts:\n${list}`,
       this.cfg.maxTokens ?? 8000,
     );
-    return parseContradiction(parseJsonObject(raw), existing.length);
+    const parsed = parseJsonObject(raw);
+    const same = parseSame(parsed, existing.length);
+    return { ended: parseContradiction(parsed, existing.length), ...(same ? { same } : {}) };
   }
 }
 
@@ -359,16 +372,29 @@ export function parseContradiction(parsed: unknown, count: number): number[] {
   if (p.which === undefined || p.which === null) {
     return p.contradicts === true ? Array.from({ length: count }, (_, i) => i) : [];
   }
-  const listed = Array.isArray(p.which) ? p.which : [p.which];
-  const which = [...new Set(listed.map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= count))].map(
-    (n) => n - 1,
-  );
+  const which = zeroBased(p.which, count);
   if (which.length === 0 && p.contradicts === true) {
     console.error(
       `[minizep] contradiction answer names no fact of 1..${count} (which=${JSON.stringify(p.which).slice(0, 80)}); closing none`,
     );
   }
   return which;
+}
+
+/**
+ * "same": the facts the new one only restates, 1-based like "which". Undefined
+ * when the reply has no such list: the pipeline then takes every fact of the
+ * same pair and relation that is not ended as restated, as before.
+ */
+function parseSame(parsed: unknown, count: number): number[] | undefined {
+  const same = ((parsed ?? {}) as { same?: unknown }).same;
+  return same === undefined || same === null ? undefined : zeroBased(same, count);
+}
+
+/** 1-based numbers (or numeric strings, or one bare number) within 1..count -> distinct 0-based indexes. */
+function zeroBased(listed: unknown, count: number): number[] {
+  const all = Array.isArray(listed) ? listed : [listed];
+  return [...new Set(all.map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= count))].map((n) => n - 1);
 }
 
 /** The user message of an extraction call. */

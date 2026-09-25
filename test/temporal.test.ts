@@ -424,10 +424,40 @@ test('temporal: paraphrases between the same endpoints reinforce one edge (embed
   assert.equal((await zep.store.getFacts('g')).length, 1);
 });
 
+test('temporal: a statement the judge says holds alongside a fact of the same pair and relation is a fact of its own; a restatement is evidence', async () => {
+  const pair = [entity('model M', ['Product']), entity('benchmark B1', ['Concept'])];
+  const run = (text: string) => scenario(pair, [says('model M', 'benchmark B1', 'EVALUATED_ON', text)]);
+  const { zep, llm } = scripted(
+    {
+      'job 11': run('Job 11 evaluated model M on benchmark B1 with a score of 0.71'),
+      'job 12': run('Job 12 evaluated model M on benchmark B1 with a score of 0.74; it does not replace job 11'),
+      'job 11 again': run('The job 11 score of 0.71 for model M on benchmark B1 still stands'),
+    },
+    // nothing ends; only the confirmation restates a fact, job 11's
+    (cand, existing) => ({
+      ended: [],
+      same: cand.fact.startsWith('The job 11') ? existing.flatMap((e, i) => (e.fact.startsWith('Job 11') ? [i] : [])) : [],
+    }),
+  );
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'job 11', validAt: d('2026-01-01') });
+  const twelve = await zep.ingest.addEpisode({ groupId: 'g', content: 'job 12', validAt: d('2026-02-01') });
+  assert.deepEqual([twelve.facts.length, twelve.reinforced.length, twelve.invalidated.length], [1, 0, 0], 'not folded into job 11');
+
+  const again = await zep.ingest.addEpisode({ groupId: 'g', content: 'job 11 again', validAt: d('2026-03-01') });
+  assert.equal(llm.contradictionCalls.at(-1)!.existing.length, 2);
+  assert.deepEqual([again.facts.length, again.reinforced.map((f) => f.fact)], [0, ['Job 11 evaluated model M on benchmark B1 with a score of 0.71']]);
+  const now = (await zep.factsAt(new Date(), 'g')).map((r) => r.fact.fact).sort();
+  assert.deepEqual(now, [
+    'Job 11 evaluated model M on benchmark B1 with a score of 0.71',
+    'Job 12 evaluated model M on benchmark B1 with a score of 0.74; it does not replace job 11',
+  ]);
+});
+
 test('temporal: regression R1 — a backfilled document worded differently does not resurrect the relation either', async () => {
   const people = [entity('Bob'), entity('Initech', ['Organization'])];
-  // whether the model says the new wording ends the old one or not, Bob is not at Initech today
-  for (const contradicts of [false, true]) {
+  // whether the model says the new wording ends the old one, restates it or holds alongside it, Bob
+  // is not at Initech today
+  for (const contradicts of [false, true, 'alongside'] as const) {
     const { zep, llm } = scripted(
       {
         'Bob works at Initech': scenario(people, [says('Bob', 'Initech', 'WORKS_AT', 'Bob works at Initech')]),
@@ -435,7 +465,7 @@ test('temporal: regression R1 — a backfilled document worded differently does 
         // the prompt asks for detailed sentences, so a later mention rarely repeats the words
         'Bob is a senior developer at Initech': scenario(people, [says('Bob', 'Initech', 'WORKS_AT', 'Bob is a senior developer at Initech')]),
       },
-      contradicts,
+      contradicts === 'alongside' ? () => ({ ended: [], same: [] }) : contradicts,
     );
     await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob works at Initech', validAt: d('2024-01-15') });
     await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob left Initech in Feb 2025', validAt: d('2025-03-01') });
@@ -443,9 +473,15 @@ test('temporal: regression R1 — a backfilled document worded differently does 
 
     assert.deepEqual(llm.contradictionCalls.map((c) => c.existing.map((e) => e.fact)), [['Bob works at Initech']], 'the ended record is checked');
     assert.equal((await zep.factsAt(new Date(), 'g')).length, 0, `Bob is not at Initech today (contradicts: ${contradicts})`);
-    assert.equal((await zep.factsAt(d('2024-09-01'), 'g')).length, 1, 'he was in 2024');
+    assert.equal((await zep.factsAt(d('2024-09-01'), 'g')).length, contradicts === 'alongside' ? 2 : 1, 'he was in 2024');
     const windows = (await zep.store.getFacts('g')).map((f) => [f.fact, f.validAt?.toISOString().slice(0, 10), f.invalidAt?.toISOString().slice(0, 10)]);
-    if (contradicts) {
+    if (contradicts === 'alongside') {
+      // a fact of its own next to the old one, within the old one's known end
+      assert.deepEqual(windows, [
+        ['Bob works at Initech', '2024-01-15', '2025-02-01'],
+        ['Bob is a senior developer at Initech', '2024-06-01', '2025-02-01'],
+      ]);
+    } else if (contradicts) {
       // the new wording took over from the old one, within its known end
       assert.deepEqual(windows, [
         ['Bob works at Initech', '2024-01-15', '2024-06-01'],

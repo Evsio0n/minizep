@@ -103,6 +103,18 @@ export interface ContradictionExisting {
   invalidAt?: Date;
 }
 
+/** What the candidate does to the existing facts, as 0-based indexes into `existing`. */
+export interface ContradictionVerdict {
+  /** the facts it ends */
+  ended: number[];
+  /**
+   * The facts it only restates, confirms or adds detail to (the same
+   * relationship). Absent: not told apart, and every fact between the same
+   * pair and relation that is not ended counts as restated.
+   */
+  same?: number[];
+}
+
 export interface LLMProvider {
   extract(
     content: string,
@@ -111,18 +123,22 @@ export interface LLMProvider {
     options?: ExtractOptions,
   ): Promise<ExtractionResult>;
   /**
-   * Which existing facts does the candidate end? Returns their 0-based indexes
-   * into `existing` (empty: none). `existing` holds the active facts between
-   * the same pair; facts with the same source and relation but another target
-   * only when that relation holds one target at a time, or when such a fact
-   * began after the candidate (a document added late). Providers written
-   * against the old boolean contract are still accepted by the pipeline:
-   * `true` means "all of them".
+   * Which existing facts does the candidate end? Returns a verdict, or just
+   * the 0-based indexes of the ended facts into `existing` (empty: none).
+   * `existing` holds the active facts between the same pair; facts with the
+   * same source and relation but another target only when that relation holds
+   * one target at a time, or when such a fact began after the candidate (a
+   * document added late). An existing fact of the candidate's own relation
+   * and pair that it does not end is taken as restated (it gains the evidence)
+   * unless a verdict's `same` leaves it out: then the candidate holds
+   * alongside it as a fact of its own. Providers written against the old
+   * boolean contract are still accepted by the pipeline: `true` means "all of
+   * them".
    */
   detectContradiction(
     candidate: ContradictionCandidate,
     existing: ContradictionExisting[],
-  ): Promise<number[]>;
+  ): Promise<number[] | ContradictionVerdict>;
 }
 
 export interface Embedder {
