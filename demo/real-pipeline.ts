@@ -16,10 +16,13 @@ import {
 const llmCfg = await loadLLMConfig(); // deepseek from ~/.openclaw/openclaw.json
 console.log(`LLM: ${llmCfg.model} @ ${llmCfg.baseUrl}`);
 
-const embedder = new FallbackEmbedder([
-  new OpenAIEmbedder((process.env.MINIZEP_EMBED_URL ?? 'http://127.0.0.1:11435'), 'qwen3-embed'), // llama.cpp on V100
-  new OllamaEmbedder(),
-]);
+const embedder = new FallbackEmbedder(
+  [
+    new OpenAIEmbedder((process.env.MINIZEP_EMBED_URL ?? 'http://127.0.0.1:11435'), 'qwen3-embed'), // llama.cpp on V100
+    new OllamaEmbedder(),
+  ],
+  { allowHash: true }, // a demo may degrade to hash vectors; servers never do
+);
 
 const zep = new Minizep({ llm: new OpenAICompatLLM(llmCfg), embedder });
 
@@ -41,7 +44,7 @@ await zep.ingest.addEpisode({
 });
 console.log(`  took ${((performance.now() - t0) / 1000).toFixed(1)}s`);
 
-const show = (rows: ReturnType<typeof zep.factsAbout>, title: string) => {
+const show = (rows: Awaited<ReturnType<typeof zep.factsAbout>>, title: string) => {
   console.log(`\n--- ${title} ---`);
   for (const r of rows) {
     const f = r.fact;
