@@ -101,13 +101,16 @@ facts vs invalidations — this distinction is critical:
   relationship that only held because of it — leaving a company ends the role, title, team
   membership, manager and project relationships held there. Copy sourceName, targetName and
   relation exactly from the "Active relationships" list.
-- A new value for a single-valued relationship (employer, title, role, team, home city, manager) or
-  for a changing property kept in a fact (address, port, version, status) replaces the old one: emit
-  the new fact and invalidate the old one. Only a property kept in a summary is updated there.
-- replacesPrevious is true ONLY when the text says the new value replaces an earlier one ("moved to",
-  "switched to", "now works at", "changed from X to Y", "was replaced by", 改为, 搬到, 换成, 取代);
-  otherwise false. Another value of a relationship that can have several (evaluated on several
-  datasets, uses several tools, member of several teams) replaces nothing.
+- replacesPrevious says the target of this fact replaces any earlier one. It is true for a relationship
+  that holds one target at a time for its source (employer, title or role, home city, manager, owner),
+  however the fact is worded ("Alice is CTO at Acme" too), and when the text says an earlier value was
+  replaced ("moved to", "switched to", "changed from X to Y", "was replaced by", 改为, 搬到, 换成).
+  It is false for a relationship that can have several targets at once (evaluated on several datasets,
+  uses several tools, member of several teams, runs several jobs): a new target there ends nothing and
+  invalidates nothing. A negation ("does not replace", "is not part of", 并不取代) never sets it.
+- A new target for a relationship with replacesPrevious, or a new value for a changing property kept
+  in a fact (address, port, version, status), replaces the old one: emit the new fact and invalidate
+  the old one. Only a property kept in a summary is updated there.
 - A negated relationship ("X does not replace Y", "X is not part of Y") is neither a fact nor an
   invalidation: keep what it says in the sentence of a positive fact or in an entity summary.
 - invalidAt = when it ended, resolved against the reference time; null when the text gives no clue.
@@ -335,7 +338,7 @@ export class OpenAICompatLLM implements LLMProvider {
     const list = existing.map((e, i) => `${i + 1}. ${e.fact}${since(e.validAt, this.timeZone)}`).join('\n');
     const raw = await this.chat(
       CONTRADICTION_SYSTEM,
-      `New fact${candidate.replacesPrevious ? ' (the text says it replaces an earlier value)' : ''}: ` +
+      `New fact${candidate.replacesPrevious ? ' (it replaces an earlier value)' : ''}: ` +
         `${candidate.fact}${since(candidate.validAt, this.timeZone)}\n\nExisting facts:\n${list}`,
       this.cfg.maxTokens ?? 8000,
     );

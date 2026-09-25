@@ -264,9 +264,10 @@ llama-server -m qwen3-embed-q8.gguf --embedding --pooling last -ngl 99 --port 11
 2. **实体消歧有限** —— 名称相同（大小写无关）才合并，`Alice` 和 `Alice Chen` 仍是两个实体（查询侧 `findEntities` 会按前缀/子串/名称向量给出候选），没有 Graphiti 那样的 LLM dedup。
 3. **快照体积** —— 向量直接存进 JSON，1024 维 × 每条实体/事实。1000 条量级约数十 MB，量大时应把向量拆到独立的二进制/向量库。
 4. **矛盾检测依赖 LLM** —— 抽取给出的 `invalidations` 是主路径，`detectContradiction` 只对同一对实体之间的事实兜底判断；
-   同源同关系、换了目标的事实只有在抽取标明新值取代旧值（`replacesPrevious`：“搬到”“改为”“now works at”）时才参与判断，
+   同源同关系、换了目标的事实只在一次只有一个值的关系上参与判断：`WORKS_AT`/`HAS_ROLE`/`HAS_TITLE`/`LIVES_IN`/`REPORTS_TO`，
+   以及抽取标了 `replacesPrevious` 的事实（雇主、职位、住址、上级、归属这类关系，或文本说新值取代了旧值），
    因为多数关系可以同时有多个值（在多个数据集上评测、用多个工具）。判断要求两者不能同时成立，确认、补充、“不取代”都不算；
-   漏判时旧事实不会被关闭，误判时用 `reopen_fact` 撤销。
+   漏判时旧事实不会被关闭，误判时用 `reopen_fact` 撤销（结束时间还在将来的也可以）。
 5. **无 community 层** —— 没有 Graphiti 的 L2 社区聚类与增量摘要。
 6. **单实例、单写入进程** —— MCP 会话在进程内存里，服务重启后客户端要重新初始化会话，也不能多个实例分担同一批会话。
    每个数据库只能有一个写入进程：启动时会接管所有 `pending` 的 episode，另一个进程若正在处理其中一条，会被重复抽取。

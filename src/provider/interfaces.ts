@@ -20,10 +20,13 @@ export interface ExtractedFact {
   /** when the fact stopped being true, if the text says so */
   invalidAt?: Date;
   /**
-   * The text says this value replaces an earlier one ("moved to", "now works
-   * at", "changed from X to Y"). Only then are the facts with the same source
-   * and relation but another target checked for contradiction; most relations
-   * can hold several values at once. Absent means false.
+   * This target replaces the earlier one: the relationship holds one target
+   * at a time for its source (employer, title or role, home, manager, owner),
+   * or the text says the value was replaced ("moved to", "changed from X to
+   * Y"). Only for such a fact, and for the relations the pipeline knows hold
+   * one target at a time (WORKS_AT, HAS_ROLE, ...), are the facts with the same
+   * source and relation but another target checked for contradiction; most
+   * relations can hold several values at once. Absent means false.
    */
   replacesPrevious?: boolean;
 }
@@ -89,7 +92,7 @@ export interface ContradictionCandidate {
   fact: string;
   relation?: string;
   validAt?: Date;
-  /** the text says it replaces an earlier value (see ExtractedFact) */
+  /** the extraction says it replaces an earlier target (see ExtractedFact) */
   replacesPrevious?: boolean;
 }
 
@@ -111,10 +114,10 @@ export interface LLMProvider {
    * Which existing facts does the candidate end? Returns their 0-based indexes
    * into `existing` (empty: none). `existing` holds the active facts between
    * the same pair; facts with the same source and relation but another target
-   * only when the candidate replaces an earlier value, or when such a fact
-   * replaced an earlier value after the candidate began (a document added
-   * late). Providers written against the old boolean contract are still
-   * accepted by the pipeline: `true` means "all of them".
+   * only when that relation holds one target at a time, or when such a fact
+   * began after the candidate (a document added late). Providers written
+   * against the old boolean contract are still accepted by the pipeline:
+   * `true` means "all of them".
    */
   detectContradiction(
     candidate: ContradictionCandidate,

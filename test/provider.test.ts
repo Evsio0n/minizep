@@ -91,9 +91,14 @@ test('provider: the extraction prompt carries the reference time, known summarie
       assert.match(system, /UPDATED\s+summary/);
       // a changed property of one entity replaces its value in the summary, it is not a fact
       assert.match(system, /A summary states current values/);
-      assert.match(system, /for a changing property kept in a fact \(address, port, version, status\) replaces the old one/);
-      // only an explicit replacement lets the pipeline end another value of the same relation
-      assert.match(system, /replacesPrevious is true ONLY when the text says the new value replaces an earlier one/);
+      assert.match(system, /a new value for a changing property kept\s+in a fact \(address, port, version, status\), replaces the old one/);
+      // one list of the relationships with one target at a time (a team is not one): they, and an
+      // explicit replacement, let the pipeline end another target of the same relation
+      assert.match(system, /replacesPrevious says the target of this fact replaces any earlier one/);
+      assert.match(system, /one target at a time for its source \(employer, title or role, home city, manager, owner\),\s+however the fact is worded/);
+      assert.equal(system.match(/employer, title/g)?.length, 1, 'one list');
+      assert.match(system, /member of several teams, runs several jobs\): a new target there ends nothing/);
+      assert.match(system, /A negation \("does not replace", "is not part of", 并不取代\) never sets it/);
       assert.match(system, /A negated relationship \("X does not replace Y", "X is not part of Y"\) is neither a fact nor an\s+invalidation/);
     },
   );
@@ -127,7 +132,7 @@ test('provider: start dates are shown as calendar days of the configured zone, l
         { fact: 'Alice works at Acme', validAt: start },
       ]);
       assert.equal(userOf(requests[0]).match(/\(since 2026-03-01\)/g)?.length, 2);
-      assert.match(userOf(requests[0]), /^New fact \(the text says it replaces an earlier value\): Alice joined Globex/);
+      assert.match(userOf(requests[0]), /^New fact \(it replaces an earlier value\): Alice joined Globex/);
     },
   );
 });

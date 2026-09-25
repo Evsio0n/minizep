@@ -449,6 +449,14 @@ function normaliseRelation(relation: string | undefined): string {
 
 const sameRelation = (f: EntityEdge, relation: string) => normaliseRelation(f.name) === relation;
 
+/**
+ * Relations that hold one target at a time for their source (employer, title,
+ * home, manager): a new target is checked against the old one whether or not
+ * the extraction marked it with replacesPrevious, so a backfilled or plainly
+ * worded value ("Alice is CTO at Acme") cannot leave two current values.
+ */
+const SINGLE_VALUED = new Set(['WORKS_AT', 'HAS_ROLE', 'HAS_TITLE', 'LIVES_IN', 'REPORTS_TO']);
+
 function validDate(d: unknown): Date | undefined {
   return d instanceof Date && !Number.isNaN(d.getTime()) ? d : undefined;
 }
@@ -886,17 +894,19 @@ class EpisodeRun {
     // b. contradictions: the facts between the same pair that are live now or
     //    held at validAt (a backfilled statement can replace a value that has
     //    since ended). The facts in the same slot with another target are
-    //    candidates only when the text says this value replaces an earlier one
-    //    (a new employer, home or title changes target, not endpoints), or
-    //    when such a fact replaced an earlier value after this statement's
-    //    start (a document added late): most relations hold several values at
-    //    once (evaluated on several datasets, uses several tools). A statement
-    //    with an unknown start cannot end anything.
+    //    candidates only for a relation that holds one target at a time (a new
+    //    employer, home or title changes target, not endpoints): one of
+    //    SINGLE_VALUED, one the extraction marked with replacesPrevious, or
+    //    one where such a fact began after this statement's start (a document
+    //    added late). Most relations hold several values at once (evaluated on
+    //    several datasets, uses several tools). A statement with an unknown
+    //    start cannot end anything.
     let ended: EntityEdge[] = [];
     if (validAt) {
-      const replaces = plan.cand.replacesPrevious === true;
+      const flagged = plan.cand.replacesPrevious === true;
+      const oneValue = flagged || SINGLE_VALUED.has(relation);
       const exclusive = (f: EntityEdge) =>
-        replaces || (f.attributes?.replacesPrevious === true && !!f.validAt && f.validAt > validAt);
+        oneValue || (f.attributes?.replacesPrevious === true && !!f.validAt && f.validAt > validAt);
       const candidates = pool.filter(
         (f) =>
           !this.created.has(f) &&
@@ -907,7 +917,7 @@ class EpisodeRun {
       );
       if (candidates.length > 0) {
         const answer: unknown = await this.llm.detectContradiction(
-          { sourceName: src.name, targetName: tgt.name, fact: text, relation, validAt, replacesPrevious: replaces },
+          { sourceName: src.name, targetName: tgt.name, fact: text, relation, validAt, replacesPrevious: flagged },
           candidates.map((f) => ({ fact: f.fact, validAt: f.validAt, invalidAt: f.invalidAt })),
         );
         ended = pickContradicted(answer, candidates);

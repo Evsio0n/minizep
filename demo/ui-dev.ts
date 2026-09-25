@@ -60,12 +60,11 @@ const SCRIPTS = new Map<string, Script>([
     },
   ],
   [
-    // a job change: the new employer replaces the old one, so the scripted
-    // contradiction check sees Bob's Initech fact and ends it
+    // a job change: the scripted contradiction check ends Bob's Initech fact
     'Bob joined Globex.',
     {
       entities: [person('Bob', 'Engineer, now at Globex.'), org('Globex', 'A logistics company.')],
-      facts: [{ sourceName: 'Bob', targetName: 'Globex', relation: 'WORKS_AT', fact: 'Bob joined Globex', replacesPrevious: true }],
+      facts: [{ sourceName: 'Bob', targetName: 'Globex', relation: 'WORKS_AT', fact: 'Bob joined Globex' }],
     },
   ],
   [
