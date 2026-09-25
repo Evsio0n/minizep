@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Minizep, FallbackEmbedder } from '../src/index.js';
-import { IngestPipeline, mentions } from '../src/pipeline/ingest.js';
+import { IngestPipeline, InvalidationError, mentions } from '../src/pipeline/ingest.js';
 import { MemoryGraphStore } from '../src/store/memory-store.js';
 import { contentHash } from '../src/util/hash.js';
 import { HashEmbedder } from '../src/provider/interfaces.js';
@@ -663,4 +663,44 @@ test('ingest: Latin names match whole words only', () => {
   assert.equal(mentions('malice inc', 'alice'), false);
   assert.equal(mentions('alice2 called', 'alice'), false, 'digits continue a word');
   assert.equal(mentions('阿里巴巴的张三', '张三'), true, 'CJK names match anywhere');
+});
+
+test('ingest: a fact can be ended or retracted by hand, only within its own group', async () => {
+  const llm = new ScriptedLLM(() =>
+    scenario([entity('Alice'), entity('Acme', ['Organization'])], [fact('Alice', 'Acme', 'WORKS_AT')]),
+  );
+  const zep = new Minizep({ llm, embedder: deterministicEmbedder() });
+  const r = await zep.ingest.addEpisode({ groupId: 'g', content: 'alice works at acme', validAt: new Date('2024-01-01') });
+  const f = r.facts[0];
+
+  await assert.rejects(
+    zep.ingest.invalidateFact(f.uuid, { groupId: 'other', reason: 'x' }),
+    (err: InvalidationError) => err.code === 'not_found',
+  );
+  await assert.rejects(
+    zep.ingest.invalidateFact(f.uuid, { groupId: 'g', reason: 'x', at: new Date('2023-06-01') }),
+    (err: InvalidationError) => err.code === 'conflict' && /cannot end at or before/.test(err.message),
+  );
+
+  const ended = await zep.ingest.invalidateFact(f.uuid, { groupId: 'g', reason: 'left', at: new Date('2024-05-01') });
+  assert.deepEqual(ended.invalidAt, new Date('2024-05-01'));
+  assert.equal(ended.attributes.invalidatedBy, 'left');
+  assert.ok(ended.expiredAt, 'the correction is dated in knowledge time');
+  assert.equal((await zep.factsAt(new Date('2024-03-01'), 'g')).length, 1);
+  assert.equal((await zep.factsAt(new Date('2024-06-01'), 'g')).length, 0);
+
+  // a fact whose start is unknown is retracted without a valid-time end
+  const undated = { ...f, uuid: crypto.randomUUID(), validAt: undefined, invalidAt: undefined, expiredAt: undefined };
+  await zep.store.addFact(undated);
+  const learned = new Date();
+  await new Promise((res) => setTimeout(res, 2));
+  const retracted = await zep.ingest.invalidateFact(undated.uuid, { groupId: 'g', reason: 'never true', retract: true });
+  assert.equal(retracted.invalidAt, undefined);
+  assert.equal(retracted.attributes.retracted, true);
+  assert.equal((await zep.factsAt(new Date('2024-03-01'), 'g')).length, 1, 'only the dated fact, the retracted one never');
+  assert.equal((await zep.factsAt(new Date('2024-03-01'), 'g', { asOf: learned })).length, 2, 'as believed before');
+  await assert.rejects(
+    zep.ingest.invalidateFact(undated.uuid, { groupId: 'g', reason: 'again', retract: true }),
+    /already retracted/,
+  );
 });

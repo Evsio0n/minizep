@@ -55,6 +55,28 @@ export interface EpisodeInput {
   idempotencyKey?: string;
 }
 
+/** What a manual invalidation should do to a fact. */
+export interface InvalidateFactInput {
+  /** the fact must belong to this group (otherwise it is reported as not found) */
+  groupId: string;
+  /** real-world instant the fact stopped being true (default now); ignored when retracting */
+  at?: Date;
+  /** why, kept on the fact for auditing */
+  reason: string;
+  /** the fact was never true: empty its window instead of ending it */
+  retract?: boolean;
+}
+
+/** A manual invalidation that cannot be applied, with why. */
+export class InvalidationError extends Error {
+  constructor(
+    message: string,
+    readonly code: 'not_found' | 'conflict',
+  ) {
+    super(message);
+  }
+}
+
 export interface IngestOptions {
   /**
    * Skip an episode already processed in the same group (default true).
@@ -168,6 +190,47 @@ export class IngestPipeline {
     return (await this.store.getEpisodes(groupId))
       .filter((e) => e.status === 'pending')
       .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  }
+
+  /**
+   * Close a fact by hand (an operator or agent correcting the graph), under
+   * the group's lock so a concurrent episode cannot write back a stale copy.
+   *
+   * Ending sets invalidAt to `at`, which must fall inside the fact's window.
+   * Retracting empties the window (invalidAt = validAt, or no valid-time end
+   * at all when the start is unknown): the fact was never true. Either way
+   * expiredAt records when the system learned it, so as_of queries still show
+   * what was believed before.
+   */
+  async invalidateFact(factUuid: string, input: InvalidateFactInput): Promise<EntityEdge> {
+    return this.locks.run(input.groupId, async () => {
+      const found = await this.store.getFact(factUuid);
+      if (!found || found.groupId !== input.groupId) throw new InvalidationError('fact not found', 'not_found');
+      if (isRetracted(found)) throw new InvalidationError('fact is already retracted', 'conflict');
+      const f: EntityEdge = { ...found, attributes: { ...found.attributes } };
+      const now = new Date();
+
+      if (input.retract) {
+        f.invalidAt = f.validAt;
+        f.attributes.retracted = true;
+      } else {
+        const at = input.at ?? now;
+        if (f.invalidAt && f.invalidAt <= at) {
+          throw new InvalidationError(`fact already ended at ${f.invalidAt.toISOString()}`, 'conflict');
+        }
+        if (f.validAt && at <= f.validAt) {
+          throw new InvalidationError(
+            `fact started at ${f.validAt.toISOString()}, it cannot end at or before that (retract it instead)`,
+            'conflict',
+          );
+        }
+        f.invalidAt = at;
+      }
+      f.expiredAt = now;
+      f.attributes.invalidatedBy = input.reason.slice(0, 120);
+      await this.store.updateFact(f);
+      return f;
+    });
   }
 
   /** Only ever executed while holding the group's lock. */

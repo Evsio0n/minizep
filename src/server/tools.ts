@@ -1,41 +1,126 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import type { Minizep } from '../index.js';
-import type { FilePersistence } from '../store/persistence.js';
-import type { EntityEdge, EntityNode, FactWithContext } from '../model/types.js';
-import type { JobQueue } from '../jobs/queue.js';
+import type { Principal } from './auth.js';
+import { shapes, type AddMemoryOutcome, type FactRow, type JobRow, type MemoryService } from './service.js';
 
-/** Everything the tool handlers need, injected so transports can differ. */
+/** How the server introduces itself to MCP clients (stdio and HTTP). */
+export const SERVER_INFO = { name: 'minizep', version: '0.2.0' };
+
+/**
+ * Everything the tool handlers need, injected so transports can differ: the
+ * shared service and who is calling (a token's principal over HTTP, the local
+ * user over stdio).
+ */
 export interface ToolContext {
-  zep: Minizep;
-  persistence: FilePersistence;
-  jobs: JobQueue;
-  llmLabel: string;
-  storeLabel: string;
-  defaultGroup: string;
+  service: MemoryService;
+  principal: Principal;
 }
 
-const iso = (d?: Date) => (d ? d.toISOString() : null);
+const day = (iso: string | null) => (iso ? iso.slice(0, 10) : null);
 
-function validity(f: EntityEdge): string {
-  if (!f.invalidAt && !f.expiredAt) return 'still true';
-  const end = f.invalidAt ?? f.expiredAt!;
-  return `true ${iso(f.validAt)?.slice(0, 10) ?? '?'} \u2192 ${iso(end)?.slice(0, 10)}`;
+/** Human-readable validity window, always showing the start when known. */
+export function validity(r: FactRow, now = Date.now()): string {
+  const start = day(r.valid_at) ?? '?';
+  if (r.invalid_at) {
+    if (r.valid_at && Date.parse(r.invalid_at) <= Date.parse(r.valid_at)) return 'retracted';
+    if (Date.parse(r.invalid_at) > now) return `since ${start}, until ${day(r.invalid_at)}`;
+    return `true ${start} → ${day(r.invalid_at)}`;
+  }
+  if (r.expired_at) return 'retracted';
+  if (r.valid_at && Date.parse(r.valid_at) > now) return `from ${start}`;
+  return r.valid_at ? `since ${start}` : 'still true';
 }
 
-function formatFact(r: FactWithContext): string {
-  return `${r.sourceName} --${r.fact.name}--> ${r.targetName} | "${r.fact.fact}" | ${validity(r.fact)}`;
+export function formatFact(r: FactRow): string {
+  return `[${r.uuid.slice(0, 8)}] ${r.source} --${r.relation}--> ${r.target} | "${r.fact}" | ${validity(r)}`;
 }
 
-function ok(text: string, structured?: Record<string, unknown>) {
+function ok(text: string, structured?: object) {
   return {
     content: [{ type: 'text' as const, text }],
-    ...(structured ? { structuredContent: structured } : {}),
+    ...(structured ? { structuredContent: structured as Record<string, unknown> } : {}),
   };
+}
+
+function fail(text: string, structured?: object) {
+  return { ...ok(text, structured), isError: true };
+}
+
+/** Runs a handler; a thrown error (group not permitted, bad input, not found) is a tool error. */
+async function guard<T>(fn: () => Promise<T>): Promise<T | ReturnType<typeof fail>> {
+  try {
+    return await fn();
+  } catch (err) {
+    return fail((err as Error).message);
+  }
+}
+
+const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+function describeAdd(o: AddMemoryOutcome, ms: number) {
+  const ep = o.episode_uuid.slice(0, 8);
+  switch (o.status) {
+    case 'queued':
+      return ok(
+        `queued job ${o.job_id} for episode ${ep} (stored as pending in group "${o.group_id}")\n` +
+          'status: queued\npoll memory_job_status with this id',
+        o,
+      );
+    case 'duplicate':
+      return ok(`duplicate: episode ${ep} was already processed in group "${o.group_id}"; nothing changed`, o);
+    case 'failed':
+      return fail(
+        `extraction failed: ${o.error}\n` +
+          `episode ${ep} is stored for retry in group "${o.group_id}" (status: failed); ` +
+          'call retry_failed once the cause is fixed',
+        o,
+      );
+  }
+  const lines = [
+    `episode ${ep} processed in group "${o.group_id}" (${ms}ms)`,
+    `entities: ${o.entities.length ? o.entities.join(', ') : '(none)'}`,
+    `new facts: ${o.facts.length ? o.facts.map((f) => f.fact).join(' ; ') : '(none)'}`,
+    `reinforced: ${o.reinforced.length}`,
+    `invalidated: ${o.invalidated.length ? o.invalidated.map((f) => f.fact).join(' ; ') : '(none)'}`,
+  ];
+  if (o.dropped.facts || o.dropped.invalidations) {
+    lines.push(
+      `dropped: ${plural(o.dropped.facts, 'fact')}, ${plural(o.dropped.invalidations, 'invalidation')} ` +
+        '(an entity they name could not be resolved)',
+    );
+  }
+  return ok(lines.join('\n'), o);
+}
+
+function describeJob(job: JobRow): string {
+  const lines = [
+    `job      : ${job.id}`,
+    `status   : ${job.status}`,
+    `label    : ${job.label}`,
+    job.episode_uuid ? `episode  : ${job.episode_uuid.slice(0, 8)}` : '',
+    `created  : ${job.created_at}`,
+    job.finished_at ? `finished : ${job.finished_at}` : '',
+  ].filter(Boolean);
+  if (job.error) lines.push(`error    : ${job.error}`);
+  const r = job.result as AddMemoryOutcome | null;
+  if (r?.status) {
+    lines.push(
+      `result   : ${r.status}`,
+      `entities : ${r.entities.length}`,
+      `facts    : ${r.facts.length}`,
+      `reinforced: ${r.reinforced.length}`,
+      `invalidated: ${r.invalidated.length}`,
+    );
+    if (r.dropped.facts || r.dropped.invalidations) {
+      lines.push(`dropped  : ${r.dropped.facts} facts, ${r.dropped.invalidations} invalidations`);
+    }
+  }
+  return lines.join('\n');
 }
 
 /** Registers every minizep tool on a server instance. Shared by stdio and HTTP. */
 export function registerTools(server: McpServer, ctx: ToolContext): void {
+  const { service, principal: p } = ctx;
 
   server.registerTool(
     'add_memory',
@@ -43,70 +128,15 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       title: 'Add memory',
       description:
         'Ingest text into the temporal knowledge graph. Extracts entities and facts, and marks ' +
-        'relationships that the text says have ended as invalid (historical facts are kept, not deleted).',
-      inputSchema: {
-        content: z.string().min(1).describe('The text to remember (a message, note, or document excerpt)'),
-        group_id: z.string().optional().describe(`Memory namespace (default "${ctx.defaultGroup}")`),
-        valid_at: z
-          .string()
-          .optional()
-          .describe('ISO-8601 timestamp for when this happened in the real world (defaults to now)'),
-        source: z.enum(['text', 'json', 'markdown']).optional(),
-        name: z.string().optional().describe('Short label for this episode'),
-        async: z
-          .boolean()
-          .optional()
-          .describe(
-            'Queue the work and return a job id immediately instead of waiting. ' +
-              'Extraction takes seconds; use this for long documents or bulk ingestion, ' +
-              'then poll memory_job_status.',
-          ),
-      },
+        'relationships that the text says have ended as invalid (historical facts are kept, not deleted). ' +
+        'Reports processed, duplicate or failed; a failed episode is kept and can be retried.',
+      inputSchema: shapes.addMemory,
     },
-    async ({ content, group_id, valid_at, source, name, async: runAsync }) => {
-      const groupId = group_id ?? ctx.defaultGroup;
-
-      const ingest = () =>
-        ctx.zep.ingest.addEpisode({
-          groupId,
-          content,
-          source,
-          name,
-          validAt: valid_at ? new Date(valid_at) : undefined,
-        });
-
-      if (runAsync) {
-        const job = ctx.jobs.submit(`add_memory:${groupId}`, async () => {
-          const r = await ingest();
-          ctx.persistence.schedule(ctx.zep);
-          return r;
-        });
-        return ok(
-          `queued job ${job.id}\nstatus: ${job.status}\npoll memory_job_status with this id`,
-          { job_id: job.id, status: job.status },
-        );
-      }
-
-      const started = Date.now();
-      const result = await ingest();
-      ctx.persistence.schedule(ctx.zep);
-
-      const lines = [
-        `episode ${result.episode.uuid.slice(0, 8)} stored in group "${groupId}" (${Date.now() - started}ms)`,
-        `entities: ${result.entities.length ? result.entities.map((e) => e.name).join(', ') : '(none)'}`,
-        `new facts: ${result.facts.length ? result.facts.map((f) => f.fact).join(' ; ') : '(none)'}`,
-        `reinforced: ${result.reinforced.length}`,
-        `invalidated: ${
-          result.invalidated.length ? result.invalidated.map((f) => f.fact).join(' ; ') : '(none)'
-        }`,
-      ];
-      return ok(lines.join('\n'), {
-        episode_uuid: result.episode.uuid,
-        entities: result.entities.map((e) => e.name),
-        facts: result.facts.map((f) => f.fact),
-        invalidated: result.invalidated.map((f) => f.fact),
-      });
-    },
+    (args) =>
+      guard(async () => {
+        const started = Date.now();
+        return describeAdd(await service.addMemory(p, args), Date.now() - started);
+      }),
   );
 
   server.registerTool(
@@ -115,59 +145,37 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       title: 'Search facts',
       description:
         'Hybrid search (BM25 + embeddings + rank fusion) over facts. By default only currently-true ' +
-        'facts are returned; pass at= to time-travel, or include_historical=true for the full history.',
-      inputSchema: {
-        query: z.string().min(1),
-        group_id: z.string().optional(),
-        limit: z.number().int().min(1).max(50).optional(),
-        at: z.string().optional().describe('ISO-8601 instant: return only facts true at that time'),
-        include_historical: z.boolean().optional().describe('Include facts that are no longer true'),
-      },
+        'facts are returned; pass at= to time-travel, as_of= for what was known then, or ' +
+        'include_historical=true for the full history.',
+      inputSchema: shapes.search,
     },
-    async ({ query, group_id, limit, at, include_historical }) => {
-      const rows = await ctx.zep.searchFacts(query, {
-        groupId: group_id ?? ctx.defaultGroup,
-        limit: limit ?? 10,
-        at: at ? new Date(at) : undefined,
-        includeHistorical: include_historical ?? false,
-      });
-      if (!rows.length) return ok('no matching facts');
-      return ok(rows.map(formatFact).join('\n'), {
-        facts: rows.map((r) => ({
-          fact: r.fact.fact,
-          relation: r.fact.name,
-          source: r.sourceName,
-          target: r.targetName,
-          valid_at: iso(r.fact.validAt),
-          invalid_at: iso(r.fact.invalidAt),
-        })),
-      });
-    },
+    (args) =>
+      guard(async () => {
+        const r = await service.search(p, args);
+        const note = r.degraded ? '\n(keyword ranking only: the embedding service is unavailable)' : '';
+        if (!r.facts.length) return ok(`no matching facts${note}`, r);
+        return ok(r.facts.map(formatFact).join('\n') + note, r);
+      }),
   );
 
   server.registerTool(
     'facts_about',
     {
       title: 'Facts about an entity',
-      description: 'Every fact touching one entity, with its temporal validity window.',
-      inputSchema: {
-        entity: z.string().min(1).describe('Entity name, e.g. "Alice"'),
-        group_id: z.string().optional(),
-        at: z.string().optional(),
-        include_historical: z.boolean().optional(),
-        limit: z.number().int().min(1).max(100).optional(),
-      },
+      description:
+        'Every fact touching one entity, with its temporal validity window. A partial name resolves ' +
+        'to the best match; other plausible matches are listed.',
+      inputSchema: shapes.factsAbout,
     },
-    async ({ entity, group_id, at, include_historical, limit }) => {
-      const rows = await ctx.zep.factsAbout(entity, {
-        groupId: group_id ?? ctx.defaultGroup,
-        at: at ? new Date(at) : undefined,
-        includeHistorical: include_historical ?? false,
-        limit: limit ?? 50,
-      });
-      if (!rows.length) return ok(`no facts about "${entity}"`);
-      return ok(rows.map(formatFact).join('\n'));
-    },
+    (args) =>
+      guard(async () => {
+        const r = await service.factsAbout(p, args);
+        if (!r.entity) return ok(`no entity matches "${args.entity}"`, r);
+        const lines = [`facts about ${r.entity.name}:`];
+        lines.push(...(r.facts.length ? r.facts.map(formatFact) : ['(none)']));
+        if (r.candidates.length) lines.push(`other matches: ${r.candidates.map((c) => c.name).join(', ')}`);
+        return ok(lines.join('\n'), r);
+      }),
   );
 
   server.registerTool(
@@ -176,15 +184,18 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       title: 'Time travel',
       description: 'What the graph believed was true at a given instant (bi-temporal query).',
       inputSchema: {
-        timestamp: z.string().describe('ISO-8601 instant, e.g. 2024-06-01T00:00:00Z'),
-        group_id: z.string().optional(),
+        timestamp: z.string().optional().describe('ISO-8601 instant, e.g. 2024-06-01T00:00:00Z (default now)'),
+        as_of: shapes.factsAt.as_of,
+        group_id: shapes.factsAt.group_id,
+        limit: shapes.factsAt.limit,
       },
     },
-    async ({ timestamp, group_id }) => {
-      const rows = await ctx.zep.factsAt(new Date(timestamp), group_id ?? ctx.defaultGroup);
-      if (!rows.length) return ok(`nothing was true at ${timestamp}`);
-      return ok(rows.map(formatFact).join('\n'));
-    },
+    ({ timestamp, ...rest }) =>
+      guard(async () => {
+        const r = await service.factsAt(p, { ...rest, at: timestamp });
+        if (!r.facts.length) return ok(`nothing was true at ${r.at}`, r);
+        return ok(r.facts.map(formatFact).join('\n'), r);
+      }),
   );
 
   server.registerTool(
@@ -192,109 +203,150 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'List entities',
       description: 'Entities in the graph, optionally filtered by a name/summary substring.',
-      inputSchema: {
-        query: z.string().optional(),
-        group_id: z.string().optional(),
-        limit: z.number().int().min(1).max(200).optional(),
-      },
+      inputSchema: shapes.entities,
     },
-    async ({ query, group_id, limit }) => {
-      const q = query?.toLowerCase();
-      const rows = (await ctx.zep.store.getEntities(group_id ?? ctx.defaultGroup))
-        .filter((e: EntityNode) => !q || e.name.toLowerCase().includes(q) || e.summary.toLowerCase().includes(q))
-        .slice(0, limit ?? 50);
-      if (!rows.length) return ok('no entities');
-      return ok(rows.map((e) => `${e.name} [${e.labels.join(',')}] — ${e.summary}`).join('\n'));
-    },
+    (args) =>
+      guard(async () => {
+        const r = await service.entities(p, args);
+        if (!r.entities.length) return ok('no entities', r);
+        return ok(r.entities.map((e) => `${e.name} [${e.labels.join(',')}] — ${e.summary}`).join('\n'), r);
+      }),
   );
 
   server.registerTool(
     'list_episodes',
     {
       title: 'List episodes',
-      description: 'Raw ingested data (provenance). Everything in the graph traces back to these.',
-      inputSchema: {
-        group_id: z.string().optional(),
-        limit: z.number().int().min(1).max(100).optional(),
-      },
+      description:
+        'Raw ingested data (provenance), newest first, with its processing status. ' +
+        'Everything in the graph traces back to these.',
+      inputSchema: shapes.episodes,
     },
-    async ({ group_id, limit }) => {
-      const rows = (await ctx.zep.store.getEpisodes(group_id ?? ctx.defaultGroup))
-        .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
-        .slice(0, limit ?? 20);
-      if (!rows.length) return ok('no episodes');
-      return ok(
-        rows
-          .map((e) => `${e.uuid.slice(0, 8)} ${iso(e.validAt)?.slice(0, 10)} — ${e.content.slice(0, 120)}`)
-          .join('\n'),
-      );
+    (args) =>
+      guard(async () => {
+        const r = await service.episodes(p, args);
+        // the full text is one get_episode away; the listing only previews it
+        const episodes = r.episodes.map(({ content, ...e }) => ({ ...e, preview: content.slice(0, 200) }));
+        if (!episodes.length) return ok('no episodes', { ...r, episodes });
+        return ok(
+          episodes
+            .map((e) => `${e.uuid.slice(0, 8)} ${day(e.valid_at)} [${e.status}] — ${e.preview.slice(0, 120)}`)
+            .join('\n'),
+          { ...r, episodes },
+        );
+      }),
+  );
+
+  server.registerTool(
+    'get_episode',
+    {
+      title: 'Get episode',
+      description:
+        'One episode (by uuid or a prefix of at least 8 characters) with its status, full text and ' +
+        'the facts it produced or reinforced.',
+      inputSchema: shapes.episode,
     },
+    (args) =>
+      guard(async () => {
+        const r = await service.episode(p, args);
+        const e = r.episode;
+        const lines = [
+          `episode  : ${e.uuid}`,
+          `group    : ${e.group_id}`,
+          `status   : ${e.status}${e.error ? ` (${e.error})` : ''}`,
+          `valid_at : ${e.valid_at}`,
+          `created  : ${e.created_at}`,
+          `name     : ${e.name}`,
+          '',
+          e.content,
+          '',
+          `facts first stated here (${r.facts.length}):`,
+          ...r.facts.map(formatFact),
+        ];
+        if (r.reinforced.length) lines.push(`reinforced (${r.reinforced.length}):`, ...r.reinforced.map(formatFact));
+        return ok(lines.join('\n'), r);
+      }),
+  );
+
+  server.registerTool(
+    'invalidate_fact',
+    {
+      title: 'Invalidate fact',
+      description:
+        'Close a fact by hand: it stopped being true at `at` (default now). With retract=true the fact ' +
+        'is treated as never having been true. History is kept either way (as_of still shows what was ' +
+        'believed before). Fact ids are shown in brackets by the search tools.',
+      inputSchema: shapes.invalidateFact,
+    },
+    (args) =>
+      guard(async () => {
+        const r = await service.invalidateFact(p, args);
+        const what = args.retract ? 'retracted' : `ended at ${r.fact.invalid_at}`;
+        return ok(`${what}: ${formatFact(r.fact)}`, r);
+      }),
+  );
+
+  server.registerTool(
+    'retry_failed',
+    {
+      title: 'Retry failed episodes',
+      description:
+        'Re-process the episodes whose extraction failed (e.g. during an LLM or embedding outage), in place.',
+      inputSchema: shapes.group,
+    },
+    (args) =>
+      guard(async () => {
+        const r = await service.retryFailed(p, args);
+        const text =
+          `retried ${plural(r.retried, 'failed episode')} in group "${r.group_id}": ` +
+          `${r.succeeded} succeeded, ${r.still_failing} still failing`;
+        return r.still_failing ? fail(text, r) : ok(text, r);
+      }),
   );
 
   server.registerTool(
     'memory_job_status',
     {
       title: 'Ingestion job status',
-      description:
-        'Check an asynchronous add_memory job. Omit job_id to list recent jobs.',
+      description: 'Check an asynchronous add_memory job. Omit job_id to list recent jobs.',
       inputSchema: {
         job_id: z.string().optional(),
         limit: z.number().int().min(1).max(100).optional(),
       },
     },
-    async ({ job_id, limit }) => {
-      if (job_id) {
-        const job = ctx.jobs.get(job_id);
-        if (!job) return ok(`no job ${job_id}`);
-        const lines = [
-          `job      : ${job.id}`,
-          `status   : ${job.status}`,
-          `label    : ${job.label}`,
-          `created  : ${job.createdAt.toISOString()}`,
-          job.finishedAt ? `finished : ${job.finishedAt.toISOString()}` : '',
-        ].filter(Boolean);
-        if (job.error) lines.push(`error    : ${job.error}`);
-        if (job.result) {
-          const r = job.result as { entities?: unknown[]; facts?: unknown[]; invalidated?: unknown[]; failed?: boolean };
-          lines.push(
-            `entities : ${r.entities?.length ?? 0}`,
-            `facts    : ${r.facts?.length ?? 0}`,
-            `invalidated: ${r.invalidated?.length ?? 0}`,
-          );
-          if (r.failed) lines.push('(extraction failed; the episode is stored for retry)');
+    ({ job_id, limit }) =>
+      guard(async () => {
+        if (job_id) {
+          const job = service.job(p, job_id);
+          return ok(describeJob(job), job);
         }
-        return ok(lines.join('\n'), { job_id: job.id, status: job.status });
-      }
-      const jobs = ctx.jobs.list(limit ?? 20);
-      if (jobs.length === 0) return ok('no jobs');
-      return ok(
-        jobs.map((j) => `${j.id.slice(0, 8)} ${j.status.padEnd(9)} ${j.label}`).join('\n'),
-      );
-    },
+        const jobs = service.listJobs(p, limit ?? 20);
+        if (jobs.length === 0) return ok('no jobs', { jobs });
+        return ok(jobs.map((j) => `${j.id.slice(0, 8)} ${j.status.padEnd(9)} ${j.label}`).join('\n'), { jobs });
+      }),
   );
 
   server.registerTool(
     'graph_stats',
     {
       title: 'Graph statistics',
-      description: 'Counts of episodes, entities, active and historical facts.',
-      inputSchema: {},
+      description: 'Counts of episodes (by status), entities, active and historical facts in one group.',
+      inputSchema: shapes.group,
     },
-    async () => {
-      // scoped to the caller's namespace: a token must not be able to infer
-      // how much data other tenants hold
-      const group = ctx.defaultGroup;
-      const facts = await ctx.zep.store.getFacts(group);
-      const active = (await ctx.zep.factsAt(new Date(), group)).length;
-      const text = [
-        `group    : ${group}`,
-        `episodes : ${(await ctx.zep.store.getEpisodes(group)).length}`,
-        `entities : ${(await ctx.zep.store.getEntities(group)).length}`,
-        `facts    : ${facts.length} (${active} currently true, ${facts.length - active} historical)`,
-        `store    : ${ctx.storeLabel}`,
-      `jobs     : ${ctx.jobs.stats.running} running, ${ctx.jobs.stats.queued} queued`,
-        `llm      : ${ctx.llmLabel}`,
-      ].join('\n');
-      return ok(text);
-    },
-  );}
+    (args) =>
+      guard(async () => {
+        const s = await service.stats(p, args);
+        const text = [
+          `group    : ${s.group_id}`,
+          `episodes : ${s.episodes.total} (${s.episodes.processed} processed, ${s.episodes.pending} pending, ` +
+            `${s.episodes.failed} failed)`,
+          `entities : ${s.entities}`,
+          `facts    : ${s.facts.total} (${s.facts.active} currently true, ${s.facts.historical} historical)`,
+          `store    : ${service.storeLabel}`,
+          `jobs     : ${s.jobs.running} running, ${s.jobs.queued} queued`,
+          `llm      : ${service.llmLabel}`,
+        ].join('\n');
+        return ok(text, s);
+      }),
+  );
+}
