@@ -563,6 +563,10 @@ MINIZEP_UI_GROUPS='teamA|shared'      # or '*' for every group
     read). Request bodies must be `application/json`, as everywhere.
 - Anonymous mode (`MINIZEP_ALLOW_ANONYMOUS=1`) keeps its rules for `/v1` and `/mcp` (loopback
   `Host`, no browser `Origin`); the UI works there too, through `/ui/api`.
+- Working on the page: `npm run ui:dev` serves it on http://127.0.0.1:8788/ui from an in-memory
+  graph seeded with every fact state (active, ended, future, retracted), a failed episode and a
+  Chinese group, using a scripted LLM and the hash embedder, so nothing leaves the machine. Edits
+  to `ui/index.html` show on reload. See `demo/ui-dev.ts` for its settings.
 
 ---
 
