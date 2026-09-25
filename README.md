@@ -128,14 +128,31 @@ memory_job_status { job_id }                →  running / succeeded / failed
 
 ### Embedding 服务位置
 
-集群 GPU 常驻 + storage-01 Tailscale 直连（详见 `infra/embedding/`）：
+集群 GPU 常驻 + 网关主机 Tailscale 直连（详见 `infra/embedding/`）：
 
 ```
-agent ──► <gateway>:11435 ──► <compute-node>:11435 (llama.cpp)
+agent ──► <gateway>:11435 ──► <compute-node>:<job-port> (llama.cpp)
 ```
 
-`infra/embedding/supervise.sh` 在作业消失时自动重投（Slurm 有 7 天时限，"常驻"靠这个实现），
-`embed-proxy.py` 从 `current-target` 文件读取后端地址，作业换节点时自动跟随。
+- `llamacpp-serve.sh`：Slurm 作业模板（分区等占位符见文件头注释，路径用环境变量）。不固定节点；
+  端口由作业号推导（`PORT_BASE + SLURM_JOB_ID % PORT_RANGE`），新旧作业落在同一节点也不冲突。
+  启动时把 `<节点IP>:<端口>` 写入 `$BASE/endpoints/<jobid>`，退出时删除。
+- `supervise.sh`：每 `INTERVAL` 秒检查一次，维护 `$BASE/current-target`（只指向健康的后端）。
+- `embed-proxy.py`：TCP 转发到 `current-target`；没有可用后端时返回 HTTP 503 + JSON 错误，而不是直接断开。
+
+**滚动续期**：Slurm 有 7 天时限，所以"常驻"靠提前换班，而不是等作业消失再重投：
+
+1. 所有运行中/排队中的作业剩余时间都不超过 `LEAD`（默认 3 小时）时，提交新作业；一个都没有时同样提交（冷启动）。
+2. 新作业的 `GET /health` 返回 200（模型加载完成）后，`current-target` 才原子地切到它（总是指向最新的健康作业）。
+3. 切换满 `GRACE` 秒（默认 300）后，取消同名的旧作业。
+4. 启动后或上次健康之后超过 `STALE_AFTER` 秒（默认 1800）仍不健康的作业会被取消，不再算作"已覆盖"，
+   所以卡住的新作业不会挡住下一次续期。`squeue` 失败时这一轮什么都不做。
+
+```bash
+DRY_RUN=1 ONCE=1 BASE=<job-dir> infra/embedding/supervise.sh   # 只打印决策，不做任何改动
+bash infra/embedding/test/supervise.test.sh                     # 假 squeue/sbatch/scancel/curl/getent
+python3 infra/embedding/test/test_embed_proxy.py
+```
 
 > 本文档中的 `<gateway>` / `<compute-node>` 是占位符；实际部署时由 `MINIZEP_EMBED_URL` 指定。
 
