@@ -1,6 +1,6 @@
 import { Pool, type PoolClient } from 'pg';
 import { isFactActive, type EntityEdge, type EntityNode, type EpisodicNode, type UUID } from '../model/types.js';
-import { tokenize } from '../search/retrieval.js';
+import { isCjkToken, tokenize } from '../search/retrieval.js';
 import type { GraphStore } from './memory-store.js';
 
 export interface PostgresStoreOptions {
@@ -116,13 +116,23 @@ export class PostgresStore implements GraphStore {
           CREATE INDEX IF NOT EXISTS facts_fact_embedding_hnsw
             ON facts USING hnsw (fact_embedding vector_cosine_ops);
         `);
-        // keyword search index. 'simple' is deliberate: it needs no language
-        // dictionary, so it behaves predictably on mixed-language content.
-        // (CJK still tokenises poorly — see README, pg_bigm/zhparser required.)
+        // keyword search. Postgres' parser keeps a CJK sentence as one word, so
+        // the store writes tokenize()'s output (CJK bigrams, see retrieval.ts)
+        // to search_text and indexes that. 'simple' is deliberate: it needs no
+        // language dictionary and leaves the pre-split tokens alone.
+        // Separate statements: the ALTER's exclusive lock must not be held
+        // while the index builds, and backfilling first makes the build cheaper.
+        await this.pool.query('ALTER TABLE facts ADD COLUMN IF NOT EXISTS search_text TEXT');
+        await this.backfillSearchText();
         await this.pool.query(`
-          CREATE INDEX IF NOT EXISTS facts_fts
-            ON facts USING gin (to_tsvector('simple', name || ' ' || fact));
+          CREATE INDEX IF NOT EXISTS facts_search_text
+            ON facts USING gin (to_tsvector('simple', search_text))
         `);
+        // The old facts_fts index (on name || ' ' || fact) is no longer queried
+        // and only slowed down writes. Dropped by schema-qualified name, so a
+        // test schema can never reach an index in public; an older build that
+        // is rolled back to recreates it on start (CREATE INDEX IF NOT EXISTS).
+        await this.pool.query(`DROP INDEX IF EXISTS ${this.schema}.facts_fts`);
 
         // CREATE TABLE IF NOT EXISTS silently keeps an existing column's vector
         // dimension, so a model change would otherwise surface as a confusing
@@ -154,6 +164,32 @@ export class PostgresStore implements GraphStore {
     );
     const typmod = r.rows[0]?.atttypmod;
     return typmod == null || typmod < 0 ? null : Number(typmod);
+  }
+
+  /**
+   * Fill search_text for facts written before the column existed, in batches.
+   * Keyset pagination on the primary key keeps every batch a range scan, and
+   * the IS NULL guard makes a rerun, or several processes starting at once,
+   * harmless.
+   */
+  private async backfillSearchText(batchSize = 500): Promise<void> {
+    let after: string | null = null;
+    for (;;) {
+      const r = await this.pool.query(
+        `SELECT uuid, name, fact FROM facts
+          WHERE search_text IS NULL AND ($1::uuid IS NULL OR uuid > $1::uuid)
+          ORDER BY uuid LIMIT $2`,
+        [after, batchSize],
+      );
+      if (r.rows.length === 0) return;
+      await this.pool.query(
+        `UPDATE facts AS f SET search_text = v.search_text
+           FROM unnest($1::uuid[], $2::text[]) AS v(uuid, search_text)
+          WHERE f.uuid = v.uuid AND f.search_text IS NULL`,
+        [r.rows.map((row) => row.uuid), r.rows.map((row) => searchTextOf(row.name, row.fact))],
+      );
+      after = r.rows[r.rows.length - 1].uuid as string;
+    }
   }
 
   /** Server-side truth check, used by tests and health endpoints. */
@@ -275,13 +311,15 @@ export class PostgresStore implements GraphStore {
     await this.ensure();
     await this.pool.query(
       `INSERT INTO facts (uuid, group_id, source_node_uuid, target_node_uuid, name, fact, episodes,
-                          valid_at, invalid_at, created_at, expired_at, attributes, fact_embedding)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                          valid_at, invalid_at, created_at, expired_at, attributes, fact_embedding,
+                          search_text)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        ON CONFLICT (uuid) DO UPDATE SET
          name = EXCLUDED.name, fact = EXCLUDED.fact, episodes = EXCLUDED.episodes,
          valid_at = EXCLUDED.valid_at, invalid_at = EXCLUDED.invalid_at,
          expired_at = EXCLUDED.expired_at, attributes = EXCLUDED.attributes,
-         fact_embedding = EXCLUDED.fact_embedding`,
+         fact_embedding = EXCLUDED.fact_embedding,
+         search_text = EXCLUDED.search_text`,
       [
         edge.uuid,
         edge.groupId,
@@ -296,6 +334,7 @@ export class PostgresStore implements GraphStore {
         edge.expiredAt ?? null,
         JSON.stringify(edge.attributes ?? {}),
         this.vec(edge.factEmbedding),
+        searchTextOf(edge.name, edge.fact),
       ],
     );
   }
@@ -346,15 +385,20 @@ export class PostgresStore implements GraphStore {
     // websearch_to_tsquery("alice works at acme") means alice AND works AND at
     // AND acme, which matches almost nothing (the document holds "WORKS_AT" as
     // one token). Ranking on OR-ed terms is both far more useful and closer to
-    // what the in-process BM25 path does.
-    const terms = [...new Set(tokenize(query).filter((t) => t.length > 1))];
-    const tsQuery = terms.length > 0 ? terms.join(' OR ') : query;
-    const params: unknown[] = [tsQuery];
+    // what the in-process BM25 path does. The query is split by the same
+    // tokenize() that produced search_text, so CJK bigrams line up.
+    const tokens = [...new Set(tokenize(query))];
+    // one-letter Latin tokens ("a") are noise without BM25's idf; a single
+    // CJK character is a word in its own right
+    const terms = tokens.filter((t) => t.length > 1 || isCjkToken(t));
+    const chosen = terms.length > 0 ? terms : tokens;
+    if (chosen.length === 0) return [];
+    const params: unknown[] = [chosen.join(' OR ')];
     let sql = `
-      SELECT *, ts_rank_cd(to_tsvector('simple', name || ' ' || fact),
+      SELECT *, ts_rank_cd(to_tsvector('simple', search_text),
                            websearch_to_tsquery('simple', $1)) AS score
         FROM facts
-       WHERE to_tsvector('simple', name || ' ' || fact) @@ websearch_to_tsquery('simple', $1)`;
+       WHERE to_tsvector('simple', search_text) @@ websearch_to_tsquery('simple', $1)`;
     if (opts.groupId) {
       params.push(opts.groupId);
       sql += ` AND group_id = $${params.length}`;
@@ -408,6 +452,11 @@ export class PostgresStore implements GraphStore {
     const r = await this.pool.query(sql, params);
     return r.rows.map((row) => ({ edge: rowToFact(row), distance: Number(row.distance) }));
   }
+}
+
+/** The facts.search_text value: keyword tokens of the relation name and fact text. */
+function searchTextOf(name: string, fact: string): string {
+  return tokenize(`${name} ${fact}`).join(' ');
 }
 
 /* ---------------- row mapping ---------------- */
