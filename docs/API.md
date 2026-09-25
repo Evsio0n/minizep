@@ -87,7 +87,7 @@ Every error is `{"error": "<message>"}`:
 | 403 | invalid token; group not permitted for this token |
 | 404 | unknown route, or no such record in the resolved group |
 | 405 | route exists with another method (`Allow` header lists it) |
-| 409 | the request conflicts with the fact's current state (already ended, already retracted, end before start) |
+| 409 | the request conflicts with the fact's current state (already ended, already retracted, end before start, nothing to reopen) |
 | 413 | request body larger than 1 MB |
 | 500 | unexpected server error (`{"error":"internal error"}`, details in the server log) |
 | 502 | ingestion failed upstream (LLM, embedding service or store); the episode is **kept** for retry |
@@ -187,7 +187,8 @@ curl -s -X POST http://127.0.0.1:8787/v1/memories \
 ```
 
 - `facts`: new facts; `reinforced`: existing facts this text restated; `invalidated`: existing
-  facts this text ended.
+  facts this text ended. One that was still true can be put back with
+  [reopen](#post-v1factsuuidreopen).
 - `dropped`: extracted candidates that were discarded. `facts` and `invalidations` name an entity
   that could not be resolved: non-zero means the text said more than the graph recorded. `entities`
   are names that are only a literal value (an IP address, a number, a URL, a version) with no fact
@@ -443,7 +444,39 @@ curl -s -X POST http://127.0.0.1:8787/v1/facts/160f2ea7/invalidate \
 Nothing is deleted: queries with an `as_of` before the correction still return what was believed
 then. An earlier end than the recorded one is allowed; 409 when the fact had already ended at or
 before `at` (`fact already ended at …`), when `at` is not after its start, or when it is already
-retracted.
+retracted. To undo a wrong end or retraction, [reopen](#post-v1factsuuidreopen) the fact.
+
+### POST /v1/facts/:uuid/reopen
+
+Undo a wrong end or retraction, e.g. an ingestion that closed a fact which is still true.
+`:uuid` is the fact uuid or a prefix of at least 8 characters.
+
+| Field        | Type   | Notes |
+|--------------|--------|-------|
+| `reason`     | string | required, kept on both records |
+| `invalid_at` | string | when it really stopped being true, if it did (default: still true); must be after its `valid_at` |
+| `group_id`   | string | |
+
+A row keeps one version of what was believed, so the closed row is not edited back. It is
+**retracted** (its window is emptied and `expired_at` set to now; a row that was already retracted
+keeps its retraction) and a corrected **copy** is inserted: same endpoints, relation, text,
+`valid_at` and evidence, `invalid_at` as given, `created_at` now, and a new uuid. The response has
+both:
+
+```json
+{ "group_id": "teamA",
+  "fact":     { "uuid": "5c0de1f2-…", "valid_at": "2024-03-01T09:00:00.000Z", "invalid_at": null,
+                "created_at": "2026-09-25T08:02:11.130Z", "expired_at": null, "reason": null, "…": "…" },
+  "previous": { "uuid": "160f2ea7-…", "valid_at": "2024-03-01T09:00:00.000Z",
+                "invalid_at": "2024-03-01T09:00:00.000Z", "expired_at": "2026-09-25T08:02:11.130Z",
+                "reason": "reopened as 5c0de1f2: the later note confirms it, ends nothing", "…": "…" } }
+```
+
+An `as_of` before the reopen finds the old row and not the copy; from the reopen on, only the
+copy, and the old row is `retracted` at every `at`. As with any retraction of an ended fact, an
+`as_of` between the wrong end and the reopen sees the old row without that end. 409 when the fact
+is active or has not ended (`nothing to reopen`), was already reopened, or `invalid_at` is not after
+its start.
 
 ### GET /v1/stats
 
@@ -516,6 +549,7 @@ rendering and the same JSON as the REST API in `structuredContent`.
 | `list_episodes`     | `group_id?`, `limit?` | `GET /v1/episodes` (text preview only) |
 | `get_episode`       | `id` (uuid or 8+ char prefix), `group_id?` | `GET /v1/episodes/:id` |
 | `invalidate_fact`   | `uuid`, `reason`, `at?`, `retract?`, `group_id?` | `POST /v1/facts/:uuid/invalidate` |
+| `reopen_fact`       | `uuid`, `reason`, `invalid_at?`, `group_id?` | `POST /v1/facts/:uuid/reopen` |
 | `retry_failed`      | `group_id?` | `POST /v1/episodes/retry-failed` |
 | `graph_stats`       | `group_id?` | `GET /v1/stats` |
 
@@ -528,7 +562,7 @@ error (`isError: true`) whose text says the episode is stored for retry. Fact li
 
 with the validity rendered as `since <start>`, `true <start> → <end>`, `since <start>, until
 <future end>`, `from <future start>`, `still true` (start unknown) or `retracted`. The bracketed
-prefix is what `invalidate_fact` takes.
+prefix is what `invalidate_fact` and `reopen_fact` take.
 
 ### stdio clients
 

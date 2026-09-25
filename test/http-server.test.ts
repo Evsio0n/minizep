@@ -82,6 +82,7 @@ const MINIMAL_ARGS: Record<string, Record<string, unknown>> = {
   list_episodes: {},
   get_episode: { id: '00000000' },
   invalidate_fact: { uuid: '00000000', reason: 'test' },
+  reopen_fact: { uuid: '00000000', reason: 'test' },
   retry_failed: {},
   graph_stats: {},
 };
@@ -441,7 +442,7 @@ for (const backend of backends) {
     }
   });
 
-  test(`[${backend.name}] invalidate_fact ends or retracts a fact, keeping what was believed before`, async () => {
+  test(`[${backend.name}] invalidate_fact ends or retracts a fact and reopen_fact undoes it, keeping what was believed before`, async () => {
     const store = await backend.make();
     const srv = await startServer({ store });
     try {
@@ -470,6 +471,30 @@ for (const backend of backends) {
       assert.equal(twice.isError, true);
       assert.match(twice.text, /already ended/);
 
+      // the end was wrong: reopen it; the ended record stays what was believed until now
+      const beforeReopen = new Date().toISOString();
+      await new Promise((r) => setTimeout(r, 5));
+      const reopened = await call(a.client, 'reopen_fact', { uuid: works.uuid.slice(0, 8), reason: 'Alice did not change jobs' });
+      assert.equal(reopened.isError, false, reopened.text);
+      const copy = reopened.structured.fact;
+      assert.notEqual(copy.uuid, works.uuid);
+      assert.deepEqual([copy.valid_at, copy.invalid_at, copy.fact], [works.valid_at, null, works.fact]);
+      assert.equal(reopened.structured.previous.uuid, works.uuid);
+      assert.match(reopened.text, /since 2024-01-10/);
+      const julyNow = await call(a.client, 'facts_at', { timestamp: '2024-07-01T00:00:00Z' });
+      assert.deepEqual(
+        julyNow.structured.facts.filter((f: { relation: string }) => f.relation === 'WORKS_AT').map((f: { uuid: string }) => f.uuid),
+        [copy.uuid],
+        'only the copy, never the retracted record',
+      );
+      const julyThen = await call(a.client, 'facts_at', { timestamp: '2024-07-01T00:00:00Z', as_of: beforeReopen });
+      assert.ok(!julyThen.structured.facts.some((f: { uuid: string }) => f.uuid === copy.uuid), 'the copy was not known then');
+      const marchThen = await call(a.client, 'facts_at', { timestamp: '2024-03-01T00:00:00Z', as_of: beforeReopen });
+      assert.ok(marchThen.structured.facts.some((f: { uuid: string }) => f.uuid === works.uuid), 'the old record was');
+      const active = await call(a.client, 'reopen_fact', { uuid: copy.uuid, reason: 'x' });
+      assert.equal(active.isError, true);
+      assert.match(active.text, /nothing to reopen/);
+
       const beforeRetraction = new Date().toISOString();
       await new Promise((r) => setTimeout(r, 5));
       const retracted = await call(a.client, 'invalidate_fact', { uuid: likes.uuid, reason: 'never true', retract: true });
@@ -487,6 +512,7 @@ for (const backend of backends) {
       const foreign = await call(b.client, 'invalidate_fact', { uuid: works.uuid, reason: 'x' });
       assert.equal(foreign.isError, true);
       assert.match(foreign.text, /fact not found/);
+      assert.match((await call(b.client, 'reopen_fact', { uuid: likes.uuid, reason: 'x' })).text, /fact not found/);
     } finally {
       await srv.close();
       await backend.dispose(store);

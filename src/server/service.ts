@@ -288,6 +288,12 @@ export const shapes = {
     retract: z.boolean().optional().describe('The fact was never true: remove it from every point in time'),
     group_id: groupId,
   },
+  reopenFact: {
+    uuid: z.string().min(1).describe('Fact uuid, or a prefix of at least 8 characters'),
+    reason: z.string().min(1).describe('Why the fact still holds (kept for auditing)'),
+    invalid_at: instant('when it really stopped being true, if it did (default: still true)'),
+    group_id: groupId,
+  },
   group: {
     group_id: groupId,
   },
@@ -319,6 +325,7 @@ export type EntitiesInput = Input<typeof shapes.entities>;
 export type EpisodesInput = Input<typeof shapes.episodes>;
 export type EpisodeInputShape = Input<typeof shapes.episode>;
 export type InvalidateFactInputShape = Input<typeof shapes.invalidateFact>;
+export type ReopenFactInputShape = Input<typeof shapes.reopenFact>;
 export type GroupInput = Input<typeof shapes.group>;
 export type GraphInput = Input<typeof shapes.graph>;
 export type EntityInput = Input<typeof shapes.entity>;
@@ -547,10 +554,26 @@ export class MemoryService {
       this.persistence?.schedule(this.zep);
       return { group_id: group, fact: (await this.withNames([fact]))[0] };
     } catch (err) {
-      if (err instanceof InvalidationError) {
-        throw new ServiceError(err.code === 'not_found' ? 404 : 409, err.message);
-      }
-      throw err;
+      throw asServiceError(err);
+    }
+  }
+
+  /**
+   * Undo a wrong end or retraction: the old record is retracted and kept in
+   * history, and the returned `fact` is its corrected copy (a new uuid).
+   */
+  async reopenFact(p: Principal, input: ReopenFactInputShape) {
+    const group = resolveGroup(p, input.group_id);
+    const id = normaliseId(input.uuid, 'fact');
+    const invalidAt = parseInstant(input.invalid_at, 'invalid_at');
+    const uuid = UUID_RE.test(id) ? id : pickByPrefix(await this.zep.store.getFacts(group), id, 'fact').uuid;
+    try {
+      const r = await this.zep.ingest.reopenFact(uuid, { groupId: group, reason: input.reason, invalidAt });
+      this.persistence?.schedule(this.zep);
+      const [fact, previous] = await this.withNames([r.fact, r.previous]);
+      return { group_id: group, fact, previous };
+    } catch (err) {
+      throw asServiceError(err);
     }
   }
 
@@ -842,6 +865,12 @@ export class MemoryService {
     }
     return names;
   }
+}
+
+/** A manual correction the fact's state refuses is a 404 or a 409. */
+function asServiceError(err: unknown): unknown {
+  if (err instanceof InvalidationError) return new ServiceError(err.code === 'not_found' ? 404 : 409, err.message);
+  return err;
 }
 
 function emptyResult(episode: EpisodicNode): IngestResult {

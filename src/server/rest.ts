@@ -203,6 +203,14 @@ function routes(ctx: RestContext): Route[] {
       },
     },
     {
+      method: 'POST',
+      pattern: /^\/v1\/facts\/([^/]+)\/reopen$/,
+      handler: async ({ p, params, body }) => {
+        const input = { ...asObject(await body()), uuid: pathParam(params[0]) };
+        return { body: await s.reopenFact(p, parse(shapes.reopenFact, input)) };
+      },
+    },
+    {
       method: 'GET',
       pattern: /^\/v1\/episodes$/,
       handler: async ({ p, url }) => ({ body: await s.episodes(p, parse(shapes.episodes, queryOf(url))) }),

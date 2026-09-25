@@ -71,7 +71,17 @@ export interface InvalidateFactInput {
   retract?: boolean;
 }
 
-/** A manual invalidation that cannot be applied, with why. */
+/** How a wrongly ended or retracted fact is reopened. */
+export interface ReopenFactInput {
+  /** the fact must belong to this group (otherwise it is reported as not found) */
+  groupId: string;
+  /** why the fact still holds, kept on both records for auditing */
+  reason: string;
+  /** real-world instant it did stop being true, if it did (default: still true) */
+  invalidAt?: Date;
+}
+
+/** A manual invalidation or reopen that cannot be applied, with why. */
 export class InvalidationError extends Error {
   constructor(
     message: string,
@@ -253,6 +263,81 @@ export class IngestPipeline {
     });
   }
 
+  /**
+   * Undo a wrong end or retraction (an ingestion that closed a fact that is
+   * still true), under the group's lock.
+   *
+   * One row holds one belief, so the wrongly closed row is not edited back:
+   * it is retracted (empty window, expiredAt now; a row that is already
+   * retracted keeps its retraction) and a corrected copy is inserted with the
+   * same endpoints, relation, text, start, evidence and embedding, created
+   * now, open or ending at `invalidAt`. as_of before now finds the old row and
+   * not the copy, as_of from now on the copy and never the old row. As with
+   * any retraction of an ended fact, an as_of between the wrong end and the
+   * reopen sees the old row without that end (one row cannot hold both the end
+   * and its withdrawal); the end and its reason stay in the old row's
+   * attributes (closedAt, closedBy).
+   */
+  async reopenFact(factUuid: string, input: ReopenFactInput): Promise<{ fact: EntityEdge; previous: EntityEdge }> {
+    return this.locks.run(input.groupId, async () => {
+      const found = await this.store.getFact(factUuid);
+      if (!found || found.groupId !== input.groupId) throw new InvalidationError('fact not found', 'not_found');
+      const reopenedAs = found.attributes?.reopenedAs;
+      if (typeof reopenedAs === 'string') {
+        throw new InvalidationError(`fact was already reopened as ${reopenedAs}`, 'conflict');
+      }
+      const now = new Date();
+      const retracted = isRetracted(found);
+      if (!retracted && !(found.invalidAt && found.invalidAt <= now)) {
+        throw new InvalidationError('fact has not ended or been retracted: nothing to reopen', 'conflict');
+      }
+      if (input.invalidAt && found.validAt && input.invalidAt <= found.validAt) {
+        throw new InvalidationError(
+          `fact started at ${found.validAt.toISOString()}, it cannot end at or before that`,
+          'conflict',
+        );
+      }
+
+      const reason = input.reason.slice(0, 120);
+      const kept = Object.fromEntries(
+        Object.entries(found.attributes ?? {}).filter(([k]) => !CLOSURE_ATTRIBUTES.has(k)),
+      );
+      const copy: EntityEdge = {
+        ...found,
+        uuid: uuid(),
+        episodes: [...found.episodes],
+        factEmbedding: found.factEmbedding ? [...found.factEmbedding] : undefined,
+        invalidAt: input.invalidAt,
+        createdAt: now,
+        expiredAt: undefined,
+        attributes: { ...kept, reopenedFrom: found.uuid, reopenReason: reason },
+      };
+      const previous: EntityEdge = {
+        ...found,
+        attributes: {
+          ...found.attributes,
+          retracted: true,
+          reopenedAs: copy.uuid,
+          invalidatedBy: `reopened as ${copy.uuid.slice(0, 8)}: ${reason}`.slice(0, 120),
+          ...(typeof found.attributes?.invalidatedBy === 'string' ? { closedBy: found.attributes.invalidatedBy } : {}),
+          ...(!retracted && found.invalidAt ? { closedAt: found.invalidAt.toISOString() } : {}),
+        },
+      };
+      if (!retracted) {
+        previous.invalidAt = found.validAt;
+        previous.expiredAt = now;
+      }
+
+      const commit = async (store: GraphStore) => {
+        await store.updateFact(previous);
+        await store.addFact(copy);
+      };
+      if (this.store.transaction) await this.store.transaction(commit);
+      else await commit(this.store);
+      return { fact: copy, previous };
+    });
+  }
+
   /** Only ever executed while holding the group's save lock. */
   private async saveLocked(
     input: EpisodeInput,
@@ -411,6 +496,9 @@ function isRetracted(f: EntityEdge): boolean {
   if (f.invalidAt) return !!f.validAt && f.invalidAt <= f.validAt;
   return !!f.expiredAt;
 }
+
+/** Attributes that say how a fact was closed, which a reopened copy does not inherit. */
+const CLOSURE_ATTRIBUTES = new Set(['invalidatedBy', 'retracted', 'reopenedAs', 'closedBy', 'closedAt']);
 
 /** A fact that is true now, or scheduled to become true later. */
 function isLive(f: EntityEdge, now: Date): boolean {

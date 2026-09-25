@@ -150,7 +150,7 @@ test('stdio proxy: forwards every tool of the HTTP server under the token\'s gro
   try {
     await client.connect(transport);
     const names = (await client.listTools()).tools.map((t) => t.name);
-    for (const tool of ['add_memory', 'get_episode', 'invalidate_fact', 'retry_failed', 'facts_at']) {
+    for (const tool of ['add_memory', 'get_episode', 'invalidate_fact', 'reopen_fact', 'retry_failed', 'facts_at']) {
       assert.ok(names.includes(tool), `${tool} is forwarded`);
     }
 

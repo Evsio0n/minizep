@@ -297,6 +297,24 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
   );
 
   server.registerTool(
+    'reopen_fact',
+    {
+      title: 'Reopen fact',
+      description:
+        'Undo a wrong end or retraction (e.g. ingestion closed a fact that is still true). The fact is ' +
+        'true again from its original start, until `invalid_at` if given. The wrongly closed record is ' +
+        'retracted but kept (as_of before now still shows it); the corrected copy gets a new id. ' +
+        'Refused while the fact is active.',
+      inputSchema: shapes.reopenFact,
+    },
+    (args) =>
+      guard(async () => {
+        const r = await service.reopenFact(p, args);
+        return ok(`reopened [${r.previous.uuid.slice(0, 8)}] as: ${formatFact(r.fact)}`, r);
+      }),
+  );
+
+  server.registerTool(
     'retry_failed',
     {
       title: 'Retry failed episodes',
