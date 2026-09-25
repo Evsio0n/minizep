@@ -123,7 +123,13 @@ const RANKING_TEXT_CHARS = 2000;
  *     last fallible step, and a failed or pending episode is retried in place
  */
 export class IngestPipeline {
+  /** held while an episode is processed (seconds: LLM + embeddings) */
   private readonly locks = new KeyedMutex();
+  /**
+   * held only while an episode is looked up and saved, so an async add does not
+   * wait behind an extraction that is running for the same group
+   */
+  private readonly saveLocks = new KeyedMutex();
 
   constructor(
     private store: GraphStore,
@@ -134,7 +140,7 @@ export class IngestPipeline {
   /** Save + process, as one serialised step for the group. */
   async addEpisode(input: EpisodeInput, options: IngestOptions = {}): Promise<IngestResult> {
     return this.locks.run(input.groupId, async () => {
-      const { episode, duplicate } = await this.saveLocked(input, options);
+      const { episode, duplicate } = await this.saveLocks.run(input.groupId, () => this.saveLocked(input, options));
       return duplicate ? duplicateResult(episode) : this.processLocked(episode);
     });
   }
@@ -149,7 +155,7 @@ export class IngestPipeline {
     input: EpisodeInput,
     options: IngestOptions = {},
   ): Promise<{ episode: EpisodicNode; duplicate: boolean }> {
-    return this.locks.run(input.groupId, () => this.saveLocked(input, options));
+    return this.saveLocks.run(input.groupId, () => this.saveLocked(input, options));
   }
 
   /** Process a saved episode (a no-op 'duplicate' when it is already processed). */
@@ -233,7 +239,7 @@ export class IngestPipeline {
     });
   }
 
-  /** Only ever executed while holding the group's lock. */
+  /** Only ever executed while holding the group's save lock. */
   private async saveLocked(
     input: EpisodeInput,
     options: IngestOptions,
@@ -251,10 +257,14 @@ export class IngestPipeline {
       const unfinished = matches[0];
       if (unfinished) {
         // an earlier attempt failed or never ran: process that record again
-        // instead of piling up a second copy of the same episode
-        unfinished.status = 'pending';
-        unfinished.error = undefined;
-        await this.store.addEpisode(unfinished);
+        // instead of piling up a second copy of the same episode. A pending one
+        // is returned untouched: it may be processing right now (saving does
+        // not wait for that), and rewriting it could undo 'processed'.
+        if (unfinished.status === 'failed') {
+          unfinished.status = 'pending';
+          unfinished.error = undefined;
+          await this.store.addEpisode(unfinished);
+        }
         return { episode: unfinished, duplicate: false };
       }
     }
