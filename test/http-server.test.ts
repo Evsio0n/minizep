@@ -115,9 +115,16 @@ test('security: a token with several groups defaults to the first and may name t
     const c = await connect(srv.base, 'tokC');
     const own = await call(c.client, 'add_memory', { content: 'Carol works at Cyan.' });
     assert.equal(own.structured.group_id, 'teamC');
+    // falling back to the default group is said out loud, with the other groups
+    assert.match(own.text, /stored in the default group "teamC"\. This connection also has shared; .*forget_episode/);
+    assert.match((await call(c.client, 'search_facts', { query: 'Cyan' })).text, /can also use shared; pass group_id/);
     const shared = await call(c.client, 'add_memory', { content: 'Dan works at Delta.', group_id: 'shared' });
     assert.equal(shared.isError, false);
     assert.equal(shared.structured.group_id, 'shared');
+    assert.doesNotMatch(shared.text, /no group_id/);
+    // a token with one group has nothing to point at
+    const a = await connect(srv.base, 'tokA');
+    assert.doesNotMatch((await call(a.client, 'add_memory', { content: 'Ann works at Amber.' })).text, /no group_id/);
     assert.equal((await call(c.client, 'list_episodes', { group_id: 'teamA' })).isError, true);
     assert.equal((await srv.zep.store.getEpisodes('shared')).length, 1);
   } finally {

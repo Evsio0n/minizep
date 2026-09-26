@@ -104,6 +104,8 @@ use and your role in each: reader (read-only), writer or owner.
 - Working on a project or topic that has its own group: pass that `group_id` on every call, reads and writes.
 - The default group has nothing about what you are working on: call `list_groups` and search the group that
   matches before concluding the memory is empty.
+- A result that ends with "(no group_id: …)" came from the default group; the note lists your other groups.
+  If you just stored something that belongs to one of them, `forget_episode` it and add it there.
 - A read-only group (reader) is there to be searched: do not try to add, correct or forget anything in it.
   When something there is wrong or missing, tell the user, and ask them which group a new note should go to.
 - Never copy facts from one group into another to "share" them; ask the user which group a new topic belongs to.
