@@ -345,7 +345,8 @@ export class AccessControl {
     const asked = this.expiry(input.expires_days);
     const until = own?.expiresAt ?? null;
     const expiresAt = asked && until ? (asked < until ? asked : until) : (asked ?? until);
-    const defaultGroup = await this.defaultWithin(await this.existingUser(user), groups, input.default_group ?? null);
+    // a 400 names only the grants this caller can see (/v1/me), never the rest of the account's
+    const defaultGroup = await this.defaultWithin(await this.existingUser(user), groups, input.default_group ?? null, effectiveGrants(p));
     return this.issue({ user, name: input.name, groups, role, defaultGroup, expiresAt });
   }
 
@@ -408,6 +409,8 @@ export class AccessControl {
     requireAdmin(p);
     const name = input.name;
     const home = input.default_group ?? name;
+    const workspace = input.workspace !== false;
+    if (workspace) await this.freeWorkspace(name, home);
     const user = await this.store.createUser({
       name,
       admin: input.admin ?? false,
@@ -416,10 +419,9 @@ export class AccessControl {
     });
     if (!user) throw new ServiceError(409, `user "${name}" already exists`);
     this.usersSeen = true;
-    const grants =
-      input.workspace === false
-        ? []
-        : [await this.store.setGrant(name, home, 'owner'), await this.store.setGrant(name, `${home}/*`, 'owner')];
+    const grants = workspace
+      ? [await this.store.setGrant(name, home, 'owner'), await this.store.setGrant(name, `${home}/*`, 'owner')]
+      : [];
     const first = await this.issue({ user: name, name: 'first token', groups: null, role: null, defaultGroup: null, expiresAt: null });
     return { user: userRow(user), grants: grants.map(grantRow), ...first };
   }
@@ -490,20 +492,50 @@ export class AccessControl {
   }
 
   /**
+   * A workspace must not take over groups others use: as owner of `home` and
+   * `home/*` the new user could read their memories and remove their grants.
+   * Refused (409) when another user's grant reaches `home` or a group under
+   * it, and (400) when `home/*` would be too long to be named as a pattern
+   * again. The grants of `name` itself only exist when the name is taken,
+   * which the caller reports.
+   */
+  private async freeWorkspace(name: string, home: string): Promise<void> {
+    const below = `${home}/*`;
+    if (!pattern.safeParse(below).success) {
+      throw new ServiceError(400, 'a workspace needs a default group of at most 254 characters ("<group>/*" is a pattern, at most 256)');
+    }
+    const reaches = (g: GrantRecord) => g.user !== name && [home, below].some((w) => intersectPatterns(g.pattern, w) !== undefined);
+    const users = [...new Set((await this.store.listGrants()).filter(reaches).map((g) => g.user))];
+    if (users.length > 0) {
+      throw new ServiceError(
+        409,
+        `group "${home}" or a sub-group already has members (${users.join(', ')}): create the user without a workspace and grant a role`,
+      );
+    }
+  }
+
+  /**
    * The default group of a new token of `user` within `groups`, checked
    * against what the token could use (its user's grants, narrowed): one that
    * reaches no group, or an explicit default it cannot read, is refused (400).
    * Without an explicit one, a narrowed token that cannot read its user's
    * default gets the first exact group of `groups` it can read, else none
    * (calls then pass group_id). Checked here only: later grant changes are not.
+   * `shown` is what the 400 may name (default: all of the user's grants).
    */
-  private async defaultWithin(user: UserRecord, groups: string[] | null, asked: string | null): Promise<string | null> {
+  private async defaultWithin(
+    user: UserRecord,
+    groups: string[] | null,
+    asked: string | null,
+    shown?: Principal['grants'],
+  ): Promise<string | null> {
     const grants = await this.grantsOf(user);
     const restriction = groups ? { groups } : undefined;
     const token: Principal = { id: 'new', defaultGroup: user.defaultGroup, grants, admin: false, restriction };
     if (effectiveGrants(token).length === 0) {
       // only a user's own grants can miss: 'any' meets every pattern
-      const held = grants === 'any' ? '*' : grants.map((g) => g.pattern).join(', ') || 'none';
+      const named = shown ?? grants;
+      const held = named === 'any' ? '*' : named.map((g) => g.pattern).join(', ') || 'none';
       throw new ServiceError(400, `this token would reach none of the groups of "${user.name}" (their grants: ${held})`);
     }
     if (asked !== null) {

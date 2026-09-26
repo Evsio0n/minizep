@@ -939,7 +939,7 @@ const S = {
   defaultGroupPh: 'the user name',
   fAdmin: 'Admin: owner of every group, manages users, grants and tokens',
   fWorkspace: 'Create workspace',
-  workspaceHelp: (g) => `Owner of the default group and its sub-groups: ${g || '<name>'} and ${g || '<name>'}/*.`,
+  workspaceHelp: (g) => `Owner of the default group and its sub-groups: ${g || '<name>'} and ${g || '<name>'}/*. Refused when another user already has access there: then turn this off and grant a role.`,
   createUser: 'Create user',
   userCreated: (n) => `User ${n} created`,
   firstTokenLead: (n) => `The first token of ${n}, with all of the account’s rights. Hand it over through a safe channel.`,

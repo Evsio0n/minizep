@@ -98,12 +98,12 @@ Every error is `{"error": "<message>"}`:
 
 | Status | Meaning |
 |--------|---------|
-| 400 | invalid JSON, body not an object, a missing/invalid field, bad timestamp, id prefix too short or ambiguous |
+| 400 | invalid JSON, body not an object, a missing/invalid field, bad timestamp, id prefix too short or ambiguous; a new token that would reach none of its user's groups, or whose `default_group` it cannot read; a workspace default group over 254 characters ([ACCESS.md](ACCESS.md)) |
 | 401 | missing bearer token; (UI) `login required` |
 | 403 | invalid token; group not permitted for this token; no default group; read-only access to the group; not an owner of the group or not an admin ([ACCESS.md](ACCESS.md)) |
 | 404 | unknown route, or no such record in the resolved group |
 | 405 | route exists with another method (`Allow` header lists it) |
-| 409 | the request conflicts with the record's current state (fact already ended, already retracted, end before start, nothing to reopen; episode already forgotten; user name taken) |
+| 409 | the request conflicts with the record's current state (fact already ended, already retracted, end before start, nothing to reopen; episode already forgotten; user name taken; a new user's workspace group already has members) |
 | 413 | request body larger than 1 MB |
 | 429 | (UI) too many failed logins from this address |
 | 500 | unexpected server error (`{"error":"internal error"}`, details in the server log) |

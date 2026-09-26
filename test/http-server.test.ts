@@ -965,6 +965,12 @@ test('access: an admin adds users; each works in its own workspace, shares it by
     assert.deepEqual([nowhere.status, nowhere.body.error], [400, 'this token would reach none of the groups of "panff" (their grants: pff, pff/*)']);
     const outside = await tokenFor({ groups: ['pff/*'], default_group: 'pff' });
     assert.deepEqual([outside.status, outside.body.error], [400, 'default group "pff" is outside this token\'s reach']);
+    // a workspace takes over no group in use; a narrowed caller's 400 names only the grants it has
+    const taken = await api(srv.base, 'POST', '/v1/admin/users', { token: root, body: { name: 'carol', default_group: 'pff' } });
+    assert.deepEqual([taken.status, taken.body.error], [409, 'group "pff" or a sub-group already has members (panff): create the user without a workspace and grant a role']);
+    const narrow = (await tokenFor({ groups: ['pff', 'other'] })).body.token;
+    const hidden = await api(srv.base, 'POST', '/v1/me/tokens', { token: narrow, body: { name: 'x', groups: ['other'] } });
+    assert.deepEqual([hidden.status, hidden.body.error], [400, 'this token would reach none of the groups of "panff" (their grants: pff)'], 'not pff/*');
     const notes = await api(srv.base, 'POST', '/v1/me/tokens', { token: bob, body: { name: 'notes', groups: ['bob/notes'] } });
     assert.deepEqual([notes.status, notes.body.record.default_group], [201, 'bob/notes'], 'its one exact group, not bob');
 
