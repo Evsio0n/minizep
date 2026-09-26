@@ -11,6 +11,7 @@ import { PostgresStore } from '../src/store/postgres-store.js';
 import type { EpisodicNode } from '../src/model/types.js';
 import { ScriptedLLM, deterministicEmbedder, entity, fact } from './helpers.js';
 import { parseUiHosts, uiFromEnv } from '../src/server/ui.js';
+import { localPrincipal } from '../src/server/auth.js';
 import { ControlledLLM, api, call, connect, rawMcp, rawRequest, startServer, waitFor } from './server-helpers.js';
 
 const DAY = 86_400_000;
@@ -924,5 +925,157 @@ test('ui: the UI acts only on the groups in MINIZEP_UI_GROUPS', async () => {
     assert.equal((await rawRequest(any.base, 'POST', '/v1/search', page, search)).status, 403);
   } finally {
     await any.close();
+  }
+});
+
+/* ================================================================
+ * Users, roles and per-group access (docs/ACCESS.md)
+ * ================================================================ */
+
+type Row = Record<string, any>;
+/** The access store acting as an admin, as minizep-admin does. */
+const ADMIN = localPrincipal('default');
+const WRITE_TOOLS = ['add_memory', 'invalidate_fact', 'reopen_fact', 'forget_episode', 'retry_failed'];
+
+test('access: an admin adds users; each works in its own workspace, shares it by role, and a reader cannot write', async () => {
+  const srv = await startServer();
+  try {
+    const { token: root } = await srv.app.access.createUser(ADMIN, { name: 'root', admin: true });
+    const added = await api(srv.base, 'POST', '/v1/admin/users', { token: root, body: { name: 'bob' } });
+    assert.equal(added.status, 201);
+    assert.deepEqual(added.body.grants.map((g: Row) => `${g.pattern}:${g.role}`), ['bob:owner', 'bob/*:owner']);
+    assert.match(added.body.token, /^mz_[\w-]{43}$/);
+    assert.equal(added.body.record.prefix, added.body.token.slice(0, 8));
+    const bob = added.body.token as string;
+    const alice = (await api(srv.base, 'POST', '/v1/admin/users', { token: root, body: { name: 'alice' } })).body.token;
+    assert.equal((await api(srv.base, 'GET', '/v1/admin/users', { token: bob })).status, 403, 'admins only');
+
+    // bob's workspace: his group and its sub-groups; nobody else's
+    for (const group_id of [undefined, 'bob/notes']) {
+      const r = await api(srv.base, 'POST', '/v1/memories', { token: bob, body: { content: 'Bob works at Borealis.', group_id } });
+      assert.equal(r.status, 201);
+    }
+    const groups = await api(srv.base, 'GET', '/v1/groups', { token: bob });
+    assert.deepEqual(groups.body.groups.map((g: Row) => `${g.group_id}:${g.role}`).sort(), ['bob/notes:owner', 'bob:owner']);
+    const foreign = await api(srv.base, 'GET', '/v1/episodes?group_id=alice', { token: bob });
+    assert.deepEqual([foreign.status, foreign.body.error], [403, 'group not permitted for this token']);
+
+    // an owner shares a group, but not one they do not own, and cannot change their own access
+    const share = (token: string, group: string, body: unknown) =>
+      api(srv.base, 'POST', `/v1/groups/${encodeURIComponent(group)}/members`, { token, body });
+    assert.equal((await share(bob, 'bob/notes', { user: 'alice', role: 'reader' })).status, 200);
+    assert.equal((await share(bob, 'alice', { user: 'bob', role: 'owner' })).status, 403);
+    assert.deepEqual((await share(bob, 'bob/notes', { user: 'bob', role: 'reader' })).body, { error: 'you cannot change your own access' });
+    const members = await api(srv.base, 'GET', '/v1/groups/bob%2Fnotes/members', { token: bob });
+    assert.deepEqual(members.body.members.map((m: Row) => `${m.user}:${m.pattern}:${m.role}`), ['alice:bob/notes:reader', 'bob:bob/*:owner']);
+
+    // alice reads the shared group and may not write there, over REST or MCP
+    assert.equal((await api(srv.base, 'GET', '/v1/episodes?group_id=bob%2Fnotes', { token: alice })).body.episodes.length, 1);
+    const write = await api(srv.base, 'POST', '/v1/memories', { token: alice, body: { content: 'Eve works at Evilcorp.', group_id: 'bob/notes' } });
+    assert.deepEqual([write.status, write.body.error], [403, 'read-only access to group "bob/notes"']);
+    const a = await connect(srv.base, alice);
+    assert.match(
+      a.client.getInstructions() ?? '',
+      /use: alice \(owner, default\), alice\/\* \(owner\), bob\/notes \(reader\)\. A name ending in \*.* Read-only \(search them, never write there\): bob\/notes\./,
+    );
+    const viaMcp = await call(a.client, 'add_memory', { content: 'Eve works at Evilcorp.', group_id: 'bob/notes' });
+    assert.deepEqual([viaMcp.isError, viaMcp.text], [true, 'read-only access to group "bob/notes"']);
+
+    // a read-only token of hers is offered no write tool, and cannot mint a stronger token
+    const ro = await api(srv.base, 'POST', '/v1/me/tokens', { token: alice, body: { name: 'viewer', role: 'reader' } });
+    assert.equal(ro.status, 201);
+    const me = (await api(srv.base, 'GET', '/v1/me', { token: ro.body.token })).body;
+    assert.deepEqual([me.user.name, me.admin, me.token.role, me.grants.every((g: Row) => g.role === 'reader')], ['alice', false, 'reader', true]);
+    const wider = await api(srv.base, 'POST', '/v1/me/tokens', { token: ro.body.token, body: { name: 'wider', role: 'writer' } });
+    assert.equal(wider.body.record.role, 'reader');
+    assert.equal((await api(srv.base, 'POST', '/v1/memories', { token: ro.body.token, body: { content: 'x' } })).status, 403);
+    const viewer = await connect(srv.base, ro.body.token);
+    const names = (await viewer.client.listTools()).tools.map((t) => t.name);
+    assert.ok(names.includes('search_facts'));
+    assert.deepEqual(names.filter((n) => WRITE_TOOLS.includes(n)), []);
+    assert.match((await call(viewer.client, 'list_groups')).text, /^bob\/notes \(reader\): /m);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('access: an open MCP session follows grant changes and token revocation at its next request', async () => {
+  const srv = await startServer();
+  try {
+    const { token: root } = await srv.app.access.createUser(ADMIN, { name: 'root', admin: true });
+    const { token, record } = await srv.app.access.createUser(ADMIN, { name: 'bob', workspace: false, default_group: 'shared' });
+    const grant = (body: unknown) => api(srv.base, 'POST', '/v1/admin/grants', { token: root, body });
+    assert.equal((await grant({ user: 'bob', pattern: 'shared', role: 'writer' })).status, 200);
+    const b = await connect(srv.base, token);
+    assert.equal((await call(b.client, 'add_memory', { content: 'Bob works at Borealis.' })).structured.group_id, 'shared');
+
+    await grant({ user: 'bob', pattern: 'shared', role: 'reader' });
+    assert.equal((await call(b.client, 'add_memory', { content: 'Bob likes Cyan.' })).text, 'read-only access to group "shared"');
+    assert.match((await call(b.client, 'list_episodes')).text, /Borealis/);
+    const revoke = await api(srv.base, 'POST', '/v1/admin/grants/revoke', { token: root, body: { user: 'bob', pattern: 'shared' } });
+    assert.equal(revoke.status, 200);
+    assert.equal((await call(b.client, 'list_episodes')).text, 'no default group: pass group_id');
+
+    assert.equal((await api(srv.base, 'POST', `/v1/admin/tokens/${record.id}/revoke`, { token: root })).status, 200);
+    await assert.rejects(call(b.client, 'list_groups'), (err: unknown) => (err as StreamableHTTPError).code === 403);
+    assert.equal((await api(srv.base, 'GET', '/v1/me', { token })).status, 403);
+  } finally {
+    await srv.close();
+  }
+});
+
+test('ui: MINIZEP_UI=1 logs in with a token into a cookie session; without one the API is 401', async () => {
+  assert.throws(() => uiFromEnv({ MINIZEP_UI: '1', MINIZEP_UI_GROUPS: 'teamA' }), /not both/);
+  const srv = await startServer({ ui: uiFromEnv({ MINIZEP_UI: '1' }) });
+  try {
+    const { token: bob, record } = await srv.app.access.createUser(ADMIN, { name: 'bob' });
+    const ui = async (method: string, path: string, opts: { cookie?: string; body?: unknown } = {}) => {
+      const res = await fetch(`${srv.base}/ui/api${path}`, {
+        method,
+        headers: {
+          ...(opts.cookie ? { cookie: opts.cookie } : {}),
+          ...(opts.body !== undefined ? { 'content-type': 'application/json' } : {}),
+        },
+        body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+      });
+      const setCookie = res.headers.get('set-cookie') ?? '';
+      return { status: res.status, body: await res.json(), setCookie, cookie: setCookie.split(';')[0] };
+    };
+    const loginRequired = [401, { error: 'login required' }];
+
+    assert.equal((await fetch(`${srv.base}/ui`)).status, 200, 'the page itself needs no login');
+    for (const path of ['/me', '/v1/groups']) {
+      const r = await ui('GET', path);
+      assert.deepEqual([r.status, r.body], loginRequired, path);
+    }
+    const wrong = await ui('POST', '/login', { body: { token: 'mz_wrong' } });
+    assert.deepEqual([wrong.status, wrong.body, wrong.setCookie], [403, { error: 'invalid token' }, '']);
+    const json = { 'content-type': 'application/json' };
+    const crossSite = await rawRequest(srv.base, 'POST', '/ui/api/login', { ...json, origin: 'http://evil.example', 'sec-fetch-site': 'cross-site' }, JSON.stringify({ token: bob }));
+    assert.deepEqual([crossSite.status, crossSite.body], [403, { error: 'cross-origin request refused' }]);
+
+    const login = await ui('POST', '/login', { body: { token: bob } });
+    assert.equal(login.status, 200);
+    assert.match(login.setCookie, /^mz_ui=[\w-]{43}; HttpOnly; SameSite=Strict; Path=\/ui; Max-Age=2592000$/);
+    assert.equal(login.body.me.user.name, 'bob');
+    assert.deepEqual((await ui('GET', '/me', { cookie: login.cookie })).body, (await api(srv.base, 'GET', '/v1/me', { token: bob })).body);
+    const added = await ui('POST', '/v1/memories', { cookie: login.cookie, body: { content: 'Bob works at Borealis.' } });
+    assert.deepEqual([added.status, added.body.group_id], [201, 'bob']);
+    const env = await ui('POST', '/login', { body: { token: 'tokA' } });
+    assert.equal((await ui('GET', '/v1/stats', { cookie: env.cookie })).body.group_id, 'teamA', 'env tokens log in too');
+
+    const logout = await ui('POST', '/logout', { cookie: login.cookie });
+    assert.deepEqual([logout.status, logout.setCookie], [200, 'mz_ui=; HttpOnly; SameSite=Strict; Path=/ui; Max-Age=0']);
+    assert.deepEqual(await ui('GET', '/me', { cookie: login.cookie }).then((r) => [r.status, r.body]), loginRequired);
+    // a session is its token: revoking the token ends it
+    const again = await ui('POST', '/login', { body: { token: bob } });
+    await srv.app.access.revokeToken(ADMIN, record.id);
+    assert.deepEqual(await ui('GET', '/v1/groups', { cookie: again.cookie }).then((r) => [r.status, r.body]), loginRequired);
+
+    // the 10th failure from one address within 5 minutes locks it out, even for a good token
+    for (let i = 0; i < 9; i++) await ui('POST', '/login', { body: { token: 'mz_wrong' } });
+    assert.equal((await ui('POST', '/login', { body: { token: 'tokA' } })).status, 429);
+  } finally {
+    await srv.close();
   }
 });

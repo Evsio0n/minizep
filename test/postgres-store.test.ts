@@ -7,6 +7,10 @@ import { isFactActive, isFactKnown, type EntityEdge, type EntityNode } from '../
 import { Minizep } from '../src/index.js';
 import { HashEmbedder } from '../src/provider/interfaces.js';
 import { ScriptedLLM, entity, fact } from './helpers.js';
+import { sha256 } from '../src/store/access-store.js';
+import { AccessControl } from '../src/server/access.js';
+import { localPrincipal } from '../src/server/auth.js';
+import pg from 'pg';
 
 import { readFileSync } from 'node:fs';
 
@@ -180,6 +184,62 @@ if (!available) {
       }
     } finally {
       await s.close();
+    }
+  });
+
+  test('[postgres] the access store keeps users, grants, tokens and UI sessions, and never a secret', async () => {
+    const schema = 'minizep_test_access';
+    const admin = new pg.Pool({ connectionString: URL! });
+    await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+    const s = new PostgresStore({ connectionString: URL!, embeddingDims: DIMS, schema });
+    const store = s.accessStore();
+    try {
+      assert.equal(await store.countUsers(), 0);
+      const access = new AccessControl({ store });
+      const bob = await access.createUser(localPrincipal('x'), { name: 'bob' });
+      assert.equal(await store.createUser({ name: 'bob', admin: false, disabled: false, defaultGroup: 'bob' }), undefined, 'names are unique');
+      await store.createUser({ name: 'alice', admin: false, disabled: false, defaultGroup: 'alice' });
+      assert.deepEqual((await store.listUsers()).map((u) => u.name), ['alice', 'bob']);
+      assert.equal((await store.updateUser('alice', { admin: true }))?.admin, true);
+      assert.equal(await store.updateUser('nobody', { admin: true }), undefined);
+
+      // grants: upserted per (user, pattern), found by the groups they cover
+      await store.setGrant('alice', 'bob/notes', 'reader');
+      await store.setGrant('alice', 'bob/notes', 'writer');
+      const covering = await store.listGrants({ group: 'bob/notes' });
+      assert.deepEqual(covering.map((g) => `${g.user}:${g.pattern}:${g.role}`), ['alice:bob/notes:writer', 'bob:bob/*:owner']);
+      assert.ok(covering[0].createdAt instanceof Date);
+      assert.equal(await store.removeGrant('alice', 'bob/notes'), true);
+      assert.equal(await store.removeGrant('alice', 'bob/notes'), false);
+
+      // tokens: found by the hash of the secret, which is stored nowhere
+      const found = await store.findTokenBySecretHash(sha256(bob.token));
+      assert.deepEqual([found?.id, found?.user, found?.prefix], [bob.record.id, 'bob', bob.token.slice(0, 8)]);
+      const { rows } = await admin.query(`SELECT * FROM ${schema}.mz_tokens`);
+      assert.ok(!JSON.stringify(rows).includes(bob.token.slice(3)), 'no secret in the table');
+      const p = await access.principalFor(bob.token);
+      assert.deepEqual([p?.user, p?.defaultGroup, p?.grants], ['bob', 'bob', [{ pattern: 'bob', role: 'owner' }, { pattern: 'bob/*', role: 'owner' }]]);
+      const limited = await store.createToken({ user: 'bob', name: 'ro', groups: ['bob/notes'], role: 'reader', defaultGroup: 'bob/notes', expiresAt: new Date(Date.now() + 86_400_000) });
+      assert.deepEqual([limited.token.groups, limited.token.role, limited.token.defaultGroup], [['bob/notes'], 'reader', 'bob/notes']);
+      const used = new Date('2026-01-02T03:04:05Z');
+      await store.touchToken(limited.token.id, used);
+      const first = new Date('2026-02-01T00:00:00Z');
+      await store.revokeToken(limited.token.id, first);
+      const revoked = await store.revokeToken(limited.token.id, new Date());
+      assert.deepEqual([revoked?.lastUsedAt, revoked?.revokedAt], [used, first], 'revoking again keeps the first time');
+      assert.deepEqual((await store.listTokens({ user: 'bob' })).map((t) => t.name), ['first token', 'ro']);
+
+      // UI sessions: by the hash of the cookie, until they expire
+      await store.createUiSession('h1', bob.record.id, new Date(Date.now() + 60_000));
+      await store.createUiSession('h2', bob.record.id, new Date(Date.now() - 1));
+      assert.equal((await store.getUiSession('h1'))?.tokenId, bob.record.id);
+      assert.equal(await store.purgeUiSessions(new Date()), 1);
+      await store.deleteUiSession('h1');
+      assert.equal(await store.getUiSession('h1'), undefined);
+    } finally {
+      await s.close();
+      await admin.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);
+      await admin.end();
     }
   });
 }

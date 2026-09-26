@@ -4,7 +4,9 @@
  * Both transports are thin: they validate input with the shapes below, call
  * one method here and format the plain-JSON result (snake_case, ISO dates).
  * Every method takes the caller's Principal and resolves the memory group
- * through auth.resolveGroup(), so no endpoint can forget the tenant check.
+ * through auth.resolveGroup() with what it needs (read, or write for the
+ * methods that change the memory), so no endpoint can forget the tenant or
+ * role check.
  */
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
@@ -14,7 +16,7 @@ import { factView, isFactActive } from '../model/types.js';
 import { displayTimeZone } from '../util/time.js';
 import { InvalidationError, type EpisodeInput, type IngestResult } from '../pipeline/ingest.js';
 import type { Job, JobQueue } from '../jobs/queue.js';
-import { permits, resolveGroup, type Principal } from './auth.js';
+import { effectiveGrants, matchesPattern, permits, resolveGroup, roleIn, unrestricted, type Principal } from './auth.js';
 
 /** A request that cannot be served, with the HTTP status that says why. */
 export class ServiceError extends Error {
@@ -407,7 +409,7 @@ export class MemoryService {
   /* ---------- ingestion ---------- */
 
   async addMemory(p: Principal, input: AddMemoryInput): Promise<AddMemoryOutcome> {
-    const group = resolveGroup(p, input.group_id);
+    const group = resolveGroup(p, input.group_id, 'write');
     const episodeInput: EpisodeInput = {
       groupId: group,
       content: input.content,
@@ -443,7 +445,7 @@ export class MemoryService {
   }
 
   async retryFailed(p: Principal, input: GroupInput) {
-    const group = resolveGroup(p, input.group_id);
+    const group = resolveGroup(p, input.group_id, 'write');
     const r = await this.track(this.zep.ingest.retryFailed(group));
     this.persistence?.schedule(this.zep);
     return { group_id: group, retried: r.retried, succeeded: r.succeeded, still_failing: r.stillFailing };
@@ -526,7 +528,7 @@ export class MemoryService {
   }
 
   private canSee(p: Principal, job: Job): boolean {
-    return job.group === undefined ? p.groups === 'any' : permits(p, job.group);
+    return job.group === undefined ? unrestricted(p) : permits(p, job.group, 'read');
   }
 
   /* ---------- queries ---------- */
@@ -601,7 +603,7 @@ export class MemoryService {
   }
 
   async invalidateFact(p: Principal, input: InvalidateFactInputShape) {
-    const group = resolveGroup(p, input.group_id);
+    const group = resolveGroup(p, input.group_id, 'write');
     const id = normaliseId(input.uuid, 'fact');
     const at = parseInstant(input.at, 'at');
     const uuid = UUID_RE.test(id) ? id : pickByPrefix(await this.zep.store.getFacts(group), id, 'fact').uuid;
@@ -624,7 +626,7 @@ export class MemoryService {
    * history, and the returned `fact` is its corrected copy (a new uuid).
    */
   async reopenFact(p: Principal, input: ReopenFactInputShape) {
-    const group = resolveGroup(p, input.group_id);
+    const group = resolveGroup(p, input.group_id, 'write');
     const id = normaliseId(input.uuid, 'fact');
     const invalidAt = parseInstant(input.invalid_at, 'invalid_at');
     const uuid = UUID_RE.test(id) ? id : pickByPrefix(await this.zep.store.getFacts(group), id, 'fact').uuid;
@@ -646,7 +648,7 @@ export class MemoryService {
    * 'forgotten'.
    */
   async forgetEpisode(p: Principal, input: ForgetEpisodeInputShape) {
-    const group = resolveGroup(p, input.group_id);
+    const group = resolveGroup(p, input.group_id, 'write');
     const episode = await this.findEpisode(group, input.id);
     try {
       const r = await this.zep.ingest.forgetEpisode(episode.uuid, { groupId: group, reason: input.reason });
@@ -854,18 +856,13 @@ export class MemoryService {
   }
 
   /**
-   * The groups the caller may open, most recently active first: its own list,
-   * or for a principal allowed any group, every group that holds data.
+   * The groups the caller may open, most recently active first, with its
+   * role in each: see visibleGroups(); for a caller allowed any group, every
+   * group that holds data.
    */
   async groups(p: Principal) {
     const store = this.zep.store;
-    let ids: string[];
-    if (p.groups !== 'any') ids = [...p.groups];
-    else if (store.listGroups) ids = await store.listGroups();
-    else {
-      const [episodes, entities] = await Promise.all([store.getEpisodes(), store.getEntities()]);
-      ids = [...new Set([...episodes.map((e) => e.groupId), ...entities.map((e) => e.groupId)])];
-    }
+    const ids = (await this.visibleGroups(p)) ?? (await this.storedGroups());
     const now = new Date();
     const rows = await Promise.all(
       ids.map(async (group) => {
@@ -877,6 +874,7 @@ export class MemoryService {
         const last = episodes.reduce<Date | undefined>((m, e) => (!m || e.createdAt > m ? e.createdAt : m), undefined);
         return {
           group_id: group,
+          role: roleIn(p, group)!,
           entities: entities.length,
           facts: facts.length,
           active_facts: facts.filter((f) => isFactActive(f, now)).length,
@@ -900,7 +898,8 @@ export class MemoryService {
       store: this.storeLabel,
       llm: this.llmLabel,
       default_group: p.defaultGroup,
-      groups: p.groups === 'any' ? null : [...p.groups],
+      /** the patterns the caller may read (null: any group) */
+      groups: unrestricted(p) ? null : effectiveGrants(p).map((g) => g.pattern),
       jobs: this.jobs.statsFor((j) => this.canSee(p, j)),
       /** over the caller's groups: failed episodes, and those the background retry gave up on */
       episodes: await this.failures(p),
@@ -916,8 +915,8 @@ export class MemoryService {
    */
   private async failures(p: Principal): Promise<{ failed: number; given_up: number } | null> {
     const store = this.zep.store;
-    const groups = p.groups === 'any' ? undefined : [...p.groups];
     try {
+      const groups = await this.visibleGroups(p);
       if (store.countFailedEpisodes) {
         const counts = await store.countFailedEpisodes(groups, this.retryMax);
         return { failed: counts.failed, given_up: counts.givenUp };
@@ -929,6 +928,28 @@ export class MemoryService {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * The groups the caller may read: its exact grants (held or empty), every
+   * stored group a pattern of its grants matches, and its default group, when
+   * readable. Undefined for a caller allowed any group.
+   */
+  private async visibleGroups(p: Principal): Promise<string[] | undefined> {
+    if (unrestricted(p)) return undefined;
+    const patterns = [...effectiveGrants(p).map((g) => g.pattern), p.defaultGroup];
+    const exact = patterns.filter((g) => !g.endsWith('*'));
+    const stored = patterns.length > exact.length ? await this.storedGroups() : [];
+    const matched = stored.filter((g) => patterns.some((pattern) => pattern.endsWith('*') && matchesPattern(pattern, g)));
+    return [...new Set([...exact, ...matched])].filter((g) => permits(p, g));
+  }
+
+  /** Every group that holds an episode or an entity. */
+  private async storedGroups(): Promise<string[]> {
+    const store = this.zep.store;
+    if (store.listGroups) return store.listGroups();
+    const [episodes, entities] = await Promise.all([store.getEpisodes(), store.getEntities()]);
+    return [...new Set([...episodes.map((e) => e.groupId), ...entities.map((e) => e.groupId)])];
   }
 
   /* ---------- lifecycle ---------- */

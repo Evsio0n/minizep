@@ -22,6 +22,7 @@ import {
 import type { Embedder } from '../provider/interfaces.js';
 import { JobQueue } from '../jobs/queue.js';
 import { loadLocalDatabaseUrl } from '../cli/local-db.js';
+import { MemoryAccessStore, type AccessStore } from '../store/access-store.js';
 
 /** Default embedding endpoint: a llama.cpp server on the loopback interface. */
 const DEFAULT_EMBED_URL = 'http://127.0.0.1:11435';
@@ -30,6 +31,8 @@ export interface Runtime {
   zep: Minizep;
   persistence: FilePersistence;
   jobs: JobQueue;
+  /** users, grants and tokens: next to the graph in Postgres, else in memory until exit */
+  access: AccessStore;
   llmLabel: string;
   storeLabel: string;
   /** release the database pool (after the last flush) */
@@ -76,6 +79,7 @@ export async function runtimeFromEnv(): Promise<Runtime> {
       zep: new Minizep({ store, llm, embedder }),
       persistence,
       jobs,
+      access: store.accessStore(),
       llmLabel,
       storeLabel: `postgres (${databaseUrl.replace(/:[^:@/]+@/, ':***@')}, dims=${store.embeddingDims})`,
       close: () => store.close(),
@@ -88,6 +92,7 @@ export async function runtimeFromEnv(): Promise<Runtime> {
     zep,
     persistence,
     jobs,
+    access: new MemoryAccessStore(),
     llmLabel,
     storeLabel: `memory + snapshot ${dbPath} (${loaded ? 'loaded' : 'empty'})`,
     close: async () => undefined,

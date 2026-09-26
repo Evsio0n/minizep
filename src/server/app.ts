@@ -16,21 +16,34 @@ import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
 import type { Minizep } from '../index.js';
 import { JobQueue } from '../jobs/queue.js';
-import { authorize, type Principal } from './auth.js';
+import { MemoryAccessStore, type AccessStore } from '../store/access-store.js';
+import { AccessControl, accessShapes } from './access.js';
+import { isAnonymous, type Principal } from './auth.js';
 import { bindOnce, listenWithRetry, parseHosts, type RetryOptions, type RetryingListen } from './listen.js';
-import { createRestHandler, readJsonBody, sendJson } from './rest.js';
+import { createRestHandler, parse, readJsonBody, sendJson } from './rest.js';
 import { MemoryService, type SnapshotWriter } from './service.js';
 import { SessionRegistry } from './sessions.js';
 import { registerTools, SERVER_INFO, serverOptionsFor } from './tools.js';
-import { sendUiPage, uiPrincipal, uiRefusal, type UiOptions } from './ui.js';
+import {
+  LoginThrottle,
+  SESSION_COOKIE,
+  readCookie,
+  sendUiPage,
+  sessionCookie,
+  uiPrincipal,
+  uiRefusal,
+  type UiOptions,
+} from './ui.js';
 
 export interface HttpAppOptions {
   zep: Minizep;
   /** token -> permitted groups, first = default (see auth.parseTokens) */
   tokens: Map<string, string[]>;
-  /** with no tokens configured, serve everyone as one trusted user (local development only) */
+  /** users, grants and tokens (default: in memory, gone at exit) */
+  access?: AccessStore;
+  /** with no token configured and no user, serve everyone as one trusted user (local development only) */
   allowAnonymous?: boolean;
-  /** serve the web UI on /ui, without a token, limited to these groups (see ui.ts) */
+  /** serve the web UI on /ui: with a login, or without one for fixed groups (see ui.ts) */
   ui?: UiOptions;
   jobs?: JobQueue;
   persistence?: SnapshotWriter;
@@ -54,6 +67,8 @@ export interface HttpAppOptions {
 interface McpSession {
   server: McpServer;
   transport: StreamableHTTPServerTransport;
+  /** who the tools act for: refreshed from every request's authentication */
+  principal: Principal;
   close(): Promise<void>;
 }
 
@@ -61,6 +76,7 @@ export interface HttpApp {
   /** the request listener (usable with any node:http server) */
   handler: (req: IncomingMessage, res: ServerResponse) => void;
   service: MemoryService;
+  access: AccessControl;
   jobs: JobQueue;
   sessions: SessionRegistry<McpSession>;
   /**
@@ -96,15 +112,27 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
     storeLabel: opts.storeLabel,
     retryMax: opts.retryMax,
   });
+  const access = new AccessControl({
+    store: opts.access ?? new MemoryAccessStore(),
+    tokens: opts.tokens,
+    allowAnonymous: opts.allowAnonymous,
+    log,
+  });
   const sessions = new SessionRegistry<McpSession>({ ttlMs: opts.sessionTtlMs, maxSessions: opts.maxSessions });
   sessions.startSweeping();
   const rest = createRestHandler({
     service,
+    access,
     sessionsOf: (p) => sessions.countFor(p.id),
     log,
   });
 
-  const ui = opts.ui && { principal: uiPrincipal(opts.ui), hosts: new Set(opts.ui.hosts ?? []) };
+  const ui: UiState | undefined = opts.ui && {
+    principal: opts.ui.groups && uiPrincipal(opts.ui.groups),
+    hosts: new Set(opts.ui.hosts ?? []),
+    sessionMs: (opts.ui.sessionDays ?? 30) * 86_400_000,
+    throttle: new LoginThrottle(),
+  };
 
   const servers: Server[] = [];
   const retries: RetryingListen[] = [];
@@ -115,7 +143,6 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
   /** A new MCP server + transport acting for `principal`; registered once initialised. */
   async function openSession(principal: Principal, onReady: () => void): Promise<McpSession> {
     const server = new McpServer(SERVER_INFO, serverOptionsFor(principal));
-    registerTools(server, { service, principal });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       onsessioninitialized: (id) => {
@@ -123,7 +150,8 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
         onReady();
       },
     });
-    const session: McpSession = { server, transport, close: () => server.close() };
+    const session: McpSession = { server, transport, principal, close: () => server.close() };
+    registerTools(server, { service, principal: () => session.principal });
     transport.onclose = () => {
       if (transport.sessionId) sessions.delete(transport.sessionId);
     };
@@ -149,6 +177,8 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
       const found = sessions.acquire(sessionId, principal.id, req.method !== 'GET');
       // 404 tells a client to start a new session; 403: someone else's session
       if (!found.ok) return sendJson(res, found.status, rpcError(found.error, found.status === 404 ? -32001 : -32000));
+      // the same token, but its grants may have changed since the session began
+      found.handle.principal = principal;
       res.on('close', found.release);
       await found.handle.transport.handleRequest(req, res, body);
       return;
@@ -185,8 +215,8 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
     const isRest = url.pathname === '/v1' || url.pathname.startsWith('/v1/');
     if (!isMcp && !isRest) return sendJson(res, 404, { error: 'not found' });
 
-    const auth = authorize(req.headers.authorization, opts.tokens, opts.allowAnonymous ?? false);
-    if (auth.ok && opts.tokens.size === 0 && !fromLocalClient(req)) {
+    const auth = await access.authenticate(req.headers.authorization);
+    if (auth.ok && isAnonymous(auth.principal) && !fromLocalClient(req)) {
       // anonymous (development) mode: without a token a browser page could
       // write into the graph cross-site, or read it via DNS rebinding
       return sendJson(res, 403, { error: 'anonymous mode only serves local, non-browser clients' });
@@ -200,23 +230,28 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
   }
 
   /**
-   * The UI page and its API. No token: the fixed UI principal keeps it to the
-   * configured groups, and uiRefusal() to its own page on an allowed Host.
+   * The UI page and its API. uiRefusal() keeps every UI request to its own
+   * page on an allowed Host; the API then acts as the logged-in token, or as
+   * the fixed principal of the UI without login.
    */
-  async function handleUi(
-    req: IncomingMessage,
-    res: ServerResponse,
-    url: URL,
-    ui: { principal: Principal; hosts: ReadonlySet<string> },
-  ): Promise<void> {
+  async function handleUi(req: IncomingMessage, res: ServerResponse, url: URL, ui: UiState): Promise<void> {
     const refused = uiRefusal(req, ui.hosts);
     if (refused) return sendJson(res, 403, { error: refused });
     const path = url.pathname;
-    if (path === '/ui/api/v1' || path.startsWith('/ui/api/v1/')) {
+    if (path === '/ui/api' || path.startsWith('/ui/api/')) {
       if (closing) return sendJson(res, 503, { error: 'server is shutting down' });
       res.setHeader('x-content-type-options', 'nosniff');
       res.setHeader('cache-control', 'no-store');
-      return rest(req, res, new URL(path.slice('/ui/api'.length) + url.search, 'http://localhost'), ui.principal);
+      if (path === '/ui/api/v1' || path.startsWith('/ui/api/v1/')) {
+        const principal = ui.principal ?? (await access.sessionPrincipal(readCookie(req, SESSION_COOKIE)));
+        if (!principal) return sendJson(res, 401, { error: 'login required' });
+        return rest(req, res, new URL(path.slice('/ui/api'.length) + url.search, 'http://localhost'), principal);
+      }
+      return handleUiSession(req, res, path, ui).catch((err) => {
+        const status = (err as { status?: unknown }).status;
+        if (typeof status !== 'number') throw err;
+        sendJson(res, status, { error: (err as Error).message });
+      });
     }
     // The page lives at /ui, so the relative "ui/api/v1" it calls resolves to
     // /ui/api/v1 (also behind a path prefix). "/" and "/ui/" lead there.
@@ -228,6 +263,41 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
     if (target === 'page') return sendUiPage(req, res);
     res.writeHead(302, { location: target + url.search, 'cache-control': 'no-cache', 'content-length': '0' });
     res.end();
+  }
+
+  /**
+   * /ui/api/login, /logout and /me. Without login (MINIZEP_UI_GROUPS) /me
+   * answers the fixed principal and there is nothing to log in to.
+   */
+  async function handleUiSession(req: IncomingMessage, res: ServerResponse, path: string, ui: UiState): Promise<void> {
+    const method = path === '/ui/api/me' ? 'GET' : path === '/ui/api/login' || path === '/ui/api/logout' ? 'POST' : undefined;
+    if (!method) return sendJson(res, 404, { error: 'not found' });
+    if (req.method !== method) return sendJson(res, 405, { error: `method not allowed (use ${method})` }, { allow: method });
+    const sid = readCookie(req, SESSION_COOKIE);
+    if (path === '/ui/api/me') {
+      const principal = ui.principal ?? (await access.sessionPrincipal(sid));
+      if (!principal) return sendJson(res, 401, { error: 'login required' });
+      return sendJson(res, 200, await access.me(principal));
+    }
+    if (ui.principal) return sendJson(res, 404, { error: 'this UI has no login (MINIZEP_UI_GROUPS)' });
+    if (path === '/ui/api/logout') {
+      await access.logout(sid);
+      return sendJson(res, 200, { ok: true }, { 'set-cookie': sessionCookie('', 0) });
+    }
+
+    const address = req.socket.remoteAddress ?? '';
+    const wait = ui.throttle.blockedFor(address);
+    if (wait > 0) {
+      return sendJson(res, 429, { error: 'too many failed logins: try again later' }, { 'retry-after': String(Math.ceil(wait / 1000)) });
+    }
+    const { token } = parse(accessShapes.login, await readJsonBody(req));
+    const login = await access.login(token, ui.sessionMs);
+    if (!login) {
+      ui.throttle.fail(address);
+      return sendJson(res, 403, { error: 'invalid token' });
+    }
+    const body = { me: await access.me(login.principal), expires_at: login.expiresAt.toISOString() };
+    return sendJson(res, 200, body, { 'set-cookie': sessionCookie(login.sid, Math.floor(ui.sessionMs / 1000)) });
   }
 
   /** No Origin header (not a browser page) and a loopback Host. */
@@ -300,7 +370,15 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
     return closing;
   }
 
-  return { handler, service, jobs, sessions, listen, addresses, close };
+  return { handler, service, access, jobs, sessions, listen, addresses, close };
+}
+
+interface UiState {
+  /** the fixed caller of the UI without login; undefined: visitors log in */
+  principal?: Principal;
+  hosts: ReadonlySet<string>;
+  sessionMs: number;
+  throttle: LoginThrottle;
 }
 
 function describe(a: AddressInfo, ui: boolean): string {

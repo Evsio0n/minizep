@@ -50,7 +50,7 @@ export async function serveStdio(opts: StdioOptions): Promise<StdioServer> {
   // single local user: every group is theirs
   const principal = localPrincipal(opts.defaultGroup);
   const server = new McpServer(SERVER_INFO, serverOptionsFor(principal));
-  registerTools(server, { service, principal });
+  registerTools(server, { service, principal: () => principal });
   // once the client is gone its pipe is broken: a late answer must not crash
   // the process while it drains
   stdout.on('error', (err) => log(`stdout: ${err.message}`));

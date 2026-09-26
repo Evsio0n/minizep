@@ -2,6 +2,7 @@ import { Pool, type PoolClient } from 'pg';
 import { isFactActive, type EntityEdge, type EntityNode, type EpisodicNode, type UUID } from '../model/types.js';
 import { bm25TermScores, tokenize, type Bm25Corpus } from '../search/retrieval.js';
 import type { FailedEpisodes, GraphStore } from './memory-store.js';
+import { PostgresAccessStore } from './access-store.js';
 
 export interface PostgresStoreOptions {
   connectionString?: string;
@@ -160,6 +161,11 @@ export class PostgresStore implements GraphStore {
 
   async close(): Promise<void> {
     await this.pool.end();
+  }
+
+  /** Users, grants and tokens (access-store.ts), kept in this database and schema, on this pool. */
+  accessStore(): PostgresAccessStore {
+    return new PostgresAccessStore(this.pool, this.schema);
   }
 
   /** Dimension of the existing embedding column, or null when the table is new. */
