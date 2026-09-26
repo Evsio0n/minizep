@@ -21,7 +21,7 @@ import { bindOnce, listenWithRetry, parseHosts, type RetryOptions, type Retrying
 import { createRestHandler, readJsonBody, sendJson } from './rest.js';
 import { MemoryService, type SnapshotWriter } from './service.js';
 import { SessionRegistry } from './sessions.js';
-import { registerTools, SERVER_INFO, SERVER_OPTIONS } from './tools.js';
+import { registerTools, SERVER_INFO, serverOptionsFor } from './tools.js';
 import { sendUiPage, uiPrincipal, uiRefusal, type UiOptions } from './ui.js';
 
 export interface HttpAppOptions {
@@ -114,7 +114,7 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
 
   /** A new MCP server + transport acting for `principal`; registered once initialised. */
   async function openSession(principal: Principal, onReady: () => void): Promise<McpSession> {
-    const server = new McpServer(SERVER_INFO, SERVER_OPTIONS);
+    const server = new McpServer(SERVER_INFO, serverOptionsFor(principal));
     registerTools(server, { service, principal });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),

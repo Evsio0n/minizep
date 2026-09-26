@@ -677,7 +677,7 @@ test('mcp: the server explains itself: instructions, the guide of docs/MEMORY-GU
     }
 
     const { tools } = await a.client.listTools();
-    const reads = ['search_facts', 'facts_about', 'facts_at', 'list_entities', 'list_episodes', 'get_episode', 'memory_job_status', 'graph_stats', 'memory_guide'];
+    const reads = ['search_facts', 'facts_about', 'facts_at', 'list_entities', 'list_episodes', 'get_episode', 'memory_job_status', 'graph_stats', 'list_groups', 'memory_guide'];
     const guide = readFileSync(new URL('../docs/MEMORY-GUIDE.md', import.meta.url), 'utf8');
     for (const t of tools) {
       assert.equal(t.annotations?.openWorldHint, false, t.name);
@@ -694,7 +694,7 @@ test('mcp: the server explains itself: instructions, the guide of docs/MEMORY-GU
     assert.deepEqual([add?.destructiveHint, add?.idempotentHint], [false, true]);
     assert.equal(tools.find((t) => t.name === 'retry_failed')?.annotations?.destructiveHint, false);
     // the instructions send to the same tools as the guide's decision table
-    for (const name of ['add_memory', 'invalidate_fact', 'reopen_fact', 'forget_episode', 'memory_job_status', 'graph_stats', 'retry_failed', 'memory_guide']) {
+    for (const name of ['add_memory', 'invalidate_fact', 'reopen_fact', 'forget_episode', 'memory_job_status', 'graph_stats', 'retry_failed', 'list_groups', 'memory_guide']) {
       assert.match(instructions, new RegExp(`\\b${name}\\b`));
       assert.ok(tools.some((t) => t.name === name), name);
     }
