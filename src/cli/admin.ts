@@ -32,7 +32,8 @@ const USAGE = `usage: minizep-admin <command> [--json]
 
 A pattern is a group name, or a prefix ending in "*" ("bob/*"; "*" = every group).
 The workspace of "user add" is its default group g (--default-group, else <name>) and g/*:
-the user is owner of both, unless --no-workspace.`;
+the user is owner of both, unless --no-workspace. It is refused when another user's grant
+already reaches g or a group under it: then use --no-workspace and grant a role.`;
 
 const ADMIN: Principal = { id: 'cli', defaultGroup: 'default', grants: 'any', admin: true };
 

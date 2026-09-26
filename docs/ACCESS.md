@@ -31,7 +31,8 @@ use). A server without a database keeps them in memory only: they are gone when 
 
   A new token must reach at least one group: its user's grants (every group for an admin) within
   its `groups`. One that reaches none is refused with 400
-  `this token would reach none of the groups of "<user>" (their grants: <patterns>)`, and so is a
+  `this token would reach none of the groups of "<user>" (their grants: <patterns>)` (from
+  `/v1/me/tokens`, only the grants the calling token has, as `/v1/me` shows them), and so is a
   `default_group` it cannot read (400 `default group "<g>" is outside this token's reach`). A
   token with `groups` but no `default_group`, which cannot read its user's default group, gets
   the first exact group name (no `*`) of its `groups` that it can read as its `default_group`, or
@@ -66,9 +67,16 @@ caller's role in each group, so a model knows where it may only search.
 on `bob` and on `bob/*`: his own group and any sub-group he opens (`bob/notes`, `bob/asr`). A
 group comes into existence with its first memory.
 
-The workspace is always the default group and its sub-groups: `--default-group pff` makes it
-`pff` and `pff/*` (grants of `owner` on both, whatever the user's name). `--no-workspace` skips
-both grants: the user can then read its default group only once it is granted.
+`user add` makes the workspace from the default group given then: `--default-group pff` makes it
+`pff` and `pff/*` (grants of `owner` on both, whatever the user's name). A workspace never takes
+over a group in use: when another user's grant already reaches the group or one under it (a team
+group, someone's workspace), `user add` is refused with 409
+`group "<g>" or a sub-group already has members (<users>): create the user without a workspace and grant a role`,
+since its owner could read their memories and remove their grants. The default group of a
+workspace has at most 254 characters (400 otherwise), so that `<g>/*` stays a pattern.
+`--no-workspace` skips both grants: the user can then read its default group only once it is
+granted. `user set --default-group` later moves no grant: grant the new group separately, or
+its calls without `group_id` fail with 403 `no default group: pass group_id`.
 
 Bob shares `bob/notes` with Alice as a reader:
 
@@ -103,8 +111,11 @@ token revoke <token-id>
 ```
 
 `token create` refuses a token that would reach none of the user's groups, or whose
-`--default-group` it cannot read, and gives a narrowed one a default group it can read (see
-[Concepts](#concepts), Token). `--json` prints the JSON of the matching REST endpoint. A running
+`--default-group` it cannot read. A narrowed one without `--default-group` that cannot read its
+user's default group gets the first exact group (no `*`) of `--groups` it can read as its default,
+else none, and calls then pass `group_id` (see [Concepts](#concepts), Token): for a user with
+default group `pff`, `--groups 'pff/*'` has no default, so add `--default-group pff/notes` or use
+`--groups pff,pff/*`. `--json` prints the JSON of the matching REST endpoint. A running
 server sees changes made with the CLI within 30 seconds (it caches each token's rights that
 long); changes made through its own REST endpoints apply at once.
 
@@ -176,7 +187,7 @@ Everything else is 403 `admin rights required`.
 | Route | Body | Answer |
 |---|---|---|
 | `GET /v1/admin/users` | | 200 `{users: [user + {grants: [{pattern, role, created_at}], tokens: [token]}]}` |
-| `POST /v1/admin/users` | `{name, admin?, default_group?, workspace? = true}` | 201 `{user, grants: [grant], token: "<secret>", record: token}`, `grants` owner of the default group (`default_group`, else `name`) and its `/*`, none without a workspace; 409 when the name is taken |
+| `POST /v1/admin/users` | `{name, admin?, default_group?, workspace? = true}` | 201 `{user, grants: [grant], token: "<secret>", record: token}`, `grants` owner of the default group (`default_group`, else `name`) and its `/*`, none without a workspace; 409 when the name is taken or another user's grant reaches the workspace (see [Workspaces](#workspaces)); 400 when a workspace's default group is over 254 characters |
 | `POST /v1/admin/users/:name` | `{admin?, disabled?, default_group?}` | 200 `{user}`; 404 |
 | `POST /v1/admin/users/:name/tokens` | `{name?, groups?, role?, default_group?, expires_days?}` | 201 `{token: "<secret>", record: token}`; 400 when it would reach none of the user's groups or cannot read `default_group`; 404 |
 | `POST /v1/admin/tokens/:id/revoke` | | 200 `{record: token}`; 404 |
