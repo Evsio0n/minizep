@@ -61,7 +61,8 @@ sudo deploy/install.sh --user minizep     # 启用、重启、等 /health 就绪
 
 - [docs/DEPLOY.md](docs/DEPLOY.md)：拓扑、只在 VPN 上暴露、token 与 group、轮换 token、接入 MCP 客户端、
   REST 快速上手、Web UI、测试数据库、升级与回滚、embedding 换班
-- [docs/API.md](docs/API.md)：MCP 工具与 REST（`/v1`）接口，以及可选的 Web UI（`/ui`，`MINIZEP_UI=1`，用 token 登录）
+- [docs/API.md](docs/API.md)：MCP 工具与 REST（`/v1`）接口，以及可选的 Web UI（`/ui`，`MINIZEP_UI=1`，用 token 登录；
+  按角色只读或可写，owner 管理 group 成员，Access 页管理自己的 token，管理员管理用户、授权与 token）
 - [docs/ACCESS.md](docs/ACCESS.md)：用户、角色（reader / writer / owner）与按 group 授权，`minizep-admin`，从 `MINIZEP_TOKENS` 迁移
 
 ## 生产化状态

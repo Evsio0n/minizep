@@ -193,9 +193,33 @@ it shows a login form while `/ui/api/me` answers 401.
 - The cookie's path is `/ui`: behind a proxy that serves minizep under a prefix, rewrite it
   (nginx: `proxy_cookie_path /ui /prefix/ui;`).
 
+What the page does with this:
+
+- **Login.** The token typed into the form is sent once to `/ui/api/login` and kept nowhere by the
+  page (no local or session storage, never in a URL); the field is cleared after each attempt.
+  Whenever a call answers 401 (logged out in another tab, session expired, token revoked, user
+  disabled), the login form comes back over the page; logging in again returns to the same place.
+  The top bar shows who is logged in (the user, or `token tok_…` for an env token), an `admin`
+  badge, and a menu with Access and Log out.
+- **Roles.** The group list and the group switcher show the caller's role in each group. In a
+  group where it is `reader`, the page marks it read-only and offers no change: no Add memory,
+  End / Retract fact or Retry failed.
+- **Members** (`#/g/<group>/members`, in the sidebar for owners and admins): the grants that reach
+  the group. Exact grants can be added by user name, given another role or removed; grants by
+  pattern are listed as `via bob/*` and changed only by admins. An owner's own row is not editable.
+- **Access** (`#/access`): the account, the grants of this login and the account's tokens (name,
+  prefix, groups, role, created, last used, expiry, state). A new token takes a name, optional
+  groups (comma-separated patterns), a role cap, a default group and an expiry in days; its secret
+  is shown once with a copy button. An env token has no account: the page says so. Admins also see
+  every user (admin, disabled, default group, grants, active tokens) and can create one (with or
+  without a workspace; its first token is shown once), enable or disable it, make or remove an
+  admin, set its default group, add, change or revoke grants, and create or revoke its tokens.
+  Revoking, disabling and admin changes ask for confirmation.
+
 `MINIZEP_UI_GROUPS`, the UI without login acting as writer on fixed groups, still works but is
 deprecated (the server logs a warning). There `/ui/api/me` answers that fixed caller and
-`/ui/api/login`/`logout` are 404. Setting both variables stops the server at start.
+`/ui/api/login`/`logout` are 404; the page then shows no login, logout or Access entry. Setting
+both variables stops the server at start.
 
 ## Starting the server
 

@@ -464,6 +464,35 @@ dialog.busy .dlg-foot .btn-primary, dialog.busy .dlg-foot .btn-danger { cursor: 
 .blocked-card .ico { color: var(--amber); }
 .blocked-card code { display: block; padding: 8px 10px; border-radius: 8px; background: var(--surface-2); word-break: break-word; }
 
+/* ---- login ----------------------------------------------------------- */
+.login { position: fixed; inset: 0; z-index: 90; display: grid; place-items: center; padding: 16px; background: var(--bg); overflow: auto; }
+.login-card { width: min(400px, 100%); padding: 28px; display: flex; flex-direction: column; gap: 16px; }
+.login-brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 16px; letter-spacing: -.01em; }
+.login-card .btn-primary { width: 100%; height: 36px; }
+.login-note { padding: 8px 12px; border-radius: 8px; background: var(--amber-bg); color: var(--amber-fg); font-size: 13px; }
+.form-error { padding: 8px 12px; border-radius: 8px; background: var(--red-bg); color: var(--red-fg); font-size: 13px; word-break: break-word; }
+
+/* ---- account, roles, access page ------------------------------------- */
+.b-accent { background: var(--accent-soft); color: var(--accent-fg); }
+.acct > .btn { max-width: 260px; }
+.acct-label { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+.acct-name { overflow: hidden; text-overflow: ellipsis; }
+.menu-head { display: flex; flex-direction: column; gap: 2px; padding: 6px 10px 10px; margin-bottom: 6px; border-bottom: 1px solid var(--border); min-width: 0; }
+.menu-head strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acc { display: flex; flex-direction: column; gap: 16px; max-width: 1180px; }
+.acc-card { padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.acc-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.acc-card .table-wrap { border-radius: 10px; }
+.grant-list { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.grant { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 4px 0 8px; border-radius: 6px; background: var(--surface-2); border: 1px solid var(--border); font-size: 12px; max-width: 100%; }
+.grant code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.warnbox { display: flex; align-items: flex-start; gap: 8px; padding: 10px 12px; border-radius: 10px; background: var(--amber-bg); color: var(--amber-fg); font-size: 13px; }
+.ulist li { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--border); min-width: 0; }
+.ulist li:first-child { border-top: 0; }
+.ulist code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tbl .act { text-align: right; white-space: nowrap; }
+dialog.dlg-xl { width: min(900px, calc(100vw - 32px)); }
+
 /* ---- fact state text (last, so it wins over component resets) ---------- */
 .st-ended, .st-retracted, .tl-fact.st-ended, .tl-fact.st-retracted { text-decoration: line-through; color: var(--text-3); }
 .st-retracted { text-decoration-color: var(--red); }
@@ -504,8 +533,8 @@ dialog.busy .dlg-foot .btn-primary, dialog.busy .dlg-foot .btn-danger { cursor: 
 /* =============================================================================
    minizep web UI: one file, no build step, no libraries.
 
-   Sections: 0 strings · 1 util · 2 api · 3 temporal · 4 store · 5 router
-             6 components · 7 graph · 8 views · boot
+   Sections: 0 strings · 1 util · 2 api · 2b session (login, roles) · 3 temporal
+             4 store · 5 router · 6 components · 7 graph · 8 views · boot
 
    Everything the server returns (names, fact sentences, summaries, episode
    text) comes from an LLM or a user and may contain markup, so it is only
@@ -518,7 +547,7 @@ const S = {
   groups: 'Groups',
   allGroups: 'All groups',
   groupsSub: 'Memory namespaces on this server. A group comes into existence with its first memory.',
-  views: { graph: 'Graph', facts: 'Facts', entities: 'Entities', episodes: 'Episodes' },
+  views: { graph: 'Graph', facts: 'Facts', entities: 'Entities', episodes: 'Episodes', members: 'Members' },
   addMemory: 'Add memory',
   openGroup: 'Open group',
   openGroupPh: 'Open group…',
@@ -542,7 +571,7 @@ const S = {
   blockedTitle: 'This page cannot talk to the server',
   blockedText:
     'The server refused the UI’s request. Open the UI from the minizep server’s own address ' +
-    '(for example http://127.0.0.1:8787/ui) with MINIZEP_UI_GROUPS set. A host name other than ' +
+    '(for example http://127.0.0.1:8787/ui) with MINIZEP_UI=1 set. A host name other than ' +
     'an IP address or localhost has to be listed in MINIZEP_UI_HOSTS.',
   reload: 'Reload',
   loading: 'Loading…',
@@ -779,6 +808,164 @@ const S = {
   factRetracted: 'Fact retracted',
   endBtn: 'End fact',
   retractBtn: 'Retract',
+  // login
+  login: 'Log in',
+  loginTitle: 'Log in',
+  loggingIn: 'Logging in…',
+  tokenField: 'API token',
+  tokenHelp: 'A token comes from an admin of this server, or from the Access page of your account once you are logged in.',
+  tokenRequired: 'Enter a token.',
+  badToken: 'That token is not valid: it is wrong, revoked or expired, or its user is disabled.',
+  tooManyLogins: (s) => `Too many failed logins from this address. Try again ${s ? `in ${s >= 90 ? `${Math.ceil(s / 60)} minutes` : `${s} seconds`}` : 'later'}.`,
+  sessionEnded: 'Your session ended (logged out, expired, or its token was revoked). Log in again to continue where you were.',
+  logout: 'Log out',
+  // account (top bar)
+  account: 'Account',
+  accountMenu: (who) => `Account: ${who}`,
+  envToken: (id) => `token ${id}`,
+  loggedInAs: 'Logged in as',
+  withToken: (n) => `with the token “${n}”`,
+  envTokenShort: 'a token configured on the server',
+  adminBadge: 'admin',
+  you: 'you',
+  // roles
+  roles: { reader: 'reader', writer: 'writer', owner: 'owner' },
+  roleTip: { reader: 'may read', writer: 'may read and write', owner: 'may read, write and manage members' },
+  colRole: 'Role',
+  colYourRole: 'Your role',
+  readOnly: 'read-only',
+  readOnlyTip: 'Your role in this group is reader: you can look, not change.',
+  readOnlyNote: 'Read-only: your role in this group is reader.',
+  noWriteTip: 'This login may not write into any group.',
+  // access page
+  access: 'Access',
+  accessSub: 'Your account and its API tokens; for admins, every user with their grants and tokens.',
+  myAccount: 'My account',
+  fUser: 'User',
+  noAccount: 'none (a token configured on the server)',
+  fLoggedInWith: 'Logged in with',
+  envTokenKind: 'server token',
+  expiresOn: (d) => `expires ${d}`,
+  fDefaultGroup: 'Default group',
+  fGrants: 'May use',
+  grantsHelp: 'The grants of your account, narrowed by the token you logged in with.',
+  envGrantsHelp: 'The groups this server token may use.',
+  noGrants: 'no group',
+  moreN: (n) => `+${n} more`,
+  adminNarrowed: 'admin (not with this token)',
+  adminNarrowedTip: 'This token is narrowed (groups or role), so it does not act as an admin.',
+  noLoginNote: 'This UI runs without a login (MINIZEP_UI_GROUPS, deprecated): there are no accounts or tokens to manage here.',
+  envTokenNote: 'Your token is configured on the server (MINIZEP_TOKENS) and belongs to no account, so it has no tokens of its own to manage. Ask an admin for a user account to make tokens here.',
+  myTokens: 'My tokens',
+  tokensHelp: 'Give each agent or device its own token. A token can be narrowed to some groups, a lower role or an expiry, and never does more than the token you are logged in with.',
+  newToken: 'New token',
+  noTokens: 'No tokens',
+  colPrefix: 'Prefix',
+  colGroups: 'Groups',
+  colCreated: 'Created',
+  colLastUsed: 'Last used',
+  colExpires: 'Expires',
+  actions: 'Actions',
+  allOfAccount: 'all of the account’s',
+  roleOfAccount: 'the account’s',
+  defaultIs: (g) => `default ${g}`,
+  never: 'never',
+  tokenState: { active: 'active', revoked: 'revoked', expired: 'expired' },
+  thisLogin: 'this login',
+  revoke: 'Revoke',
+  revokeToken: 'Revoke token',
+  revokeTokenText: (n) => `Revoke the token “${n}”? Everything that uses it loses access at once. This cannot be undone.`,
+  revokeOwnNote: ' It is the token you are logged in with: you will be logged out.',
+  tokenRevoked: 'Token revoked',
+  // token form and secret
+  newTokenFor: (u) => `New token for ${u}`,
+  fTokenName: 'Name',
+  tokenNamePh: 'e.g. laptop, ci-agent',
+  nameRequired: 'A name is required.',
+  fTokenGroups: 'Groups',
+  tokenGroupsPh: 'team-a, bob/*',
+  tokenGroupsHelp: 'Comma-separated group names, or prefixes ending in *. Empty: every group of the account.',
+  fTokenRole: 'Role cap',
+  roleInherit: 'the account’s role',
+  tokenRoleHelp: 'The token never acts above this role.',
+  fExpires: 'Expires after (days)',
+  expiresHelp: '1 to 3650; empty: never.',
+  badDays: 'Days must be a whole number from 1 to 3650.',
+  createToken: 'Create token',
+  tokenCreated: 'Token created',
+  secretLead: 'Copy the token now and hand it to the agent or person that needs it.',
+  secretOnce: 'You will not see it again: minizep keeps only a hash of it. A lost token is revoked and a new one made.',
+  tokenSecret: 'Token secret',
+  copy: 'Copy',
+  copiedShort: 'Copied',
+  // members
+  membersSub: 'Who may read, write or manage this group. Grants by pattern (such as bob/*) reach it too; admins manage those on the Access page.',
+  memberUserPh: 'User name',
+  addMember: 'Add member',
+  userRequired: 'Enter a user name.',
+  colUser: 'User',
+  colGrant: 'Grant',
+  colAdded: 'Added',
+  exactGrant: 'this group',
+  viaPattern: (p) => `via ${p}`,
+  patternTip: 'A grant by pattern: only an admin can change it, on the Access page.',
+  selfNote: 'your own access',
+  selfTip: 'You cannot change your own access.',
+  roleFor: (x) => `Role of ${x}`,
+  remove: 'Remove',
+  removeMemberTitle: 'Remove member',
+  removeMemberText: (u, g) => `Remove the access of ${u} to ${g}? Grants by pattern that also reach it stay.`,
+  memberSet: (u, r) => `${u} is now ${r}`,
+  memberRemoved: (u) => `Removed ${u}`,
+  noMembers: 'No grant reaches this group',
+  membersForbidden: 'Only owners of this group see its members',
+  // admin
+  users: 'Users',
+  usersHelp: 'Users are never deleted: disable them. Changes apply at once to their tokens and logins.',
+  newUser: 'New user',
+  noUsers: 'No users',
+  noSuchUser: 'This user does not exist.',
+  colAdmin: 'Admin',
+  colDefault: 'Default group',
+  colGrants: 'Grants',
+  colActiveTokens: 'Active tokens',
+  disabledBadge: 'disabled',
+  activeBadge: 'active',
+  manage: 'Manage',
+  userTitle: (n) => `User ${n}`,
+  createdOn: (d) => `created ${d}`,
+  userNameHelp: '1 to 64 of a-z, 0-9, “.”, “_”, “-”, starting with a letter or digit.',
+  badUserName: 'A user name is 1 to 64 of a-z, 0-9, “.”, “_”, “-”, starting with a letter or digit.',
+  defaultGroupPh: 'the user name',
+  fAdmin: 'Admin: owner of every group, manages users, grants and tokens',
+  fWorkspace: 'Create workspace',
+  workspaceHelp: (n) => `Owner of ${n || '<name>'} and ${n || '<name>'}/*.`,
+  createUser: 'Create user',
+  userCreated: (n) => `User ${n} created`,
+  firstTokenLead: (n) => `The first token of ${n}, with all of the account’s rights. Hand it over through a safe channel.`,
+  accountSec: 'Account',
+  makeAdmin: 'Make admin',
+  removeAdmin: 'Remove admin',
+  makeAdminText: (n) => `Make ${n} an admin? Admins own every group and manage all users, grants and tokens.`,
+  removeAdminText: (n, self) => `Remove the admin rights of ${n}?${self ? ' They are yours: you lose them at once.' : ''}`,
+  disableUser: 'Disable',
+  disableUserTitle: 'Disable user',
+  enableUser: 'Enable',
+  disableText: (n, self) => `Disable ${n}? Every token and login of ${n} stops working at once.${self ? ' That is you: you will be logged out.' : ''}`,
+  userUpdated: 'User updated',
+  save: 'Save',
+  groupNameRequired: 'Enter a group name.',
+  grantsN: (n) => `Grants (${n})`,
+  noUserGrants: 'No grants: this user can open no group, unless an admin.',
+  fPattern: 'Pattern',
+  patternPh: 'group, or prefix/*',
+  patternRequired: 'Enter a group name or a pattern.',
+  addGrant: 'Add grant',
+  revokeGrant: 'Revoke grant',
+  revokeGrantText: (u, p) => `Revoke the grant of ${u} on ${p}?`,
+  grantSaved: 'Grant saved',
+  grantRevoked: 'Grant revoked',
+  tokensN: (n) => `Tokens (${n})`,
 };
 
 /* ---------------------------------------------------------------- 1. util */
@@ -858,6 +1045,11 @@ const ICONS = {
   alert: [['path', { d: 'M12 3.5l9.5 17h-19z' }], ['path', { d: 'M12 10v4.5M12 17.5v.01' }]],
   check: [['path', { d: 'M5 12.5l4.5 4.5L19 7.5' }]],
   target: [['circle', { cx: 12, cy: 12, r: 8 }], ['circle', { cx: 12, cy: 12, r: 3 }]],
+  user: [['circle', { cx: 12, cy: 8, r: 4 }], ['path', { d: 'M4 21c1-4.5 4.2-7 8-7s7 2.5 8 7' }]],
+  key: [['circle', { cx: 8, cy: 15, r: 4 }], ['path', { d: 'M10.8 12.2L20 3M16 7l3 3M14 9l2 2' }]],
+  lock: [['rect', { x: 5, y: 11, width: 14, height: 10, rx: 2 }], ['path', { d: 'M8 11V7a4 4 0 0 1 8 0v4' }]],
+  logout: [['path', { d: 'M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4' }], ['path', { d: 'M16 17l5-5-5-5M21 12H9' }]],
+  shield: [['path', { d: 'M12 3l8 3v6c0 4.5-3.4 8-8 9-4.6-1-8-4.5-8-9V6z' }], ['path', { d: 'M9 12l2 2 4-4' }]],
 };
 function icon(name, size = 16) {
   const el = sv('svg', {
@@ -956,6 +1148,7 @@ async function copyText(text) {
     } catch { ok = false; }
   }
   toast(ok ? S.copied : S.copyFailed, ok ? 'ok' : 'error');
+  return ok;
 }
 const shortId = (id) => String(id ?? '').slice(0, 8);
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
@@ -985,16 +1178,20 @@ class ApiError extends Error {
   }
 }
 const API_PREFIX = 'ui/api/v1';
+/** login, logout and me: next to the data API */
+const AUTH_PREFIX = 'ui/api';
 /**
  * The data API lives at <root>ui/api/v1 where the page itself is <root>ui/
  * (or <root>ui): resolved against the page URL, so a path prefix in front of
  * the server keeps working. Never an absolute URL.
  */
-function apiBase() {
+function apiBase(auth = false) {
   const dir = location.pathname.replace(/[^/]*$/, '');
   const root = /(^|\/)ui\/$/.test(dir) ? dir.slice(0, -3) : dir;
-  return root + API_PREFIX;
+  return root + (auth ? AUTH_PREFIX : API_PREFIX);
 }
+/** What the Host / Origin guard of the UI answers (403): the page itself cannot use the API. */
+const GUARD_REFUSAL = /^(host not allowed|cross-origin request refused)/;
 /**
  * The server's clock. created_at, expired_at and as_of are stamped by the
  * server, and a browser on another machine may run behind it; a fact ended a
@@ -1029,9 +1226,12 @@ function noteChangeStamps(rows) {
  * header, should the UI ever need one, would be added here and nowhere else.
  * `accept` lists extra statuses that resolve normally (e.g. 502 from
  * add-memory carries a full outcome). Resolves with the body plus `_status`.
+ * `auth` calls ui/api/{me,login,logout} instead of the data API. A 401 means
+ * the session is gone: the login screen takes over (the hash stays, so the
+ * page comes back to it). Calls about access pass `group: null`.
  */
 async function api(method, path, opts = {}) {
-  const { query, body, signal, accept = [], quiet = false } = opts;
+  const { query, body, signal, accept = [], quiet = false, auth = false } = opts;
   const group = Object.prototype.hasOwnProperty.call(opts, 'group') ? opts.group : state.group;
   const params = new URLSearchParams();
   const q = { ...(query || {}) };
@@ -1044,7 +1244,7 @@ async function api(method, path, opts = {}) {
     payload = JSON.stringify(b);
   }
   const qs = params.toString();
-  const url = `${apiBase()}${path}${qs ? `?${qs}` : ''}`;
+  const url = `${apiBase(auth)}${path}${qs ? `?${qs}` : ''}`;
   const headers = { accept: 'application/json' };
   if (payload !== undefined) headers['content-type'] = 'application/json';
   let res;
@@ -1069,10 +1269,200 @@ async function api(method, path, opts = {}) {
   }
   const msg = data && typeof data.error === 'string' ? data.error : `${S.httpError} ${res.status}`;
   const e = new ApiError(res.status, msg, data);
-  // a 403 that is not about a group means the Host/Origin guard refused the page itself
-  if (res.status === 403 && !/group/i.test(msg)) showBlocked(msg);
-  else if (!quiet) toast(msg, 'error');
+  const wait = Number(res.headers.get('retry-after'));
+  if (Number.isFinite(wait) && wait > 0) e.retryAfter = Math.ceil(wait);
+  if (res.status === 401) needLogin(session.running ? S.sessionEnded : '');
+  else if (res.status === 403 && GUARD_REFUSAL.test(msg)) showBlocked(msg);
+  else {
+    // a write refused as read-only: the rights may have changed since /me was read
+    if (res.status === 403 && /^read-only access/.test(msg)) refreshMeSoon();
+    if (!quiet) toast(msg, 'error');
+  }
   throw e;
+}
+
+/* ---------------------------------------------------------------- 2b. session */
+/**
+ * Who the page acts as (GET ui/api/me). `mode` is 'login' (a session cookie
+ * made from a token: logout offered) or 'open' (the deprecated UI without
+ * login, MINIZEP_UI_GROUPS: /me answers with token null and there is nothing
+ * to log in to or out of). The token typed into the login form is sent once
+ * and kept nowhere; the session itself is an HttpOnly cookie the page never
+ * sees. `running`: views are mounted; `locked`: the login screen is up.
+ */
+const session = { me: null, mode: null, running: false, locked: false };
+const ROLE_RANK = { reader: 1, writer: 2, owner: 3 };
+const ROLE_TONE = { reader: 'slate', writer: 'blue', owner: 'green' };
+const rank = (r) => ROLE_RANK[r] || 0;
+/**
+ * The role of this login in `group`, as the server computes it: the highest
+ * of the grants that match (me.grants are already narrowed by the token).
+ * null: none; undefined: unknown (no /me, e.g. an older server).
+ */
+function roleIn(group) {
+  const me = session.me;
+  if (!me) return undefined;
+  if (me.admin) return 'owner';
+  let best = null;
+  for (const g of arr(me.grants)) {
+    if (!g || typeof g.pattern !== 'string' || !rank(g.role)) continue;
+    const hit = g.pattern.endsWith('*') ? String(group ?? '').startsWith(g.pattern.slice(0, -1)) : g.pattern === group;
+    if (hit && rank(g.role) > rank(best)) best = g.role;
+  }
+  return best;
+}
+/** Unknown rights keep every control, as before logins existed; the server decides anyway. */
+const canWrite = (group) => (session.me ? rank(roleIn(group)) >= ROLE_RANK.writer : true);
+const canManage = (group) => !!session.me && roleIn(group) === 'owner';
+const canWriteSomewhere = () => !session.me || !!session.me.admin || arr(session.me.grants).some((g) => g && rank(g.role) >= ROLE_RANK.writer);
+const selfName = () => (session.me && session.me.user && session.me.user.name) || null;
+/** "ana", or "token tok_…" for a token configured on the server */
+function whoLabel(me = session.me) {
+  if (!me) return '';
+  if (me.user && me.user.name) return String(me.user.name);
+  return me.token && me.token.id ? S.envToken(me.token.id) : '';
+}
+function roleBadge(role) {
+  if (!role) return null;
+  return badge(S.roles[role] || String(role), ROLE_TONE[role] || 'slate', S.roleTip[role]);
+}
+/** What decides which controls a view shows: a change of it re-renders the view. */
+const rightsKey = () => (session.me ? `${!!session.me.admin}|${roleIn(state.group)}|${JSON.stringify(arr(session.me.grants))}` : '');
+function setMe(me) {
+  const before = rightsKey();
+  session.me = me && typeof me === 'object' ? me : null;
+  session.mode = session.me && session.me.token ? 'login' : 'open';
+  updateAccount();
+  updateChrome();
+  if (session.running && mounted && rightsKey() !== before) {
+    mountView();
+    if (panelCur) syncPanel(true);
+  }
+}
+async function refreshMe() {
+  try {
+    setMe(await api('GET', '/me', { auth: true, group: null, quiet: true }));
+  } catch { /* 401: the login screen is up; otherwise keep what is known */ }
+}
+const refreshMeSoon = debounce(refreshMe, 300);
+
+/** Everything the previous login loaded, which the next one may not see. */
+function resetSessionData() {
+  state.groupsList = null;
+  state.status = null;
+  state.timeline = null;
+  state.labels = null;
+  state.highlight = new Set();
+  metaFor = null;
+  factCache.clear();
+  rebuildLabelColors();
+}
+function lockShell(locked) {
+  session.locked = locked;
+  for (const el of [$('.shell'), $('.corner')]) if (el) el.inert = locked;
+}
+/**
+ * The session is gone (401) or was ended: stop the views and pollers of the
+ * old one and show the login. The hash is left alone, so logging in again
+ * returns to the same place.
+ */
+function needLogin(note = '') {
+  session.me = null;
+  session.mode = 'login';
+  session.running = false;
+  if (session.locked) return;
+  lockShell(true);
+  clearTimeout(statusTimer);
+  statusSeq++;
+  for (const j of jobs.values()) clearTimeout(j.timer);
+  for (const d of document.querySelectorAll('dialog[open]')) d.close();
+  closeGroupMenu();
+  closeAccountMenu();
+  refetchSoon.cancel();
+  if (mounted && mounted.api && mounted.api.destroy) {
+    try { mounted.api.destroy(); } catch (e) { console.error(e); }
+  }
+  mounted = null;
+  $('#view').replaceChildren();
+  closePanelUi();
+  updateAccount();
+  showLogin(note);
+}
+function showLogin(note) {
+  const el = $('#login');
+  const input = h('input', { class: 'input', type: 'password', name: 'token', required: true, autocomplete: 'off', spellcheck: 'false', autocapitalize: 'off', 'aria-describedby': 'login-help' });
+  const err = h('div', { class: 'form-error', role: 'alert', hidden: true });
+  const submit = h('button', { class: 'btn btn-primary', type: 'submit' }, S.login);
+  // method=post: should this handler ever not run, the token still never lands in a URL
+  const form = h('form', { class: 'form', method: 'post', novalidate: true },
+    field(S.tokenField, input, h('p', { class: 'help', id: 'login-help' }, S.tokenHelp)), err, submit);
+  const showErr = (msg) => { err.textContent = msg || ''; err.hidden = !msg; };
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const token = input.value.trim();
+    input.value = '';
+    if (!token) { showErr(S.tokenRequired); input.focus(); return; }
+    showErr('');
+    submit.disabled = true;
+    submit.textContent = S.loggingIn;
+    try {
+      const r = await api('POST', '/login', { auth: true, group: null, quiet: true, body: { token } });
+      hideLogin();
+      startApp(r.me || null);
+    } catch (e) {
+      if (!el.isConnected || el.hidden) return;
+      showErr(e.status === 403 && e.message === 'invalid token' ? S.badToken : e.status === 429 ? S.tooManyLogins(e.retryAfter) : e.message);
+      input.focus();
+    } finally {
+      input.value = '';
+      submit.disabled = false;
+      submit.textContent = S.login;
+    }
+  });
+  el.replaceChildren(h('section', { class: 'login-card card', 'aria-labelledby': 'login-title' },
+    h('div', { class: 'login-brand' }, h('span', { class: 'brand-mark' }, icon('graph', 16)), h('span', null, S.app)),
+    h('h1', { id: 'login-title' }, S.loginTitle),
+    note ? h('p', { class: 'login-note', role: 'status' }, note) : null,
+    form));
+  el.hidden = false;
+  document.title = `${S.loginTitle} · ${S.app}`;
+  input.focus();
+}
+function hideLogin() {
+  const el = $('#login');
+  el.hidden = true;
+  el.replaceChildren();
+  lockShell(false);
+}
+let jobsResumed = false;
+/** Mount the page for `me` (null: rights unknown), at the current hash. */
+function startApp(me) {
+  resetSessionData();
+  setMe(me);
+  session.running = true;
+  onUrl();
+  refreshStatus();
+  if (!jobsResumed) {
+    jobsResumed = true;
+    resumeJobs();
+  } else for (const j of jobs.values()) if (!j.done) pollJob(j.id);
+}
+async function logout() {
+  closeAccountMenu();
+  try {
+    await api('POST', '/logout', { auth: true, group: null, quiet: true });
+  } catch (e) {
+    if (e.status !== 401) { toast(e.message, 'error'); return; }
+  }
+  clearJobs();
+  // the next login starts from the group list, not inside this one's groups
+  try { history.replaceState(null, '', '#/'); } catch { /* ignore */ }
+  needLogin('');
+}
+/** Something about users, grants or tokens changed: the view that shows them reloads. */
+function emitAccess() {
+  const a = mounted && mounted.api;
+  if (a && a.onAccess) a.onAccess();
 }
 
 /* ---------------------------------------------------------------- 3. temporal */
@@ -1208,6 +1598,7 @@ function setState(patch, how = 'replace') {
   return changed;
 }
 function buildHash(s) {
+  if (s.view === 'access') return '#/access';
   if (s.view === 'groups' || !s.group) return '#/';
   const p = new URLSearchParams();
   if (s.at !== null) p.set('at', new Date(s.at).toISOString());
@@ -1288,23 +1679,27 @@ function labelColor(label) {
 
 /* ---------------------------------------------------------------- 5. router */
 const VIEW_NAMES = ['graph', 'facts', 'entities', 'episodes'];
+/** the views inside a group: the data views (with the time control), and its members (owners) */
+const GROUP_VIEWS = [...VIEW_NAMES, 'members'];
+const isDataView = (view = state.view) => VIEW_NAMES.includes(view);
 function parseSel(v) {
   const m = /^(node|edge|episode):(.+)$/.exec(v || '');
   return m ? { kind: m[1], id: m[2] } : null;
 }
-/** #/  |  #/g/<group>/<view>?at=&as_of=&history=1&sel=kind:id&q=&mode=about */
+/** #/  |  #/access  |  #/g/<group>/<view>?at=&as_of=&history=1&sel=kind:id&q=&mode=about */
 function parseHash(hash = location.hash) {
   const raw = hash.replace(/^#/, '') || '/';
   const qi = raw.indexOf('?');
   const path = qi < 0 ? raw : raw.slice(0, qi);
   const p = new URLSearchParams(qi < 0 ? '' : raw.slice(qi + 1));
   const base = { at: ms(p.get('at')), asOf: ms(p.get('as_of')), history: /^(1|true)$/.test(p.get('history') || '') };
+  if (/^\/access\/?$/.test(path)) return { view: 'access', group: null, ...base, sel: null, q: '', mode: '' };
   const m = /^\/g\/([^/]+)(?:\/([a-z]+))?\/?$/.exec(path);
   if (!m) return { view: 'groups', group: null, ...base, sel: null, q: '', mode: '' };
   let group = m[1];
   try { group = decodeURIComponent(group); } catch { /* keep raw */ }
   return {
-    view: VIEW_NAMES.includes(m[2]) ? m[2] : 'graph',
+    view: GROUP_VIEWS.includes(m[2]) ? m[2] : 'graph',
     group,
     ...base,
     sel: parseSel(p.get('sel')),
@@ -1316,7 +1711,7 @@ function parseHash(hash = location.hash) {
 function go(view, group = state.group, extra = {}) {
   replaceUrlSoon.cancel();
   const next = { ...state, view, group, sel: null, q: '', mode: '', ...extra };
-  if (view === 'groups') next.group = null;
+  if (view === 'groups' || view === 'access') next.group = null;
   const hash = buildHash(next);
   if (location.hash === hash) onUrl();
   else location.hash = hash;
@@ -1327,6 +1722,7 @@ function hrefFor(view, group = state.group) {
 let mounted = null; // {view, group, api}
 function onUrl() {
   replaceUrlSoon.cancel();
+  if (!session.running) return; // before /me, or behind the login: the hash is read once logged in
   const r = parseHash();
   if (r.group !== state.group) {
     state.timeline = null;
@@ -1365,9 +1761,9 @@ function mountView() {
   root.className = 'view';
   root.scrollTop = 0;
   mounted = { view: state.view, group: state.group, api: {} };
-  const factory = state.view === 'groups' ? GroupsView : VIEWS[state.view];
+  const factory = state.view === 'groups' ? GroupsView : state.view === 'access' ? AccessView : VIEWS[state.view];
   mounted.api = factory(root) || {};
-  if (state.group) ensureGroupMeta();
+  if (state.group && isDataView()) ensureGroupMeta();
 }
 const refetchSoon = debounce(() => {
   const a = mounted && mounted.api;
@@ -1400,7 +1796,7 @@ subscribe((changed) => {
 /* toast (bottom-right, 5s) */
 function toast(msg, kind = 'info', action = null) {
   const host = $('#toasts');
-  if (!host) return;
+  if (!host || session.locked) return; // behind the login nobody would read it
   let timer = 0;
   const close = () => {
     clearTimeout(timer);
@@ -1577,21 +1973,22 @@ function dataTable({ columns, rows, onRow, sort, rowClass, label, empty }) {
 }
 
 /* dialog (native <dialog>: focus trap, Esc, backdrop) */
-function openDialog({ title, body, actions = [], onSubmit, onClose, wide = false }) {
+function openDialog({ title, body, actions = [], onSubmit, onClose, wide = false, xl = false }) {
   const titleId = `dlg-t-${++uidSeq}`;
   const err = h('div', { class: 'dlg-error', role: 'alert', hidden: true });
   const bodyEl = h('div', { class: 'dlg-body' }, body);
   const foot = h('div', { class: 'dlg-foot' }, actions);
   const titleEl = h('h2', { id: titleId }, title);
   let busy = false;
+  let submitFn = onSubmit;
   const form = h('form', { class: 'dlg-form', novalidate: true },
     h('div', { class: 'dlg-head' }, titleEl, h('button', { class: 'btn btn-ghost btn-icon', type: 'button', 'aria-label': S.close, onclick: () => close() }, icon('x'))),
     bodyEl, err, foot);
   form.addEventListener('submit', (ev) => {
     ev.preventDefault();
-    if (!busy && onSubmit) onSubmit();
+    if (!busy && submitFn) submitFn();
   });
-  const dlg = h('dialog', { class: ['dlg', wide && 'dlg-wide'], 'aria-labelledby': titleId }, form);
+  const dlg = h('dialog', { class: ['dlg', wide && 'dlg-wide', xl && 'dlg-xl'], 'aria-labelledby': titleId }, form);
   const prevFocus = document.activeElement;
   document.body.append(dlg);
   dlg.addEventListener('close', () => {
@@ -1613,7 +2010,55 @@ function openDialog({ title, body, actions = [], onSubmit, onClose, wide = false
     setBody(node) { fill(bodyEl, node); bodyEl.scrollTop = 0; },
     setActions(list) { fill(foot, list); },
     setTitle(t) { titleEl.textContent = t; },
+    /** what Enter / a submit button does from now on (null: nothing) */
+    setOnSubmit(fn) { submitFn = fn; },
   };
+}
+
+/** Asks before a destructive change and runs it with the dialog busy; resolves true once `run` succeeded. */
+function confirmDialog({ title, text, confirmLabel, danger = true, run }) {
+  return new Promise((resolve) => {
+    let done = false;
+    const ok = h('button', { class: `btn ${danger ? 'btn-danger' : 'btn-primary'}`, type: 'submit' }, confirmLabel);
+    const d = openDialog({
+      title,
+      body: h('p', null, text),
+      actions: [h('button', { class: 'btn', type: 'button', onclick: () => d.close() }, S.cancel), ok],
+      onSubmit: async () => {
+        d.setError('');
+        d.setBusy(true);
+        try {
+          if (run) await run();
+          done = true;
+          d.close();
+        } catch (e) {
+          d.setError(e.message);
+        } finally {
+          d.setBusy(false);
+        }
+      },
+      onClose: () => resolve(done),
+    });
+  });
+}
+
+/** Replaces a dialog's content with a secret shown once (a new token), a copy button and the warning. */
+function showSecretIn(d, title, secret, lead) {
+  const out = h('input', { class: 'input grow mono', readonly: true, value: secret, 'aria-label': S.tokenSecret, autocomplete: 'off', spellcheck: 'false' });
+  out.addEventListener('focus', () => out.select());
+  const copy = h('button', { class: 'btn', type: 'button' }, icon('copy'), S.copy);
+  copy.addEventListener('click', async () => {
+    if (await copyText(secret)) fill(copy, icon('check'), S.copiedShort);
+  });
+  d.setOnSubmit(null); // Enter in the field must not run the form that made the token again
+  d.setTitle(title);
+  d.setError('');
+  d.setBody(h('div', { class: 'form' },
+    lead ? h('p', null, lead) : null,
+    h('div', { class: 'row' }, out, copy),
+    h('div', { class: 'warnbox', role: 'note' }, icon('alert'), h('span', null, S.secretOnce))));
+  d.setActions([h('button', { class: 'btn btn-primary', type: 'button', onclick: () => d.close() }, S.done)]);
+  out.focus();
 }
 
 /* ---- right detail panel: the same component for Node, Fact and Episode ---- */
@@ -1852,7 +2297,7 @@ function drawTracks() {
 function updateStrip() {
   const p = strip.parts;
   if (!p) return;
-  const inGroup = !!state.group && state.view !== 'groups';
+  const inGroup = !!state.group && isDataView();
   $('#strip').hidden = !inGroup;
   const label = (v) => (v === null ? S.now : fmtInstant(v));
   p.atBtn.replaceChildren(label(state.at), icon('chevDown', 12));
@@ -1883,22 +2328,27 @@ function buildSidebar() {
   const el = $('#sidebar');
   const item = (view, iconName, label) => h('a', { class: 'nav-item', href: '#/', title: label, dataset: { view } }, icon(iconName, 18), h('span', { class: 'nav-label' }, label));
   nav.all = item('groups', 'groups', S.allGroups);
+  nav.access = item('access', 'key', S.access);
+  nav.access.setAttribute('href', '#/access');
+  nav.access.hidden = true;
   nav.section = h('div', { class: 'nav-section' });
   nav.items = VIEW_NAMES.map((v) => item(v, v, S.views[v]));
-  nav.groupBox = h('div', null, nav.section, nav.items);
+  nav.members = item('members', 'shield', S.views.members);
+  nav.members.hidden = true;
+  nav.groupBox = h('div', null, nav.section, nav.items, nav.members);
   nav.statusDot = h('span', { class: 'sdot' });
   nav.statusText = h('span', { class: 'side-text' }, S.loading);
   nav.jobsText = h('span', { class: 'side-text', hidden: true });
   nav.status = h('div', { class: 'side-status' }, nav.statusDot, nav.statusText);
   el.append(
     h('a', { class: 'brand', href: '#/', 'aria-label': `${S.app}: ${S.allGroups}` }, h('span', { class: 'brand-mark' }, icon('graph', 16)), h('span', { class: 'brand-name' }, S.app)),
-    nav.all, nav.groupBox,
+    nav.all, nav.access, nav.groupBox,
     h('div', { class: 'side-foot' }, nav.status, nav.jobsText));
 }
 function updateNavHrefs() {
   if (!nav.items) return;
   nav.all.setAttribute('href', '#/');
-  for (const a of nav.items) a.setAttribute('href', state.group ? hrefFor(a.dataset.view) : '#/');
+  for (const a of [...nav.items, nav.members]) a.setAttribute('href', state.group ? hrefFor(a.dataset.view) : '#/');
 }
 const tb = {};
 function buildTopbar() {
@@ -1908,28 +2358,101 @@ function buildTopbar() {
   tb.switcher = h('div', { class: 'switcher' }, tb.switchBtn);
   tb.add = h('button', { class: 'btn btn-primary', type: 'button', onclick: () => openAddMemory() }, icon('plus'), h('span', { class: 'btn-label' }, S.addMemory));
   tb.theme = h('button', { class: 'btn btn-ghost btn-icon', type: 'button', onclick: toggleTheme });
-  el.append(tb.crumbs, tb.switcher, tb.add, tb.theme);
+  tb.acctBtn = h('button', { class: 'btn btn-ghost', type: 'button', 'aria-haspopup': 'true', 'aria-expanded': 'false', onclick: () => toggleAccountMenu() });
+  tb.acct = h('div', { class: 'switcher acct', hidden: true }, tb.acctBtn);
+  el.append(tb.crumbs, tb.switcher, tb.add, tb.theme, tb.acct);
   updateThemeButton();
 }
 function updateChrome() {
-  const inGroup = !!state.group && state.view !== 'groups';
+  const inGroup = !!state.group && state.view !== 'groups' && state.view !== 'access';
+  const onAccess = state.view === 'access';
+  const role = inGroup ? roleIn(state.group) : undefined;
   if (nav.items) {
     nav.groupBox.hidden = !inGroup;
     nav.section.textContent = state.group || '';
     nav.section.title = state.group || '';
-    nav.all.setAttribute('aria-current', inGroup ? 'false' : 'page');
+    nav.all.setAttribute('aria-current', inGroup || onAccess ? 'false' : 'page');
+    nav.access.hidden = !(session.mode === 'login' && session.me);
+    nav.access.setAttribute('aria-current', onAccess ? 'page' : 'false');
     for (const a of nav.items) a.setAttribute('aria-current', inGroup && a.dataset.view === state.view ? 'page' : 'false');
+    // owners and admins manage who may use the group
+    nav.members.hidden = !(inGroup && canManage(state.group));
+    nav.members.setAttribute('aria-current', inGroup && state.view === 'members' ? 'page' : 'false');
     updateNavHrefs();
   }
   if (tb.crumbs) {
-    tb.crumbs.replaceChildren(...(inGroup
+    fill(tb.crumbs, inGroup
       ? [h('a', { href: '#/' }, S.groups), icon('chevRight', 14), h('span', { class: 'crumb-cur', title: state.group }, state.group),
-        h('button', { class: 'icon-btn', type: 'button', 'aria-label': S.copyGroupId, title: S.copyGroupId, onclick: () => copyText(state.group) }, icon('copy', 14))]
-      : [h('span', { class: 'crumb-cur' }, S.groups)]));
+        h('button', { class: 'icon-btn', type: 'button', 'aria-label': S.copyGroupId, title: S.copyGroupId, onclick: () => copyText(state.group) }, icon('copy', 14)),
+        role === 'reader' ? h('span', { class: 'badge b-slate', title: S.readOnlyTip }, icon('lock', 11), S.readOnly) : null]
+      : [h('span', { class: 'crumb-cur' }, onAccess ? S.access : S.groups)]);
     tb.switchBtn.replaceChildren(icon('groups'), h('span', { class: 'switcher-name' }, inGroup ? state.group : S.selectGroup), icon('chevDown', 14));
     tb.switchBtn.setAttribute('aria-label', `${S.switchGroup}${inGroup ? `: ${state.group}` : ''}`);
+    // a reader cannot add memories here; elsewhere the dialog lets them pick a group they may write
+    const writable = inGroup ? canWrite(state.group) : canWriteSomewhere();
+    tb.add.disabled = !writable;
+    if (writable) tb.add.removeAttribute('title');
+    else tb.add.title = inGroup ? S.readOnlyTip : S.noWriteTip;
   }
-  document.title = inGroup ? `${state.group} · ${S.views[state.view]} · ${S.app}` : `${S.groups} · ${S.app}`;
+  document.title = inGroup ? `${state.group} · ${S.views[state.view]} · ${S.app}` : `${onAccess ? S.access : S.groups} · ${S.app}`;
+}
+/** The account button of the top bar: who is logged in, admin or not; hidden without a login. */
+function updateAccount() {
+  if (!tb.acct) return;
+  const me = session.me;
+  const show = session.mode === 'login' && !!me && !session.locked;
+  tb.acct.hidden = !show;
+  if (nav.access) nav.access.hidden = !show;
+  if (!show) return closeAccountMenu();
+  const who = whoLabel(me);
+  tb.acctBtn.replaceChildren(icon('user'),
+    h('span', { class: 'btn-label acct-label' }, h('span', { class: 'acct-name' }, who), me.admin ? badge(S.adminBadge, 'accent') : null),
+    icon('chevDown', 14));
+  tb.acctBtn.setAttribute('aria-label', S.accountMenu(me.admin ? `${who} (${S.adminBadge})` : who));
+  tb.acctBtn.title = who;
+}
+
+/* account popover: who, Access, Log out */
+let acctMenu = null;
+function closeAccountMenu(focusBack = false) {
+  if (!acctMenu) return;
+  acctMenu.remove();
+  document.removeEventListener('pointerdown', onAcctOutside, true);
+  acctMenu = null;
+  tb.acctBtn.setAttribute('aria-expanded', 'false');
+  if (focusBack) tb.acctBtn.focus();
+}
+function onAcctOutside(ev) {
+  if (acctMenu && !tb.acct.contains(ev.target)) closeAccountMenu();
+}
+function toggleAccountMenu() {
+  if (acctMenu) return closeAccountMenu();
+  closeGroupMenu();
+  const me = session.me || {};
+  const tok = me.token || {};
+  const item = (iconName, label, fn) => h('button', {
+    class: 'menu-item', type: 'button', role: 'menuitem', onclick: () => { closeAccountMenu(); fn(); },
+  }, icon(iconName), h('span', { class: 'grow' }, label));
+  acctMenu = h('div', { class: 'menu' },
+    h('div', { class: 'menu-head' },
+      h('span', { class: 'muted small' }, S.loggedInAs),
+      h('span', { class: 'row' }, h('strong', { class: 'grow', title: whoLabel(me) }, whoLabel(me)), me.admin ? badge(S.adminBadge, 'accent') : null),
+      h('span', { class: 'muted small', title: tok.id || null }, me.user ? S.withToken(tok.name || S.unnamed) : S.envTokenShort)),
+    h('div', { class: 'menu-list', role: 'menu', 'aria-label': S.account },
+      item('key', S.access, () => go('access')),
+      item('logout', S.logout, logout)));
+  acctMenu.addEventListener('keydown', (ev) => {
+    const items = [...acctMenu.querySelectorAll('.menu-item')];
+    const i = items.indexOf(document.activeElement);
+    if (ev.key === 'Escape') { ev.preventDefault(); ev.stopPropagation(); closeAccountMenu(true); }
+    else if (ev.key === 'ArrowDown') { ev.preventDefault(); items[(i + 1) % items.length].focus(); }
+    else if (ev.key === 'ArrowUp') { ev.preventDefault(); items[(i - 1 + items.length) % items.length].focus(); }
+  });
+  tb.acct.append(acctMenu);
+  tb.acctBtn.setAttribute('aria-expanded', 'true');
+  document.addEventListener('pointerdown', onAcctOutside, true);
+  const first = acctMenu.querySelector('.menu-item');
+  if (first) first.focus();
 }
 function effectiveDark() {
   const t = document.documentElement.getAttribute('data-theme');
@@ -1967,8 +2490,11 @@ function closeGroupMenu(focusBack = false) {
 function onMenuOutside(ev) {
   if (menu && !tb.switcher.contains(ev.target)) closeGroupMenu();
 }
+/** The view to open another group in: the same data view, Members only where one may manage it. */
+const switchView = (group) => (isDataView() ? state.view : state.view === 'members' && canManage(group) ? 'members' : 'graph');
 function toggleGroupMenu() {
   if (menu) return closeGroupMenu();
+  closeAccountMenu();
   const list = h('div', { class: 'menu-list', role: 'menu', 'aria-label': S.groups });
   const input = h('input', { class: 'input grow', placeholder: S.openGroupPh, 'aria-label': S.openGroup });
   const form = h('form', { class: 'menu-open' }, input, h('button', { class: 'btn btn-sm', type: 'submit', style: { height: '32px' } }, S.open));
@@ -1977,7 +2503,7 @@ function toggleGroupMenu() {
     const v = input.value.trim();
     if (!v) return;
     closeGroupMenu();
-    go(state.view === 'groups' ? 'graph' : state.view, v);
+    go(switchView(v), v);
   });
   menu = h('div', { class: 'menu' }, list, form);
   const fillMenu = (data) => {
@@ -1985,8 +2511,8 @@ function toggleGroupMenu() {
     if (!groups.length) return list.replaceChildren(h('div', { class: 'menu-empty' }, S.noGroupsYet));
     list.replaceChildren(...groups.map((g) => h('button', {
       class: 'menu-item', type: 'button', role: 'menuitem', 'aria-current': String(g.group_id === state.group),
-      onclick: () => { closeGroupMenu(); go(state.view === 'groups' ? 'graph' : state.view, g.group_id); },
-    }, h('span', { class: 'grow' }, g.group_id), h('span', { class: 'muted small' }, S.nFacts(num(g.facts))))));
+      onclick: () => { closeGroupMenu(); go(switchView(g.group_id), g.group_id); },
+    }, h('span', { class: 'grow' }, g.group_id), roleBadge(g.role), h('span', { class: 'muted small' }, S.nFacts(num(g.facts))))));
   };
   if (state.groupsList) fillMenu(state.groupsList);
   else list.replaceChildren(h('div', { class: 'menu-empty' }, S.loading));
@@ -2008,10 +2534,13 @@ function toggleGroupMenu() {
 
 /* server status line (polled every 10 s) */
 let statusTimer = 0;
+let statusSeq = 0; // an answer of an older round (another login) schedules nothing
 async function refreshStatus() {
   clearTimeout(statusTimer);
+  const seq = ++statusSeq;
   try {
     const s = await api('GET', '/status', { group: null, quiet: true });
+    if (seq !== statusSeq) return;
     state.status = s;
     nav.statusDot.className = 'sdot ok';
     nav.statusText.textContent = S.connected;
@@ -2020,11 +2549,13 @@ async function refreshStatus() {
     nav.jobsText.hidden = !jobs;
     nav.jobsText.textContent = S.jobsRunning(jobs);
   } catch (e) {
+    if (seq !== statusSeq) return;
     nav.statusDot.className = 'sdot bad';
     nav.statusText.textContent = e && e.status ? `${S.offline} (${e.status})` : S.offline;
     nav.status.title = e && e.message ? e.message : '';
     nav.jobsText.hidden = true;
   }
+  if (session.locked) return;
   statusTimer = setTimeout(refreshStatus, 10000);
 }
 
@@ -2975,11 +3506,13 @@ function GroupsView(root) {
       if (!groups.length) {
         body.replaceChildren(h('div', { class: 'card' }, emptyState({
           title: S.noMemory, text: S.noMemoryText,
-          actions: [h('button', { class: 'btn btn-primary', type: 'button', onclick: () => openAddMemory(def) }, icon('plus'), S.addMemory)],
+          actions: canWriteSomewhere() ? [h('button', { class: 'btn btn-primary', type: 'button', onclick: () => openAddMemory(def) }, icon('plus'), S.addMemory)] : [],
         })));
         return;
       }
       const last = (g) => ms(g.last_episode_at);
+      // rows carry the caller's role in each group (servers with users and roles)
+      const roles = groups.some((g) => g && g.role);
       body.replaceChildren(dataTable({
         label: S.groups,
         rows: groups,
@@ -2988,6 +3521,7 @@ function GroupsView(root) {
         columns: [
           { key: 'group', label: S.colGroup, sortValue: (g) => String(g.group_id).toLowerCase(),
             render: (g) => h('span', { class: 'row' }, h('strong', null, g.group_id), g.group_id === def ? pill(S.defaultTag) : null) },
+          roles ? { key: 'role', label: S.colYourRole, firstDir: 'desc', sortValue: (g) => rank(g.role), render: (g) => roleBadge(g.role) } : null,
           { key: 'entities', label: S.colEntities, cls: 'num', firstDir: 'desc', sortValue: (g) => g.entities ?? 0, render: (g) => num(g.entities) },
           { key: 'facts', label: S.colFacts, cls: 'num', firstDir: 'desc', sortValue: (g) => g.facts ?? 0, render: (g) => `${num(g.active_facts)} / ${num(g.facts)}` },
           { key: 'episodes', label: S.colEpisodes, cls: 'num', firstDir: 'desc', sortValue: (g) => g.episodes ?? 0, render: (g) => num(g.episodes) },
@@ -2995,7 +3529,7 @@ function GroupsView(root) {
             render: (g) => (g.failed_episodes > 0 ? badge(num(g.failed_episodes), 'red') : h('span', { class: 'muted' }, '0')) },
           { key: 'last', label: S.colLast, cls: 'nowrap', firstDir: 'desc', sortValue: last,
             render: (g) => h('span', { title: last(g) === null ? null : fmtDateTime(last(g)) }, relTime(last(g))) },
-        ],
+        ].filter(Boolean),
       }));
     } catch (e) {
       if (isAbort(e)) return;
@@ -3214,7 +3748,7 @@ function GraphPage(root) {
     // isolated nodes may still be drawn in the middle: keep the message out of their way
     empty.classList.toggle('low', arr(data.nodes).length > 0);
     const noFactsAtAll = data.counts && data.counts.facts === 0;
-    const add = h('button', { class: 'btn btn-primary btn-sm', type: 'button', onclick: () => openAddMemory() }, icon('plus', 14), S.addMemory);
+    const add = canWrite(state.group) ? h('button', { class: 'btn btn-primary btn-sm', type: 'button', onclick: () => openAddMemory() }, icon('plus', 14), S.addMemory) : null;
     empty.replaceChildren(...(state.history || noFactsAtAll
       ? [h('h3', null, S.emptyAll), h('p', null, S.emptyAllText), h('div', { class: 'row' }, add)]
       : [h('h3', null, S.emptyNow), h('p', null, S.emptyNowText), h('div', { class: 'row' },
@@ -3294,7 +3828,7 @@ function GraphPage(root) {
         statCard(S.statFacts, num(f.total), S.statFactsSub(num(f.active), num(f.historical))),
         statCard(S.statEpisodes, num(ep.total), h('span', null, S.statEpisodesSub(num(ep.processed), num(ep.pending)),
           h('span', { class: ep.failed ? 'txt-red' : null }, S.statFailed(num(ep.failed)))),
-        ep.failed ? h('button', { class: 'link small', type: 'button', onclick: (ev) => retryFailed(ev.currentTarget) }, S.retryFailed) : null),
+        ep.failed && canWrite(state.group) ? h('button', { class: 'link small', type: 'button', onclick: (ev) => retryFailed(ev.currentTarget) }, S.retryFailed) : null),
         statCard(S.statJobs, num((j.queued || 0) + (j.running || 0)), S.statJobsSub(num(j.queued || 0), num(j.running || 0))));
       // someone else (an MCP client, a job) changed the graph: refresh it
       const sig = `${s.entities}|${f.total}|${f.active}|${f.historical}`;
@@ -3603,6 +4137,7 @@ function EpisodesView(root) {
     const failed = count((e) => e.status === 'failed');
     retryBtn.replaceChildren(icon('refresh', 14), S.retryFailedN(failed));
     retryBtn.disabled = !failed;
+    retryBtn.hidden = !canWrite(state.group);
     const st = statusChips.value;
     const src = sourceChips.value;
     const list = known.filter((e) => (st === 'all' || (e.status || 'processed') === st) && (src === 'all' || e.source === src));
@@ -3636,7 +4171,7 @@ function EpisodesView(root) {
   };
 }
 
-const VIEWS = { graph: GraphPage, facts: FactsView, entities: EntitiesView, episodes: EpisodesView };
+const VIEWS = { graph: GraphPage, facts: FactsView, entities: EntitiesView, episodes: EpisodesView, members: MembersView };
 
 /* ---- 8.6 detail panels (node, fact, episode) --------------------------- */
 function showOnGraph({ sel = null, highlight = null } = {}) {
@@ -3803,7 +4338,9 @@ async function factPanel(id, signal) {
     h('p', { class: `f-sentence ${stateStyle(v.state)}` }, f.fact ?? ''),
     h('div', { class: 'row', style: { 'flex-wrap': 'wrap' } }, h('span', { class: 'badges' }, badges(f, v)), uuidChip(f.uuid))));
   const editable = v.state === 'active' || v.state === 'future';
-  if (editable) {
+  if (editable && !canWrite(state.group)) {
+    out.push(h('div', { class: 'row muted small' }, icon('lock', 14), h('span', null, S.readOnlyNote)));
+  } else if (editable) {
     const pastView = state.asOf !== null;
     const tip = pastView ? S.editNeedsNow : undefined;
     out.push(h('div', { class: 'p-actions' },
@@ -3862,7 +4399,7 @@ async function episodePanel(id, signal) {
   }
   if (ep.status === 'failed') {
     out.push(h('div', { class: 'errbox' }, h('strong', null, S.stFailed), ep.error ? h('span', null, ep.error) : null,
-      h('div', null, h('button', { class: 'btn btn-sm', type: 'button', onclick: (ev) => retryFailed(ev.currentTarget) }, icon('refresh', 14), S.retryFailed))));
+      canWrite(state.group) ? h('div', null, h('button', { class: 'btn btn-sm', type: 'button', onclick: (ev) => retryFailed(ev.currentTarget) }, icon('refresh', 14), S.retryFailed)) : null));
   }
   if (ep.status === 'forgotten') out.push(h('div', { class: 'muted small' }, S.forgottenBecause(ep.error || '')));
   out.push(h('dl', { class: 'kv' },
@@ -3880,6 +4417,13 @@ const MAX_CONTENT_BYTES = 1024 * 1024 - 8 * 1024; // the whole request body is l
 function defaultGroup() {
   return (state.status && state.status.default_group) || (state.groupsList && state.groupsList.default_group) || 'default';
 }
+/** The default group, or else the first listed group this login may write into. */
+function writableDefault() {
+  const d = defaultGroup();
+  if (canWrite(d)) return d;
+  const g = arr(state.groupsList && state.groupsList.groups).find((x) => x && canWrite(x.group_id));
+  return g ? g.group_id : d;
+}
 function outcomeCard(o) {
   const tone = { processed: 'green', duplicate: 'slate', failed: 'red', queued: 'blue' }[o.status] || 'slate';
   const d = o.dropped || {};
@@ -3893,7 +4437,7 @@ function outcomeCard(o) {
     d.entities || d.facts || d.invalidations ? h('div', { class: 'muted small' }, S.dropped(d)) : null);
 }
 function openAddMemory(groupArg) {
-  const group0 = groupArg || (state.view !== 'groups' && state.group) || defaultGroup();
+  const group0 = groupArg || (state.view !== 'groups' && state.group) || writableDefault();
   const content = h('textarea', { class: 'input', rows: 7, placeholder: S.contentPh, required: true });
   const counter = h('span', { class: 'help', 'aria-live': 'polite' });
   const name = h('input', { class: 'input', placeholder: S.optional });
@@ -3962,8 +4506,8 @@ function openAddMemory(groupArg) {
   }
 }
 function openEpisode(group, id) {
-  if (group === state.group && state.view !== 'groups') select('episode', id);
-  else go(state.view === 'groups' ? 'episodes' : state.view, group, { sel: { kind: 'episode', id } });
+  if (group === state.group && isDataView()) select('episode', id);
+  else go(isDataView() ? state.view : 'episodes', group, { sel: { kind: 'episode', id } });
 }
 
 /* ---- 8.8 fact correction (end / retract) -------------------------------- */
@@ -4033,12 +4577,21 @@ function resumeJobs() {
   }
   renderJobs();
 }
+/** The tray of a login that ended (logout): its jobs are not the next one's. */
+function clearJobs() {
+  for (const j of jobs.values()) clearTimeout(j.timer);
+  jobs.clear();
+  saveJobs();
+  renderJobs();
+}
 async function pollJob(id) {
   const j = jobs.get(id);
   if (!j || j.done) return;
+  clearTimeout(j.timer);
+  const seq = (j.seq = (j.seq || 0) + 1); // one poll chain per job, across logins
   try {
     const r = await api('GET', `/memories/jobs/${encodeURIComponent(id)}`, { group: j.group, quiet: true });
-    if (!jobs.has(id)) return;
+    if (!jobs.has(id) || j.seq !== seq) return;
     j.status = r.status || j.status;
     j.error = r.error || null;
     j.episode = r.episode_uuid || j.episode;
@@ -4051,13 +4604,15 @@ async function pollJob(id) {
       return;
     }
   } catch (e) {
-    if (e.status === 404) { // unknown (server restarted, or expired): stop tracking it
+    if (j.seq !== seq || e.status === 401) return; // the next login polls it again
+    if (e.status === 404) { // unknown (server restarted, or expired, or not this login's): stop tracking it
       jobs.delete(id);
       saveJobs();
       renderJobs();
       return;
     }
   }
+  if (!jobs.has(id) || session.locked) return;
   renderJobs();
   j.timer = setTimeout(() => pollJob(id), Date.now() - j.added < 10000 ? 1000 : 3000);
 }
@@ -4088,21 +4643,527 @@ function renderJobs() {
   }));
 }
 
+/* ---- 8.10 access: shared pieces ----------------------------------------- */
+const enc = encodeURIComponent;
+const USER_NAME = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+function roleSelect(value, onChange, label, options = ['reader', 'writer', 'owner'], cls = 'input input-sm') {
+  const sel = h('select', { class: cls, 'aria-label': label }, options.map((r) => h('option', { value: r }, r ? S.roles[r] || r : S.roleInherit)));
+  sel.value = value;
+  if (onChange) sel.addEventListener('change', () => onChange(sel.value, sel));
+  return sel;
+}
+/** [pattern role] chips; `max` shows the first ones and "+n more". */
+function grantChips(grants, max = Infinity) {
+  const list = arr(grants).filter((g) => g && typeof g.pattern === 'string');
+  if (!list.length) return h('span', { class: 'muted' }, S.noGrants);
+  const shown = list.slice(0, max);
+  return h('div', { class: 'grant-list' },
+    shown.map((g) => h('span', { class: 'grant', title: `${g.pattern}: ${S.roleTip[g.role] || g.role}` }, h('code', null, g.pattern), roleBadge(g.role))),
+    list.length > shown.length ? h('span', { class: 'muted small' }, S.moreN(list.length - shown.length)) : null);
+}
+function tokenState(t) {
+  if (t.revoked_at) return 'revoked';
+  const exp = ms(t.expires_at);
+  return exp !== null && exp <= serverNow() ? 'expired' : 'active';
+}
+const activeTokens = (u) => arr(u.tokens).filter((t) => tokenState(t) === 'active').length;
+/** Tokens (never their secrets): name, prefix, reach, dates, state, and Revoke. */
+function tokenTable(tokens, { label, currentId, onRevoke }) {
+  const when = (v, text) => (v ? h('span', { title: fmtDateTime(ms(v)) }, text(ms(v))) : h('span', { class: 'muted' }, S.never));
+  return dataTable({
+    label,
+    rows: arr(tokens),
+    sort: { key: 'created', dir: 'desc' },
+    rowClass: (t) => (tokenState(t) === 'active' ? null : 'dim-row'),
+    empty: emptyState({ title: S.noTokens }),
+    columns: [
+      { key: 'name', label: S.colName, sortValue: (t) => String(t.name || '').toLowerCase(),
+        render: (t) => h('span', { class: 'row' }, h('strong', null, t.name || S.unnamed), t.id === currentId ? badge(S.thisLogin, 'accent') : null) },
+      { key: 'prefix', label: S.colPrefix, render: (t) => h('code', { title: t.id }, `${t.prefix || ''}…`) },
+      { key: 'groups', label: S.colGroups,
+        render: (t) => h('div', { class: 'validity' },
+          t.groups ? h('span', { class: 'grant-list' }, arr(t.groups).map((p) => h('code', { class: 'chip' }, p))) : h('span', { class: 'muted' }, S.allOfAccount),
+          t.default_group ? h('span', { class: 'muted small' }, S.defaultIs(t.default_group)) : null) },
+      { key: 'role', label: S.colRole, render: (t) => (t.role ? roleBadge(t.role) : h('span', { class: 'muted' }, S.roleOfAccount)) },
+      { key: 'created', label: S.colCreated, cls: 'nowrap', firstDir: 'desc', sortValue: (t) => ms(t.created_at), render: (t) => when(t.created_at, fmtDay) },
+      { key: 'used', label: S.colLastUsed, cls: 'nowrap', firstDir: 'desc', sortValue: (t) => ms(t.last_used_at), render: (t) => when(t.last_used_at, relTime) },
+      { key: 'expires', label: S.colExpires, cls: 'nowrap', sortValue: (t) => ms(t.expires_at), render: (t) => when(t.expires_at, fmtDay) },
+      { key: 'state', label: S.colStatus, sortValue: tokenState,
+        render: (t) => {
+          const st = tokenState(t);
+          return badge(S.tokenState[st], st === 'active' ? 'green' : st === 'revoked' ? 'red' : 'slate', st === 'revoked' ? fmtDateTime(ms(t.revoked_at)) : undefined);
+        } },
+      { key: 'act', label: h('span', { class: 'sr-only' }, S.actions), cls: 'act',
+        render: (t) => (tokenState(t) === 'revoked' ? null : h('button', { class: 'btn btn-sm btn-danger', type: 'button', dataset: { k: `tok-rm:${t.id}` }, onclick: () => onRevoke(t) }, S.revoke)) },
+    ],
+  });
+}
+/** Name, groups, role cap, default group, expiry; then the secret, once. */
+function openTokenDialog({ title, nameRequired, create, onCreated }) {
+  const name = h('input', { class: 'input', maxlength: 100, placeholder: S.tokenNamePh, autocomplete: 'off' });
+  const groups = h('input', { class: 'input', placeholder: S.tokenGroupsPh, autocomplete: 'off', spellcheck: 'false' });
+  const role = roleSelect('', null, null, ['', 'reader', 'writer'], 'input');
+  const dg = h('input', { class: 'input', placeholder: S.optional, autocomplete: 'off', spellcheck: 'false' });
+  const days = h('input', { class: 'input', type: 'number', min: 1, max: 3650, step: 1, inputmode: 'numeric', placeholder: S.never });
+  const body = h('div', { class: 'form' },
+    field(nameRequired ? S.fTokenName : `${S.fTokenName} (${S.optional})`, name),
+    field(S.fTokenGroups, groups, h('div', { class: 'help' }, S.tokenGroupsHelp)),
+    h('div', { class: 'grid2' },
+      field(S.fTokenRole, role, h('div', { class: 'help' }, S.tokenRoleHelp)),
+      field(`${S.fDefaultGroup} (${S.optional})`, dg)),
+    field(S.fExpires, days, h('div', { class: 'help' }, S.expiresHelp)));
+  const submit = h('button', { class: 'btn btn-primary', type: 'submit' }, S.createToken);
+  const d = openDialog({
+    title, body, wide: true,
+    actions: [h('button', { class: 'btn', type: 'button', onclick: () => d.close() }, S.cancel), submit],
+    onSubmit: async () => {
+      const b = {};
+      const n = name.value.trim();
+      if (n) b.name = n;
+      else if (nameRequired) { d.setError(S.nameRequired); name.focus(); return; }
+      const gs = [...new Set(groups.value.split(',').map((s) => s.trim()).filter(Boolean))];
+      if (gs.length) b.groups = gs;
+      if (role.value) b.role = role.value;
+      if (dg.value.trim()) b.default_group = dg.value.trim();
+      if (days.value.trim()) {
+        const v = Number(days.value);
+        if (!Number.isInteger(v) || v < 1 || v > 3650) { d.setError(S.badDays); days.focus(); return; }
+        b.expires_days = v;
+      }
+      d.setError('');
+      d.setBusy(true);
+      try {
+        const r = await create(b);
+        toast(S.tokenCreated, 'ok');
+        if (onCreated) onCreated(r);
+        showSecretIn(d, S.tokenCreated, String(r.token ?? ''), S.secretLead);
+      } catch (e) {
+        d.setError(e.message);
+      } finally {
+        d.setBusy(false);
+      }
+    },
+  });
+  name.focus();
+}
+
+/* ---- 8.11 members of a group (owners, admins) --------------------------- */
+function MembersView(root) {
+  const group = state.group;
+  const path = `/groups/${enc(group)}/members`;
+  const ctl = new AbortController();
+  let destroyed = false;
+  const self = selfName();
+  const admin = !!(session.me && session.me.admin);
+  const userIn = h('input', { class: 'input', placeholder: S.memberUserPh, 'aria-label': S.colUser, autocomplete: 'off', spellcheck: 'false', autocapitalize: 'off', maxlength: 64 });
+  const roleSel = roleSelect('reader', null, S.colRole, undefined, 'input');
+  const addBtn = h('button', { class: 'btn btn-primary', type: 'submit' }, icon('plus'), S.addMember);
+  const form = h('form', { hidden: !canManage(group) }, userIn, roleSel, addBtn);
+  const body = h('div', null, h('div', { class: 'card' }, skeletonRows(4)));
+  root.append(h('div', { class: 'page-head' },
+    h('div', null, h('h1', null, S.views.members), h('p', { class: 'muted small' }, S.membersSub)), form), body);
+  if (admin) {
+    // admins know every user: offer their names
+    const list = h('datalist', { id: `users-${++uidSeq}` });
+    userIn.setAttribute('list', list.id);
+    root.append(list);
+    api('GET', '/admin/users', { group: null, signal: ctl.signal, quiet: true })
+      .then((r) => fill(list, arr(r.users).map((u) => h('option', { value: u.name }))))
+      .catch(() => { /* typing the name works too */ });
+  }
+  const exact = (m) => m.pattern === group;
+  const editable = (m) => exact(m) && (admin || m.user !== self);
+  const changed = (user) => {
+    if (user === self) refreshMe();
+    load();
+  };
+  form.addEventListener('submit', async (ev) => {
+    ev.preventDefault();
+    const user = userIn.value.trim();
+    if (!user) { toast(S.userRequired, 'error'); userIn.focus(); return; }
+    addBtn.disabled = true;
+    try {
+      await api('POST', path, { group: null, body: { user, role: roleSel.value } });
+      toast(S.memberSet(user, S.roles[roleSel.value]), 'ok');
+      userIn.value = '';
+      changed(user);
+    } catch { /* toast shown */ } finally {
+      addBtn.disabled = false;
+    }
+  });
+  async function setRole(m, role, sel) {
+    sel.disabled = true;
+    try {
+      await api('POST', path, { group: null, body: { user: m.user, role } });
+      toast(S.memberSet(m.user, S.roles[role]), 'ok');
+    } catch {
+      sel.value = m.role; // toast shown
+    } finally {
+      sel.disabled = false;
+    }
+    changed(m.user);
+  }
+  function remove(m) {
+    confirmDialog({
+      title: S.removeMemberTitle, text: S.removeMemberText(m.user, group), confirmLabel: S.remove,
+      run: () => api('POST', `${path}/remove`, { group: null, quiet: true, body: { user: m.user } }),
+    }).then((ok) => {
+      if (!ok) return;
+      toast(S.memberRemoved(m.user), 'ok');
+      changed(m.user);
+    });
+  }
+  async function load() {
+    try {
+      const r = await api('GET', path, { group: null, signal: ctl.signal, quiet: true });
+      if (destroyed) return;
+      // exact grants first for each user
+      const rows = arr(r.members).slice().sort((a, b) => Number(exact(b)) - Number(exact(a)));
+      body.replaceChildren(dataTable({
+        label: S.views.members,
+        rows,
+        sort: { key: 'user', dir: 'asc' },
+        empty: emptyState({ title: S.noMembers }),
+        columns: [
+          { key: 'user', label: S.colUser, sortValue: (m) => String(m.user),
+            render: (m) => h('span', { class: 'row' }, h('strong', null, m.user), m.user === self ? pill(S.you) : null) },
+          { key: 'role', label: S.colRole, firstDir: 'desc', sortValue: (m) => rank(m.role),
+            render: (m) => (editable(m) ? roleSelect(m.role, (v, sel) => setRole(m, v, sel), S.roleFor(m.user)) : roleBadge(m.role)) },
+          { key: 'grant', label: S.colGrant,
+            render: (m) => (exact(m) ? h('span', { class: 'muted' }, S.exactGrant) : h('span', { class: 'muted', title: S.patternTip }, S.viaPattern(m.pattern))) },
+          { key: 'added', label: S.colAdded, cls: 'nowrap', firstDir: 'desc', sortValue: (m) => ms(m.created_at),
+            render: (m) => h('span', { title: fmtDateTime(ms(m.created_at)) }, relTime(ms(m.created_at))) },
+          { key: 'act', label: h('span', { class: 'sr-only' }, S.actions), cls: 'act',
+            render: (m) => (editable(m)
+              ? h('button', { class: 'btn btn-sm btn-danger', type: 'button', onclick: () => remove(m) }, S.remove)
+              : exact(m) ? h('span', { class: 'muted small', title: S.selfTip }, S.selfNote) : null) },
+        ],
+      }));
+    } catch (e) {
+      if (isAbort(e) || destroyed) return;
+      body.replaceChildren(h('div', { class: 'card' }, e.status === 403 ? emptyState({ title: S.membersForbidden, text: e.message }) : errorState(e, load)));
+    }
+  }
+  load();
+  return {
+    destroy() { destroyed = true; ctl.abort(); },
+    reload: load,
+    onTime() { /* members have no time */ },
+    onData() { /* nor do memories change them */ },
+    onAccess: load,
+    focusSearch: () => userIn.focus(),
+  };
+}
+
+/* ---- 8.12 access page: my account, my tokens, users (admins) ------------ */
+function AccessView(root) {
+  const ctl = new AbortController();
+  let destroyed = false;
+  const me = session.me;
+  const wrap = h('div', { class: 'acc' });
+  root.append(h('div', { class: 'page-head' }, h('div', null, h('h1', null, S.access), h('p', { class: 'muted small' }, S.accessSub))), wrap);
+  const card = (title, action, ...content) => h('section', { class: 'card acc-card' }, h('div', { class: 'acc-head' }, h('h2', null, title), action), ...content);
+  if (!me || session.mode !== 'login') {
+    wrap.append(card(S.myAccount, null, h('p', { class: 'muted' }, S.noLoginNote), me ? grantChips(me.grants) : null));
+    return { destroy() { destroyed = true; } };
+  }
+
+  /* my account */
+  const tok = me.token || {};
+  const dg = me.default_group;
+  wrap.append(card(S.myAccount, null, h('dl', { class: 'kv' },
+    h('dt', null, S.fUser),
+    h('dd', null, me.user
+      ? h('span', { class: 'row', style: { 'flex-wrap': 'wrap' } }, h('strong', null, me.user.name),
+        me.admin ? badge(S.adminBadge, 'accent') : me.user.admin ? badge(S.adminNarrowed, 'slate', S.adminNarrowedTip) : null)
+      : h('span', { class: 'muted' }, S.noAccount)),
+    h('dt', null, S.fLoggedInWith),
+    h('dd', null, h('span', { class: 'row', style: { 'flex-wrap': 'wrap' } },
+      h('span', null, me.user ? tok.name || S.unnamed : S.envTokenKind), h('code', null, tok.id || ''),
+      tok.expires_at ? h('span', { class: 'muted small' }, S.expiresOn(fmtDay(ms(tok.expires_at)))) : null)),
+    h('dt', null, S.fDefaultGroup),
+    h('dd', null, dg ? h('a', { href: hrefFor('graph', dg) }, dg) : '—'),
+    h('dt', null, S.fGrants),
+    h('dd', null, grantChips(me.grants), h('p', { class: 'help', style: { 'margin-top': '6px' } }, me.user ? S.grantsHelp : S.envGrantsHelp)))));
+
+  /* my tokens */
+  const tokensBody = h('div', null, skeletonRows(3));
+  if (me.user) {
+    const newBtn = h('button', { class: 'btn btn-primary btn-sm', type: 'button', onclick: newMine }, icon('plus', 14), S.newToken);
+    wrap.append(card(S.myTokens, newBtn, h('p', { class: 'muted small' }, S.tokensHelp), tokensBody));
+  } else {
+    wrap.append(card(S.myTokens, null, h('p', { class: 'muted' }, S.envTokenNote)));
+  }
+  function newMine() {
+    openTokenDialog({
+      title: S.newToken, nameRequired: true,
+      create: (body) => api('POST', '/me/tokens', { group: null, quiet: true, body }),
+      onCreated: () => loadTokens(),
+    });
+  }
+  function revokeMine(t) {
+    const own = t.id === tok.id;
+    confirmDialog({
+      title: S.revokeToken, text: S.revokeTokenText(t.name || t.prefix) + (own ? S.revokeOwnNote : ''), confirmLabel: S.revoke,
+      run: () => api('POST', `/me/tokens/${enc(t.id)}/revoke`, { group: null, quiet: true }),
+    }).then((ok) => {
+      if (!ok) return;
+      toast(S.tokenRevoked, 'ok');
+      loadTokens(); // the own token: this answers 401, and the login takes over
+    });
+  }
+  async function loadTokens() {
+    if (!me.user) return;
+    try {
+      const r = await api('GET', '/me/tokens', { group: null, signal: ctl.signal, quiet: true });
+      if (destroyed) return;
+      tokensBody.replaceChildren(tokenTable(r.tokens, { label: S.myTokens, currentId: tok.id, onRevoke: revokeMine }));
+    } catch (e) {
+      if (isAbort(e) || destroyed) return;
+      tokensBody.replaceChildren(e.status === 403 ? h('p', { class: 'muted' }, S.envTokenNote) : errorState(e, loadTokens));
+    }
+  }
+
+  /* users (admins) */
+  const usersBody = h('div', null, skeletonRows(4));
+  if (me.admin) {
+    const newBtn = h('button', { class: 'btn btn-primary btn-sm', type: 'button', onclick: () => openCreateUser() }, icon('plus', 14), S.newUser);
+    wrap.append(card(S.users, newBtn, h('p', { class: 'muted small' }, S.usersHelp), usersBody));
+  }
+  async function loadUsers() {
+    if (!me.admin) return;
+    try {
+      const r = await api('GET', '/admin/users', { group: null, signal: ctl.signal, quiet: true });
+      if (destroyed) return;
+      const self = selfName();
+      usersBody.replaceChildren(dataTable({
+        label: S.users,
+        rows: arr(r.users),
+        sort: { key: 'name', dir: 'asc' },
+        onRow: (u) => openUserDialog(u.name),
+        rowClass: (u) => (u.disabled ? 'dim-row' : null),
+        empty: emptyState({ title: S.noUsers }),
+        columns: [
+          { key: 'name', label: S.colName, sortValue: (u) => String(u.name),
+            render: (u) => h('span', { class: 'row' }, h('strong', null, u.name), u.name === self ? pill(S.you) : null) },
+          { key: 'admin', label: S.colAdmin, sortValue: (u) => (u.admin ? 0 : 1), render: (u) => (u.admin ? badge(S.adminBadge, 'accent') : h('span', { class: 'muted' }, '—')) },
+          { key: 'state', label: S.colStatus, sortValue: (u) => (u.disabled ? 1 : 0),
+            render: (u) => (u.disabled ? badge(S.disabledBadge, 'red') : badge(S.activeBadge, 'green')) },
+          { key: 'default', label: S.colDefault, sortValue: (u) => String(u.default_group || ''),
+            render: (u) => (u.default_group ? h('code', null, u.default_group) : h('span', { class: 'muted' }, '—')) },
+          { key: 'grants', label: S.colGrants, render: (u) => grantChips(u.grants, 4) },
+          { key: 'tokens', label: S.colActiveTokens, cls: 'num', firstDir: 'desc', sortValue: activeTokens, render: (u) => num(activeTokens(u)) },
+          { key: 'act', label: h('span', { class: 'sr-only' }, S.actions), cls: 'act',
+            render: (u) => h('button', { class: 'btn btn-sm', type: 'button', onclick: () => openUserDialog(u.name) }, S.manage) },
+        ],
+      }));
+    } catch (e) {
+      if (isAbort(e) || destroyed) return;
+      usersBody.replaceChildren(errorState(e, loadUsers));
+    }
+  }
+  const reload = () => { loadTokens(); loadUsers(); };
+  reload();
+  return {
+    destroy() { destroyed = true; ctl.abort(); },
+    reload,
+    onTime() { /* nothing here depends on the time control */ },
+    onData() { /* nor on memories */ },
+    onAccess: reload,
+  };
+}
+
+/** Admins: a new user, by default with a workspace; then its first token, once. */
+function openCreateUser() {
+  const name = h('input', { class: 'input', maxlength: 64, required: true, autocomplete: 'off', spellcheck: 'false', autocapitalize: 'off' });
+  const dg = h('input', { class: 'input', placeholder: S.defaultGroupPh, autocomplete: 'off', spellcheck: 'false' });
+  const admin = h('input', { type: 'checkbox' });
+  const ws = h('input', { type: 'checkbox', checked: true });
+  const wsHelp = h('div', { class: 'help' }, S.workspaceHelp(''));
+  name.addEventListener('input', () => { wsHelp.textContent = S.workspaceHelp(name.value.trim()); });
+  const body = h('div', { class: 'form' },
+    field(S.fName, name, h('div', { class: 'help' }, S.userNameHelp)),
+    field(`${S.fDefaultGroup} (${S.optional})`, dg),
+    h('div', { class: 'field' }, h('label', { class: 'switch' }, ws, h('span', null, S.fWorkspace)), wsHelp),
+    h('label', { class: 'switch' }, admin, h('span', null, S.fAdmin)));
+  const submit = h('button', { class: 'btn btn-primary', type: 'submit' }, S.createUser);
+  const d = openDialog({
+    title: S.newUser, body, wide: true,
+    actions: [h('button', { class: 'btn', type: 'button', onclick: () => d.close() }, S.cancel), submit],
+    onSubmit: async () => {
+      const n = name.value.trim();
+      if (!USER_NAME.test(n)) { d.setError(S.badUserName); name.focus(); return; }
+      const b = { name: n, admin: admin.checked, workspace: ws.checked };
+      if (dg.value.trim()) b.default_group = dg.value.trim();
+      d.setError('');
+      d.setBusy(true);
+      try {
+        const r = await api('POST', '/admin/users', { group: null, quiet: true, body: b });
+        toast(S.userCreated(n), 'ok');
+        emitAccess();
+        showSecretIn(d, S.userCreated(n), String(r.token ?? ''), S.firstTokenLead(n));
+      } catch (e) {
+        d.setError(e.message);
+      } finally {
+        d.setBusy(false);
+      }
+    },
+  });
+  name.focus();
+}
+
+/**
+ * Admins: one user. Enable / disable, admin or not, default group, grants
+ * (add, change the role, revoke) and tokens (create, revoke); each change
+ * applies at once and the dialog shows the user as the server has it now.
+ */
+function openUserDialog(name) {
+  const box = h('div', { class: 'form' }, skeletonRows(4));
+  const d = openDialog({
+    title: S.userTitle(name), body: box, xl: true,
+    actions: [h('button', { class: 'btn btn-primary', type: 'button', onclick: () => d.close() }, S.done)],
+  });
+  let user = null;
+  const isSelf = () => name === selfName();
+  const userPath = `/admin/users/${enc(name)}`;
+  const post = (path, body) => api('POST', path, { group: null, quiet: true, body });
+  async function load() {
+    try {
+      const r = await api('GET', '/admin/users', { group: null, quiet: true });
+      user = arr(r.users).find((u) => u.name === name) || null;
+      if (d.dlg.open) render();
+    } catch (e) {
+      if (d.dlg.open) d.setError(e.message);
+    }
+  }
+  /** Runs one change (asking first when `confirm` is given), then reloads the user. */
+  async function change(run, okMsg, confirm) {
+    d.setError('');
+    if (confirm) {
+      if (!(await confirmDialog({ ...confirm, run }))) return;
+    } else {
+      try {
+        await run();
+      } catch (e) {
+        render(); // put back what a failed select shows
+        d.setError(e.message);
+        return;
+      }
+    }
+    toast(okMsg, 'ok');
+    if (isSelf()) {
+      await refreshMe();
+      // no longer an admin (or logged out): this dialog has nothing left to show
+      if (!session.me || !session.me.admin) return d.close();
+    }
+    emitAccess();
+    if (d.dlg.open) await load();
+  }
+  function render() {
+    // keep the keyboard where it was across the re-render
+    const active = box.contains(document.activeElement) ? document.activeElement.dataset.k : undefined;
+    const u = user;
+    if (!u) {
+      fill(box, emptyState({ title: S.noSuchUser }));
+      return;
+    }
+    const self = isSelf();
+    const adminBtn = h('button', { class: 'btn btn-sm', type: 'button', dataset: { k: 'admin' },
+      onclick: () => change(() => post(userPath, { admin: !u.admin }), S.userUpdated, {
+        title: u.admin ? S.removeAdmin : S.makeAdmin,
+        text: u.admin ? S.removeAdminText(u.name, self) : S.makeAdminText(u.name),
+        confirmLabel: u.admin ? S.removeAdmin : S.makeAdmin,
+        danger: u.admin,
+      }) }, u.admin ? S.removeAdmin : S.makeAdmin);
+    const stateBtn = u.disabled
+      ? h('button', { class: 'btn btn-sm', type: 'button', dataset: { k: 'state' }, onclick: () => change(() => post(userPath, { disabled: false }), S.userUpdated) }, S.enableUser)
+      : h('button', { class: 'btn btn-sm btn-danger', type: 'button', dataset: { k: 'state' },
+        onclick: () => change(() => post(userPath, { disabled: true }), S.userUpdated, { title: S.disableUserTitle, text: S.disableText(u.name, self), confirmLabel: S.disableUser }) }, S.disableUser);
+    // default group
+    const dgIn = h('input', { class: 'input input-sm grow', value: u.default_group || '', 'aria-label': S.fDefaultGroup, autocomplete: 'off', spellcheck: 'false', dataset: { k: 'dg' }, style: { 'max-width': '320px' } });
+    const saveDg = () => {
+      const g = dgIn.value.trim();
+      if (!g) { d.setError(S.groupNameRequired); dgIn.focus(); return; }
+      change(() => post(userPath, { default_group: g }), S.userUpdated);
+    };
+    dgIn.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); saveDg(); } });
+    // grants
+    const grants = arr(u.grants);
+    const grantRows = grants.map((g) => h('li', null,
+      h('code', { class: 'grow', title: g.pattern }, g.pattern),
+      (() => {
+        const sel = roleSelect(g.role, (v) => change(() => post('/admin/grants', { user: u.name, pattern: g.pattern, role: v }), S.grantSaved), S.roleFor(g.pattern));
+        sel.dataset.k = `grant-role:${g.pattern}`;
+        return sel;
+      })(),
+      h('button', { class: 'btn btn-sm btn-danger', type: 'button', dataset: { k: `grant-rm:${g.pattern}` },
+        onclick: () => change(() => post('/admin/grants/revoke', { user: u.name, pattern: g.pattern }), S.grantRevoked,
+          { title: S.revokeGrant, text: S.revokeGrantText(u.name, g.pattern), confirmLabel: S.revoke }) }, S.revoke)));
+    const pat = h('input', { class: 'input input-sm grow', placeholder: S.patternPh, 'aria-label': S.fPattern, autocomplete: 'off', spellcheck: 'false', dataset: { k: 'grant-pat' } });
+    const patRole = roleSelect('reader', null, S.colRole);
+    patRole.dataset.k = 'grant-new-role';
+    const addGrant = () => {
+      const p = pat.value.trim();
+      if (!p) { d.setError(S.patternRequired); pat.focus(); return; }
+      change(() => post('/admin/grants', { user: u.name, pattern: p, role: patRole.value }), S.grantSaved);
+    };
+    pat.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); addGrant(); } });
+    // tokens
+    const tokens = arr(u.tokens);
+    const newTok = h('button', { class: 'btn btn-sm', type: 'button', dataset: { k: 'tok-new' },
+      onclick: () => openTokenDialog({
+        title: S.newTokenFor(u.name), nameRequired: false,
+        create: (body) => post(`${userPath}/tokens`, body),
+        onCreated: () => { emitAccess(); load(); },
+      }) }, icon('plus', 14), S.newToken);
+    fill(box,
+      h('div', { class: 'row', style: { 'flex-wrap': 'wrap' } },
+        u.admin ? badge(S.adminBadge, 'accent') : null,
+        u.disabled ? badge(S.disabledBadge, 'red') : badge(S.activeBadge, 'green'),
+        self ? pill(S.you) : null,
+        h('span', { class: 'muted small' }, S.createdOn(fmtDay(ms(u.created_at))))),
+      section(S.accountSec, h('div', { class: 'row', style: { 'flex-wrap': 'wrap' } }, adminBtn, stateBtn)),
+      section(S.fDefaultGroup, h('div', { class: 'row' }, dgIn,
+        h('button', { class: 'btn btn-sm', type: 'button', dataset: { k: 'dg-save' }, onclick: saveDg }, S.save))),
+      section(S.grantsN(grants.length),
+        grants.length ? h('ul', { class: 'ulist' }, grantRows) : h('p', { class: 'muted small' }, S.noUserGrants),
+        h('div', { class: 'row' }, pat, patRole,
+          h('button', { class: 'btn btn-sm', type: 'button', dataset: { k: 'grant-add' }, onclick: addGrant }, icon('plus', 14), S.addGrant))),
+      section(S.tokensN(tokens.length),
+        h('div', { class: 'row' }, newTok),
+        tokenTable(tokens, {
+          label: S.tokensN(tokens.length),
+          currentId: session.me && session.me.token && session.me.token.id,
+          onRevoke: (t) => change(() => post(`/admin/tokens/${enc(t.id)}/revoke`), S.tokenRevoked, {
+            title: S.revokeToken,
+            text: S.revokeTokenText(t.name || t.prefix) + (session.me && session.me.token && t.id === session.me.token.id ? S.revokeOwnNote : ''),
+            confirmLabel: S.revoke,
+          }),
+        })));
+    if (active) {
+      const el = box.querySelector(`[data-k="${CSS.escape(active)}"]`);
+      if (el) el.focus();
+    }
+  }
+  load();
+}
+
 /* ---- keyboard ----------------------------------------------------------- */
 function onGlobalKey(ev) {
   if (ev.defaultPrevented || ev.metaKey || ev.ctrlKey || ev.altKey) return;
-  if (document.querySelector('dialog[open]') || !$('#blocked').hidden) return;
+  if (document.querySelector('dialog[open]') || !$('#blocked').hidden || session.locked) return;
   const typing = isTyping(ev.target);
   if (ev.key === 'Escape') {
     if (typing) return;
     if (menu) closeGroupMenu(true);
+    else if (acctMenu) closeAccountMenu(true);
     else if (state.sel) setState({ sel: null });
     else if (state.highlight.size) setState({ highlight: new Set() });
     return;
   }
   if (typing) return;
   const a = (mounted && mounted.api) || {};
-  const inGroup = !!state.group && state.view !== 'groups';
+  const inGroup = !!state.group && isDataView();
   switch (ev.key) {
     case '/': if (a.focusSearch) a.focusSearch(); break;
     case 'f': if (a.fit) a.fit(); else return; break;
@@ -4128,9 +5189,23 @@ function boot() {
   document.addEventListener('keydown', onGlobalKey);
   const mq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
   if (mq && mq.addEventListener) mq.addEventListener('change', updateThemeButton);
-  onUrl();
-  refreshStatus();
-  resumeJobs();
+  // rights changed elsewhere (a grant, a revoked token) show when the tab comes back
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && session.running && session.mode === 'login') refreshMe();
+  });
+  loadSession();
+}
+/** Who is this page? Then the views, or the login (401). */
+async function loadSession() {
+  let me = null;
+  try {
+    me = await api('GET', '/me', { auth: true, group: null, quiet: true });
+  } catch (e) {
+    // 401: the login is up; a guard 403: the blocked card is
+    if (e.status === 401 || !$('#blocked').hidden) return;
+    // an older server without /ui/api/me, or none reachable: carry on as before, rights unknown
+  }
+  startApp(me);
 }
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
 else boot();
@@ -4148,6 +5223,7 @@ else boot();
 </div>
 <aside class="panel" id="panel" aria-label="Details" aria-hidden="true"></aside>
 <div class="corner"><div id="toasts" aria-live="polite"></div><div id="jobs" aria-live="polite"></div></div>
+<div class="login" id="login" hidden></div>
 <div class="blocked" id="blocked" hidden></div>
 <noscript><p style="padding:24px">The minizep UI needs JavaScript.</p></noscript>
 </body>

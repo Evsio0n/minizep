@@ -725,7 +725,10 @@ MINIZEP_HTTP_URL=http://127.0.0.1:8787/mcp MINIZEP_TOKEN=$TOKEN minizep-proxy
 ## Web UI
 
 A single page for browsing and editing the graph: groups, the graph at any (`at`, `as_of`)
-instant, facts, entities, episodes, adding memories and ending or retracting facts. It is off
+instant, facts, entities, episodes, adding memories and ending or retracting facts. With the
+login it follows the caller's role (read-only where it is reader), lets owners manage a group's
+members and has an Access page for one's own tokens and, for admins, users, grants and tokens
+([ACCESS.md](ACCESS.md#web-ui-login)). It is off
 unless `MINIZEP_UI=1` (with a login) or the deprecated `MINIZEP_UI_GROUPS` (without) is set; both
 at once stop the server at start.
 
