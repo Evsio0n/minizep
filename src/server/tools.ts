@@ -34,6 +34,30 @@ export const INSTRUCTIONS = [
 /** McpServer options: every server (stdio and HTTP) describes itself the same way. */
 export const SERVER_OPTIONS = { instructions: INSTRUCTIONS };
 
+/**
+ * The instructions for one connection: the shared text plus the groups this
+ * caller may use, so a model working on some project finds that project's
+ * memory instead of searching only the default group.
+ */
+export function instructionsFor(p: Principal): string {
+  const groups =
+    p.groups === 'any'
+      ? `Groups: this connection may use any group; the default is "${p.defaultGroup}". Call list_groups to see them.`
+      : `Groups this connection may use: ${p.groups.map((g) => (g === p.defaultGroup ? `${g} (default)` : g)).join(', ')}.`;
+  return [
+    INSTRUCTIONS,
+    '',
+    `${groups} Without group_id every tool uses the default group. When you work on a project or topic that has ` +
+      'its own group, pass that group_id on every call; if the default group has nothing about it, call ' +
+      'list_groups and search the matching group before concluding the memory is empty.',
+  ].join('\n');
+}
+
+/** McpServer options for one caller. */
+export function serverOptionsFor(p: Principal) {
+  return { instructions: instructionsFor(p) };
+}
+
 /*
  * Tool annotations, so that clients can run reads without asking and ask
  * before a correction. Nothing reaches outside the memory (openWorldHint).
@@ -422,6 +446,29 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         const jobs = service.listJobs(p, limit ?? 20);
         if (jobs.length === 0) return ok('no jobs', { jobs });
         return ok(jobs.map((j) => `${j.id.slice(0, 8)} ${j.status.padEnd(9)} ${j.label}`).join('\n'), { jobs });
+      }),
+  );
+
+  server.registerTool(
+    'list_groups',
+    {
+      title: 'List groups',
+      description:
+        'Use to see which memory groups (namespaces) you can use and how much each holds, e.g. when the default ' +
+        'group has nothing about the project you are working on. See memory_guide.',
+      inputSchema: {},
+      annotations: READ_ONLY,
+    },
+    () =>
+      guard(async () => {
+        const r = await service.groups(p);
+        if (!r.groups.length) return ok('no groups hold data yet', r);
+        const lines = r.groups.map(
+          (g) =>
+            `${g.group_id}${g.group_id === r.default_group ? ' (default)' : ''}: ${g.active_facts} current facts, ` +
+            `${g.facts} in all, ${g.episodes} episodes${g.last_episode_at ? `, last ${g.last_episode_at.slice(0, 10)}` : ''}`,
+        );
+        return ok(lines.join('\n'), r);
       }),
   );
 

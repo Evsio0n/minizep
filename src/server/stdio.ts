@@ -11,7 +11,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { localPrincipal } from './auth.js';
 import type { MemoryService } from './service.js';
-import { registerTools, SERVER_INFO, SERVER_OPTIONS } from './tools.js';
+import { registerTools, SERVER_INFO, serverOptionsFor } from './tools.js';
 
 export interface StdioOptions {
   service: MemoryService;
@@ -47,9 +47,10 @@ export async function serveStdio(opts: StdioOptions): Promise<StdioServer> {
   if (recovered) log(`re-enqueued ${recovered} pending episode(s) from a previous run`);
   const stopRetrying = service.retryEvery(opts.retryIntervalMs ?? 600_000, log);
 
-  const server = new McpServer(SERVER_INFO, SERVER_OPTIONS);
   // single local user: every group is theirs
-  registerTools(server, { service, principal: localPrincipal(opts.defaultGroup) });
+  const principal = localPrincipal(opts.defaultGroup);
+  const server = new McpServer(SERVER_INFO, serverOptionsFor(principal));
+  registerTools(server, { service, principal });
   // once the client is gone its pipe is broken: a late answer must not crash
   // the process while it drains
   stdout.on('error', (err) => log(`stdout: ${err.message}`));

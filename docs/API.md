@@ -629,6 +629,9 @@ A model that connects needs no client-side instructions:
   under 512, stands alone): search before answering about people, projects, plans and decisions;
   add durable facts, one event per call, subjects named, `valid_at` = when it happened; repair the
   memory when the user contradicts it; which tool repairs what.
+- The instructions end with the groups the connection may use (its token's groups, or "any group" for
+  stdio and anonymous mode) and tell the model to pass `group_id` for a project's own group and to call
+  `list_groups` before concluding the default group has nothing.
 - The `memory_guide` tool returns the full method, [docs/MEMORY-GUIDE.md](MEMORY-GUIDE.md), also
   served as [GET /v1/guide](#get-v1guide). Keep the instructions (`src/server/tools.ts`) consistent
   with it.
@@ -658,6 +661,7 @@ rendering and the same JSON as the REST API in `structuredContent`.
 | `forget_episode`    | `id` (uuid or 8+ char prefix), `reason`, `group_id?` | `POST /v1/episodes/:id/forget` | destructive |
 | `retry_failed`      | `group_id?` | `POST /v1/episodes/retry-failed` | write |
 | `graph_stats`       | `group_id?` | `GET /v1/stats` | read |
+| `list_groups`       | none | `GET /v1/groups` | read |
 | `memory_guide`      | none | `GET /v1/guide` | read |
 
 `add_memory` reports `processed`, `duplicate`, `queued` or `failed`; a failed extraction is a tool

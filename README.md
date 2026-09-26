@@ -234,6 +234,7 @@ npm run build
 | `forget_episode` | 整条笔记是错的或不该记：只由它支撑的事实撤回，其他事实去掉这条证据，被它关闭的事实重新打开，它最后写的实体摘要改回；原文保留，状态为 `forgotten`。事实行末尾的 `ep` 就是笔记的 id |
 | `retry_failed` | 原地重试抽取失败的 episode（包括后台重试已放弃的） |
 | `graph_stats` | 图谱统计（含失败、已放弃重试、已遗忘的 episode 数） |
+| `list_groups` | 这个连接能用的 group（namespace）及各自的事实数、最近写入时间；默认 group 查不到正在做的项目时用 |
 | `memory_guide` | 使用方法全文（写什么、怎么写、怎么查、什么情况用哪个工具修），即 [docs/MEMORY-GUIDE.md](docs/MEMORY-GUIDE.md) |
 
 接入的模型不需要客户端侧的提示词：`initialize` 返回的 `instructions` 讲清基本流程（回答前先查，

@@ -95,6 +95,16 @@ Not like this:
 - `get_episode` with the `ep` id of a fact shows the note behind it; `list_episodes` lists the
   newest notes.
 
+## Groups
+
+Memory is split into groups (namespaces), usually one per person, assistant or project. Without `group_id`
+every tool uses your default group; the connection instructions list the groups you may use.
+
+- Working on a project or topic that has its own group: pass that `group_id` on every call, reads and writes.
+- The default group has nothing about what you are working on: call `list_groups` and search the group that
+  matches before concluding the memory is empty.
+- Never copy facts from one group into another to "share" them; ask the user which group a new topic belongs to.
+
 ## Repairs: situation → tool
 
 | Situation | Tool |

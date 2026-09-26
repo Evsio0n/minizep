@@ -125,7 +125,9 @@ test('stdio: the single local user may use any group', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'minizep-stdio-'));
   try {
     const { client, server } = await stdioSetup(join(dir, 'graph.json'));
-    assert.equal(client.getInstructions(), INSTRUCTIONS);
+    // the shared text, then the groups this connection may use
+    assert.ok(client.getInstructions()?.startsWith(INSTRUCTIONS));
+    assert.match(client.getInstructions() ?? '', /this connection may use any group; the default is "default"/);
     const r = await call(client, 'add_memory', { content: 'Alice works at Acme.', group_id: 'project-x' });
     assert.equal(r.isError, false);
     assert.equal(r.structured.group_id, 'project-x');
@@ -151,7 +153,8 @@ test('stdio proxy: forwards the instructions and every tool of the HTTP server u
   transport.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()));
   try {
     await client.connect(transport);
-    assert.equal(client.getInstructions(), INSTRUCTIONS);
+    assert.ok(client.getInstructions()?.startsWith(INSTRUCTIONS));
+    assert.match(client.getInstructions() ?? '', /Groups this connection may use: teamA \(default\)\./);
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name);
     for (const tool of ['add_memory', 'get_episode', 'invalidate_fact', 'reopen_fact', 'forget_episode', 'retry_failed', 'facts_at', 'memory_guide']) {
