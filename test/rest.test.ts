@@ -149,6 +149,7 @@ test('rest: every route applies the token\'s group rules', async () => {
       ['GET', '/v1/episodes?group_id=teamB'],
       ['GET', '/v1/episodes/00000000?group_id=teamB'],
       ['POST', '/v1/facts/00000000/invalidate', { reason: 'x', group_id: 'teamB' }],
+      ['POST', '/v1/facts/00000000/reopen', { reason: 'x', group_id: 'teamB' }],
       ['POST', '/v1/episodes/retry-failed', { group_id: 'teamB' }],
       ['GET', '/v1/stats?group_id=teamB'],
       ['GET', '/v1/graph?group_id=teamB'],
@@ -292,7 +293,7 @@ test('rest: episodes list and lookup by prefix', async () => {
   }
 });
 
-test('rest: invalidate a fact, with 400/404/409 for bad requests', async () => {
+test('rest: invalidate and reopen a fact, forget an episode, with 400/404/409 for bad requests', async () => {
   const srv = await startServer();
   try {
     const tok = { token: 'tokA' };
@@ -312,15 +313,48 @@ test('rest: invalidate a fact, with 400/404/409 for bad requests', async () => {
       404,
     );
 
+    const reopen = `/v1/facts/${uuid}/reopen`;
+    assert.equal((await api(srv.base, 'POST', reopen, { ...tok, body: { reason: 'x' } })).status, 409, 'active: nothing to reopen');
+
     const ok = await api(srv.base, 'POST', path, { ...tok, body: { reason: 'left', at: '2024-05-01T00:00:00Z' } });
     assert.equal(ok.status, 200);
     assert.equal(ok.body.fact.invalid_at, '2024-05-01T00:00:00.000Z');
     assert.ok(ok.body.fact.expired_at);
     assert.equal((await api(srv.base, 'POST', path, { ...tok, body: { reason: 'again' } })).status, 409);
 
+    // a wrong end is undone by reopening: a corrected copy, here with the real end
+    assert.equal((await api(srv.base, 'POST', reopen, { ...tok, body: {} })).status, 400, 'reason is required');
+    const endsEarly = { reason: 'x', invalid_at: '2023-06-01T00:00:00Z' };
+    assert.equal((await api(srv.base, 'POST', reopen, { ...tok, body: endsEarly })).status, 409, 'cannot end before it started');
+    const reopened = await api(srv.base, 'POST', reopen, { ...tok, body: { reason: 'left later', invalid_at: '2024-09-01T00:00:00Z' } });
+    assert.equal(reopened.status, 200);
+    assert.equal(reopened.body.previous.uuid, uuid);
+    assert.match(reopened.body.previous.reason, /^reopened as .*: left later$/);
+    assert.deepEqual([reopened.body.fact.valid_at, reopened.body.fact.invalid_at], ['2024-01-01T00:00:00.000Z', '2024-09-01T00:00:00.000Z']);
+    assert.equal((await api(srv.base, 'POST', reopen, { ...tok, body: { reason: 'again' } })).status, 409, 'already reopened');
+
+    // the note itself was wrong: forgetting it retracts the copy only it supports
+    const forget = `/v1/episodes/${(added.body.episode_uuid as string).slice(0, 8)}/forget`;
+    assert.equal((await api(srv.base, 'POST', forget, { ...tok, body: {} })).status, 400, 'reason is required');
+    assert.equal((await api(srv.base, 'POST', '/v1/episodes/ffffffff/forget', { ...tok, body: { reason: 'x' } })).status, 404);
+    assert.equal((await api(srv.base, 'POST', forget, { token: 'tokB', body: { reason: 'x' } })).status, 404, 'another group');
+    assert.equal((await api(srv.base, 'GET', forget, tok)).status, 405);
+    const forgot = await api(srv.base, 'POST', forget, { ...tok, body: { reason: 'another Alice' } });
+    assert.equal(forgot.status, 200);
+    assert.deepEqual(forgot.body.retracted.map((f: { uuid: string }) => f.uuid), [reopened.body.fact.uuid]);
+    assert.deepEqual([forgot.body.unlinked, forgot.body.reopened, forgot.body.unmarked_closures], [[], [], []]);
+    assert.deepEqual(forgot.body.still_closed, []);
+    // it created both entities and wrote their summaries: those go, and nothing is left on them
+    const names = (rows: { name: string }[]) => rows.map((e) => e.name).sort();
+    assert.deepEqual(forgot.body.restored_summaries.map((e: { summary: string }) => e.summary), ['', '']);
+    assert.deepEqual(names(forgot.body.restored_summaries), ['Acme', 'Alice']);
+    assert.deepEqual(names(forgot.body.orphaned_entities), ['Acme', 'Alice']);
+    assert.deepEqual([forgot.body.episode.status, forgot.body.episode.error], ['forgotten', 'another Alice']);
+    assert.equal((await api(srv.base, 'POST', forget, { ...tok, body: { reason: 'again' } })).status, 409, 'already forgotten');
+
     const stats = await api(srv.base, 'GET', '/v1/stats', tok);
-    assert.deepEqual(stats.body.facts, { total: 1, active: 0, historical: 1 });
-    assert.deepEqual(stats.body.episodes, { total: 1, pending: 0, processed: 1, failed: 0 });
+    assert.deepEqual(stats.body.facts, { total: 2, active: 0, historical: 2 });
+    assert.deepEqual(stats.body.episodes, { total: 1, pending: 0, processed: 0, failed: 0, given_up: 0, forgotten: 1 });
     assert.deepEqual(stats.body.jobs, { queued: 0, running: 0 });
   } finally {
     await srv.close();

@@ -16,5 +16,6 @@ export type {
   KnownFact,
   ContradictionCandidate,
   ContradictionExisting,
+  ContradictionVerdict,
 } from './interfaces.js';
 export type { FallbackEmbedderOptions } from './ollama-embedder.js';

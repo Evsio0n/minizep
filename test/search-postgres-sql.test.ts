@@ -49,6 +49,8 @@ class Lock {
 class FakeDatabase {
   rows: Row[] = [];
   hasColumn = true;
+  /** episodes.attempts, the retry counter */
+  hasAttempts = true;
   indexes = new Set(['facts_search_text', 'facts_search_text_missing']);
   /** indexes being built and not yet committed, as Postgres' race needs */
   private building = new Set<string>();
@@ -59,6 +61,7 @@ class FakeDatabase {
   static legacy(rows: number): FakeDatabase {
     const db = new FakeDatabase();
     db.hasColumn = false;
+    db.hasAttempts = false;
     db.indexes = new Set(['facts_fts']);
     for (let i = 0; i < rows; i++) {
       db.rows.push({
@@ -110,6 +113,11 @@ class FakeDatabase {
     }
     if (sql.startsWith('ALTER TABLE facts ADD COLUMN IF NOT EXISTS search_text')) {
       this.hasColumn = true;
+      return { rows: [] };
+    }
+    if (sql.includes("attname = 'attempts'")) return { rows: this.hasAttempts ? [{ '?column?': 1 }] : [] };
+    if (sql.startsWith('ALTER TABLE episodes ADD COLUMN IF NOT EXISTS attempts')) {
+      this.hasAttempts = true;
       return { rows: [] };
     }
     if (sql.startsWith('SELECT uuid, name, fact FROM facts WHERE search_text IS NULL')) {
@@ -380,6 +388,9 @@ test('pg migration: an old table is upgraded under the advisory lock and backfil
 
   assert.ok(db.hasColumn);
   assert.deepEqual([...db.indexes].sort(), ['facts_search_text', 'facts_search_text_missing']);
+  // the episodes' retry counter is added once, outside the facts migration
+  assert.equal(db.statements(/^ALTER TABLE episodes ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0$/).length, 1);
+  assert.ok(db.hasAttempts);
 
   // the schema work runs on one connection, between lock and unlock, in order
   const lock = db.statements(/pg_advisory_lock\(/)[0];

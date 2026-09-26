@@ -1,6 +1,7 @@
 import type {
   ContradictionCandidate,
   ContradictionExisting,
+  ContradictionVerdict,
   Embedder,
   ExtractedFact,
   ExtractedInvalidation,
@@ -38,12 +39,27 @@ export interface LLMConfig {
    * else this process's zone).
    */
   timeZone?: string;
+  /**
+   * Ask for JSON mode (`response_format: {type: "json_object"}`), which
+   * DeepSeek and OpenAI support (default: MINIZEP_LLM_JSON_MODE, else on).
+   * Turn it off for an endpoint that rejects the field.
+   */
+  jsonMode?: boolean;
+}
+
+type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string };
+
+/** An on/off environment variable: 0, false, off and no are off; unset is `fallback`. */
+function envFlag(name: string, fallback: boolean): boolean {
+  const raw = process.env[name]?.trim().toLowerCase();
+  if (!raw) return fallback;
+  return !['0', 'false', 'off', 'no'].includes(raw);
 }
 
 const EXTRACTION_SYSTEM = `You extract a temporal knowledge graph from one text.
 Return ONLY a JSON object, no prose, no markdown fences:
 {"entities":[{"name":"string","labels":["Person"|"Organization"|"Product"|"Host"|"Project"|"Job"|"Role"|"Concept"|"Event"|"Location"|"Preference"],"summary":"string"}],
- "facts":[{"sourceName":"string","targetName":"string","relation":"SCREAMING_SNAKE_CASE","fact":"self-contained sentence","validAt":"ISO-8601 or null","invalidAt":"ISO-8601 or null"}],
+ "facts":[{"sourceName":"string","targetName":"string","relation":"SCREAMING_SNAKE_CASE","fact":"self-contained sentence","validAt":"ISO-8601 or null","invalidAt":"ISO-8601 or null","replacesPrevious":false}],
  "invalidations":[{"sourceName":"string","targetName":"string","relation":"SCREAMING_SNAKE_CASE or null","invalidAt":"ISO-8601 or null","reason":"short justification"}]}
 
 Time — the message starts with a reference time: when the text was written, with its UTC offset and weekday.
@@ -101,9 +117,18 @@ facts vs invalidations — this distinction is critical:
   relationship that only held because of it — leaving a company ends the role, title, team
   membership, manager and project relationships held there. Copy sourceName, targetName and
   relation exactly from the "Active relationships" list.
-- A new value for a single-valued relationship (employer, title, role, team, home city, manager) or
-  for a changing property kept in a fact (address, port, version, status) replaces the old one: emit
-  the new fact and invalidate the old one. Only a property kept in a summary is updated there.
+- replacesPrevious says the target of this fact replaces any earlier one. It is true for a relationship
+  that holds one target at a time for its source (employer, title or role, home city, manager, owner),
+  however the fact is worded ("Alice is CTO at Acme" too), and when the text says an earlier value was
+  replaced ("moved to", "switched to", "changed from X to Y", "was replaced by", 改为, 搬到, 换成).
+  It is false for a relationship that can have several targets at once (evaluated on several datasets,
+  uses several tools, member of several teams, runs several jobs): a new target there ends nothing and
+  invalidates nothing. A negation ("does not replace", "is not part of", 并不取代) never sets it.
+- A new target for a relationship with replacesPrevious, or a new value for a changing property kept
+  in a fact (address, port, version, status), replaces the old one: emit the new fact and invalidate
+  the old one. Only a property kept in a summary is updated there.
+- A negated relationship ("X does not replace Y", "X is not part of Y") is neither a fact nor an
+  invalidation: keep what it says in the sentence of a positive fact or in an entity summary.
 - invalidAt = when it ended, resolved against the reference time; null when the text gives no clue.
 - If a relationship both starts and ends within this text, put it in "facts" with invalidAt.
 - Emit empty arrays when a category has no entries.
@@ -117,28 +142,53 @@ Output:
 {"entities":[{"name":"Alice Chen","labels":["Person"],"summary":"Alice Chen, formerly a backend engineer on Acme Corp's payments team, is a Staff Engineer at Globex."},
   {"name":"Globex","labels":["Organization"],"summary":"Globex is a company that Alice Chen joined as a Staff Engineer."},
   {"name":"Staff Engineer","labels":["Role"],"summary":"Staff Engineer is Alice Chen's role at Globex."}],
- "facts":[{"sourceName":"Alice Chen","targetName":"Globex","relation":"WORKS_AT","fact":"Alice Chen joined Globex as a Staff Engineer after leaving Acme Corp on 2026-02-27","validAt":null,"invalidAt":null},
-  {"sourceName":"Alice Chen","targetName":"Staff Engineer","relation":"HAS_ROLE","fact":"Alice Chen is a Staff Engineer at Globex","validAt":null,"invalidAt":null}],
+ "facts":[{"sourceName":"Alice Chen","targetName":"Globex","relation":"WORKS_AT","fact":"Alice Chen joined Globex as a Staff Engineer after leaving Acme Corp on 2026-02-27","validAt":null,"invalidAt":null,"replacesPrevious":true},
+  {"sourceName":"Alice Chen","targetName":"Staff Engineer","relation":"HAS_ROLE","fact":"Alice Chen is a Staff Engineer at Globex","validAt":null,"invalidAt":null,"replacesPrevious":true}],
  "invalidations":[{"sourceName":"Alice Chen","targetName":"Acme Corp","relation":"WORKS_AT","invalidAt":"2026-02-27T00:00:00+00:00","reason":"left Acme Corp last Friday"},
   {"sourceName":"Alice Chen","targetName":"backend engineer","relation":"HAS_ROLE","invalidAt":"2026-02-27T00:00:00+00:00","reason":"the role ended with leaving Acme Corp"},
   {"sourceName":"Alice Chen","targetName":"payments team","relation":"MEMBER_OF","invalidAt":"2026-02-27T00:00:00+00:00","reason":"the team membership ended with leaving Acme Corp"}]}`;
 
 const CONTRADICTION_SYSTEM = `You maintain a temporal knowledge graph. You get one NEW fact and a numbered
 list of EXISTING facts, and decide which existing facts stop being true once the new fact holds.
-An existing fact is ended when the new fact replaces it: another employer, title, role, team, manager,
-home, owner, status, date or value for the same thing; a reversal; an explicit update.
-It is NOT ended when both can hold at the same time (working at a company and owning shares in it;
-a role and a team membership; two hobbies), or when the new fact only adds detail to it.
-Dates in parentheses are when each fact started. The new fact may be OLDER than an existing one (a
-document added late): still list every existing fact it cannot hold together with; the order in time is
-taken from the dates.
-Return ONLY JSON: {"contradicts": true|false, "which": [numbers of the ended facts from the list]}`;
+An existing fact is ended ONLY when it and the new fact cannot both be true at the same time: another
+employer, title, manager, home, owner, status or value for a thing that has one at a time (a new
+version, port, address or status of the same thing ends the old one); a reversal.
+These are NOT contradictions, the existing fact stays true:
+- a restatement, elaboration or confirmation of the same relationship ("still valid", "remains",
+  "confirmed", more detail about it);
+- another value of a relationship that can have several at once (evaluated on several datasets, uses
+  several tools, member of several teams, runs several jobs; working at a company and owning shares in
+  it; a role and a team membership);
+- a statement that something does not replace, is separate from, or is in addition to another;
+- a result for another dataset, split or experiment run.
+When unsure, the existing fact is not ended.
+"same" lists the existing facts that the new fact only restates, confirms or adds detail to: the same
+relationship, not a separate one that holds alongside it (another job, run or result between the same
+two things is separate).
+Examples:
+- NEW "Model M was also evaluated on benchmark B2"; EXISTING 1. "Model M was evaluated on benchmark B1"
+  -> {"contradicts": false, "which": [], "same": []}
+- NEW "Job 12 evaluated model M on benchmark B1"; EXISTING 1. "Job 11 evaluated model M on benchmark B1"
+  -> {"contradicts": false, "which": [], "same": []}
+- NEW "The Q3 test result of service S still stands"; EXISTING 1. "Service S passed the Q3 test"
+  -> {"contradicts": false, "which": [], "same": [1]}
+- NEW "Service S on host H was upgraded to version 2.1"; EXISTING 1. "Service S version 2.0 runs on host H"
+  -> {"contradicts": true, "which": [1], "same": []}
+- NEW "Dana moved from Initech to Globex"; EXISTING 1. "Dana works at Initech"
+  -> {"contradicts": true, "which": [1], "same": []}
+Dates in parentheses are when each fact started. The system handles the order in time: decide as if both
+facts held at the same moment. The new fact may be OLDER than an existing one (a document added late):
+still list every existing fact it cannot hold together with.
+Return ONLY JSON: {"contradicts": true|false, "which": [numbers of the ended facts from the list],
+"same": [numbers of the facts it only restates]}`;
 
 export class OpenAICompatLLM implements LLMProvider {
   private readonly timeZone: string;
+  private readonly jsonMode: boolean;
 
   constructor(private cfg: LLMConfig) {
     this.timeZone = cfg.timeZone ?? process.env.MINIZEP_TIMEZONE ?? localTimeZone();
+    this.jsonMode = cfg.jsonMode ?? envFlag('MINIZEP_LLM_JSON_MODE', true);
     // an unknown zone would fail every extraction; fail at construction instead
     try {
       formatReferenceTime(new Date(), this.timeZone);
@@ -155,13 +205,13 @@ export class OpenAICompatLLM implements LLMProvider {
    *   - HTTP 429 / 5xx (rate limit, upstream hiccup)
    *   - empty `content` because the reasoning budget consumed all max_tokens
    */
-  private async chat(system: string, userPrompt: string, maxTokens: number): Promise<string> {
+  private async chat(messages: ChatMessage[], maxTokens: number): Promise<string> {
     const attempts = this.cfg.retries ?? 3;
     let lastErr: Error | undefined;
 
     for (let i = 0; i < attempts; i++) {
       try {
-        return await this.chatOnce(system, userPrompt, maxTokens);
+        return await this.chatOnce(messages, maxTokens);
       } catch (err) {
         lastErr = err as Error;
         const retryable = /empty content|HTTP (429|5\d\d)|fetch failed|timeout|aborted/i.test(lastErr.message);
@@ -174,7 +224,40 @@ export class OpenAICompatLLM implements LLMProvider {
     throw lastErr;
   }
 
-  private async chatOnce(system: string, userPrompt: string, maxTokens: number): Promise<string> {
+  /**
+   * A chat answered with one JSON object. A reply that does not parse is
+   * handed back once with the parse error; a second bad reply throws, which
+   * fails the episode like any other extraction error.
+   */
+  private async chatJson(system: string, userPrompt: string, maxTokens: number): Promise<unknown> {
+    const messages: ChatMessage[] = [
+      { role: 'system', content: system },
+      { role: 'user', content: userPrompt },
+    ];
+    const raw = await this.chat(messages, maxTokens);
+    try {
+      return parseJsonObject(raw);
+    } catch (err) {
+      if (!(err instanceof JsonReplyError)) throw err;
+      console.error(`[minizep] LLM reply is not valid JSON (${err.problem}); asking once more`);
+      const again = await this.chat(
+        [
+          ...messages,
+          { role: 'assistant', content: raw },
+          {
+            role: 'user',
+            content:
+              `Your reply is not valid JSON: ${err.problem}. ` +
+              'Return valid JSON only: the whole object, no prose, no markdown fences.',
+          },
+        ],
+        maxTokens,
+      );
+      return parseJsonObject(again);
+    }
+  }
+
+  private async chatOnce(messages: ChatMessage[], maxTokens: number): Promise<string> {
     const res = await fetch(`${this.cfg.baseUrl.replace(/\/$/, '')}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -183,12 +266,10 @@ export class OpenAICompatLLM implements LLMProvider {
       },
       body: JSON.stringify({
         model: this.cfg.model,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: userPrompt },
-        ],
+        messages,
         temperature: 0,
         max_tokens: maxTokens,
+        ...(this.jsonMode ? { response_format: { type: 'json_object' } } : {}),
       }),
       signal: AbortSignal.timeout(this.cfg.timeoutMs ?? 120_000),
     });
@@ -216,12 +297,11 @@ export class OpenAICompatLLM implements LLMProvider {
   ): Promise<ExtractionResult> {
     // the pipeline always passes the episode's time; a direct caller gets now
     const opts = { ...options, referenceTime: options.referenceTime ?? new Date() };
-    const raw = await this.chat(
+    const parsed = (await this.chatJson(
       EXTRACTION_SYSTEM,
       buildExtractionPrompt(content, knownEntityNames, knownFacts, opts, this.timeZone),
       this.cfg.maxTokens ?? 8000,
-    );
-    const parsed = parseJsonObject(raw) as {
+    )) as {
       entities?: { name: string; labels?: string[]; summary?: string }[];
       facts?: {
         sourceName: string;
@@ -230,6 +310,7 @@ export class OpenAICompatLLM implements LLMProvider {
         fact: string;
         validAt?: string | null;
         invalidAt?: string | null;
+        replacesPrevious?: boolean | null;
       }[];
       invalidations?: {
         sourceName: string;
@@ -268,6 +349,8 @@ export class OpenAICompatLLM implements LLMProvider {
         fact: f.fact.trim(),
         validAt: toDate(f.validAt),
         invalidAt: toDate(f.invalidAt),
+        // only an explicit true: a missing or malformed flag replaces nothing
+        ...(f.replacesPrevious === true ? { replacesPrevious: true } : {}),
       }));
 
     // invalidations may name endpoints that already exist; they do not have to
@@ -308,15 +391,17 @@ export class OpenAICompatLLM implements LLMProvider {
   async detectContradiction(
     candidate: ContradictionCandidate,
     existing: ContradictionExisting[],
-  ): Promise<number[]> {
-    if (existing.length === 0) return [];
+  ): Promise<ContradictionVerdict> {
+    if (existing.length === 0) return { ended: [], same: [] };
     const list = existing.map((e, i) => `${i + 1}. ${e.fact}${since(e.validAt, this.timeZone)}`).join('\n');
-    const raw = await this.chat(
+    const parsed = await this.chatJson(
       CONTRADICTION_SYSTEM,
-      `New fact: ${candidate.fact}${since(candidate.validAt, this.timeZone)}\n\nExisting facts:\n${list}`,
+      `New fact${candidate.replacesPrevious ? ' (it replaces an earlier value)' : ''}: ` +
+        `${candidate.fact}${since(candidate.validAt, this.timeZone)}\n\nExisting facts:\n${list}`,
       this.cfg.maxTokens ?? 8000,
     );
-    return parseContradiction(parseJsonObject(raw), existing.length);
+    const same = parseSame(parsed, existing.length);
+    return { ended: parseContradiction(parsed, existing.length), ...(same ? { same } : {}) };
   }
 }
 
@@ -333,16 +418,29 @@ export function parseContradiction(parsed: unknown, count: number): number[] {
   if (p.which === undefined || p.which === null) {
     return p.contradicts === true ? Array.from({ length: count }, (_, i) => i) : [];
   }
-  const listed = Array.isArray(p.which) ? p.which : [p.which];
-  const which = [...new Set(listed.map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= count))].map(
-    (n) => n - 1,
-  );
+  const which = zeroBased(p.which, count);
   if (which.length === 0 && p.contradicts === true) {
     console.error(
       `[minizep] contradiction answer names no fact of 1..${count} (which=${JSON.stringify(p.which).slice(0, 80)}); closing none`,
     );
   }
   return which;
+}
+
+/**
+ * "same": the facts the new one only restates, 1-based like "which". Undefined
+ * when the reply has no such list: the pipeline then takes every fact of the
+ * same pair and relation that is not ended as restated, as before.
+ */
+function parseSame(parsed: unknown, count: number): number[] | undefined {
+  const same = ((parsed ?? {}) as { same?: unknown }).same;
+  return same === undefined || same === null ? undefined : zeroBased(same, count);
+}
+
+/** 1-based numbers (or numeric strings, or one bare number) within 1..count -> distinct 0-based indexes. */
+function zeroBased(listed: unknown, count: number): number[] {
+  const all = Array.isArray(listed) ? listed : [listed];
+  return [...new Set(all.map(Number).filter((n) => Number.isInteger(n) && n >= 1 && n <= count))].map((n) => n - 1);
 }
 
 /** The user message of an extraction call. */
@@ -410,6 +508,16 @@ export function formatReferenceTime(d: Date, timeZone = 'UTC'): string {
   );
 }
 
+/** A reply that holds no parseable JSON object; `problem` says why, without the reply. */
+class JsonReplyError extends Error {
+  constructor(
+    readonly problem: string,
+    raw: string,
+  ) {
+    super(`${problem} in LLM output: ${raw.slice(0, 160)}`);
+  }
+}
+
 /** Tolerates fenced code blocks and surrounding prose. */
 function parseJsonObject(raw: string): unknown {
   let text = raw.trim();
@@ -417,10 +525,12 @@ function parseJsonObject(raw: string): unknown {
   if (fence) text = fence[1].trim();
   const start = text.indexOf('{');
   const end = text.lastIndexOf('}');
-  if (start === -1 || end === -1 || end <= start) {
-    throw new Error(`no JSON object in LLM output: ${raw.slice(0, 160)}`);
+  if (start === -1 || end === -1 || end <= start) throw new JsonReplyError('no JSON object', raw);
+  try {
+    return JSON.parse(text.slice(start, end + 1));
+  } catch (err) {
+    throw new JsonReplyError(`invalid JSON (${(err as Error).message.slice(0, 120)})`, raw);
   }
-  return JSON.parse(text.slice(start, end + 1));
 }
 
 function toDate(v: string | null | undefined): Date | undefined {

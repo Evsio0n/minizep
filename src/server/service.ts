@@ -6,6 +6,7 @@
  * Every method takes the caller's Principal and resolves the memory group
  * through auth.resolveGroup(), so no endpoint can forget the tenant check.
  */
+import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import type { Minizep } from '../index.js';
 import type { EntityEdge, EntityNode, EpisodicNode, FactState, FactWithContext } from '../model/types.js';
@@ -38,7 +39,18 @@ export interface ServiceOptions {
   persistence?: SnapshotWriter;
   llmLabel?: string;
   storeLabel?: string;
+  /**
+   * The background retry gives a failed episode up after this many attempts
+   * (default 3); retry_failed still takes it.
+   */
+  retryMax?: number;
 }
+
+/** Failed episodes one background retry pass takes at most. */
+const RETRY_BATCH = 5;
+
+/** The methodology the memory_guide tool and GET /v1/guide return; resolves from src/server and dist/server alike. */
+const GUIDE = new URL('../../docs/MEMORY-GUIDE.md', import.meta.url);
 
 /* ---------------- result rows ---------------- */
 
@@ -96,8 +108,11 @@ export interface EpisodeRow {
   valid_at: string;
   created_at: string;
   /** records written before statuses were persisted count as processed */
-  status: 'pending' | 'processed' | 'failed';
+  status: 'pending' | 'processed' | 'failed' | 'forgotten';
+  /** why it failed, or why it was forgotten */
   error: string | null;
+  /** processing attempts so far (retries included) */
+  attempts: number;
 }
 
 export interface JobRow {
@@ -200,6 +215,7 @@ function episodeRow(e: EpisodicNode): EpisodeRow {
     created_at: e.createdAt.toISOString(),
     status: e.status ?? 'processed',
     error: e.error ?? null,
+    attempts: e.attempts ?? 0,
   };
 }
 
@@ -288,6 +304,17 @@ export const shapes = {
     retract: z.boolean().optional().describe('The fact was never true: remove it from every point in time'),
     group_id: groupId,
   },
+  reopenFact: {
+    uuid: z.string().min(1).describe('Fact uuid, or a prefix of at least 8 characters'),
+    reason: z.string().min(1).describe('Why the fact still holds (kept for auditing)'),
+    invalid_at: instant('when it really stopped being true, if it did (default: still true)'),
+    group_id: groupId,
+  },
+  forgetEpisode: {
+    id: z.string().min(1).describe('Episode uuid, or a prefix of at least 8 characters'),
+    reason: z.string().min(1).describe('Why the note is wrong or not wanted (kept for auditing)'),
+    group_id: groupId,
+  },
   group: {
     group_id: groupId,
   },
@@ -319,6 +346,8 @@ export type EntitiesInput = Input<typeof shapes.entities>;
 export type EpisodesInput = Input<typeof shapes.episodes>;
 export type EpisodeInputShape = Input<typeof shapes.episode>;
 export type InvalidateFactInputShape = Input<typeof shapes.invalidateFact>;
+export type ReopenFactInputShape = Input<typeof shapes.reopenFact>;
+export type ForgetEpisodeInputShape = Input<typeof shapes.forgetEpisode>;
 export type GroupInput = Input<typeof shapes.group>;
 export type GraphInput = Input<typeof shapes.graph>;
 export type EntityInput = Input<typeof shapes.entity>;
@@ -359,9 +388,12 @@ export class MemoryService {
   readonly jobs: JobQueue;
   readonly llmLabel: string;
   readonly storeLabel: string;
+  readonly retryMax: number;
   private readonly persistence?: SnapshotWriter;
   /** synchronous ingestions in progress: shutdown waits for them like for jobs */
   private readonly inflight = new Set<Promise<unknown>>();
+  /** a background retry pass is running (the next tick skips instead of piling up) */
+  private sweeping = false;
 
   constructor(opts: ServiceOptions) {
     this.zep = opts.zep;
@@ -369,6 +401,7 @@ export class MemoryService {
     this.persistence = opts.persistence;
     this.llmLabel = opts.llmLabel ?? 'unknown';
     this.storeLabel = opts.storeLabel ?? 'unknown';
+    this.retryMax = opts.retryMax ?? 3;
   }
 
   /* ---------- ingestion ---------- */
@@ -416,6 +449,45 @@ export class MemoryService {
     return { group_id: group, retried: r.retried, succeeded: r.succeeded, still_failing: r.stillFailing };
   }
 
+  /**
+   * One pass of the background retry, over every group: the oldest failed
+   * episodes tried fewer than `retryMax` times, at most `batch` of them, each
+   * through the group's lock like any processing. A pass while another is
+   * still running does nothing.
+   */
+  async retrySweep(batch = RETRY_BATCH): Promise<{ retried: number; succeeded: number; still_failing: number }> {
+    if (this.sweeping) return { retried: 0, succeeded: 0, still_failing: 0 };
+    this.sweeping = true;
+    try {
+      const r = await this.track(this.zep.ingest.retryFailed(undefined, { maxAttempts: this.retryMax, limit: batch }));
+      if (r.retried) this.persistence?.schedule(this.zep);
+      return { retried: r.retried, succeeded: r.succeeded, still_failing: r.stillFailing };
+    } finally {
+      this.sweeping = false;
+    }
+  }
+
+  /**
+   * Run retrySweep every `everyMs` (0: never) until the returned function is
+   * called. The timer does not keep the process alive; a pass in progress is
+   * waited for by drain() like any ingestion.
+   */
+  retryEvery(everyMs: number, log: (msg: string) => void = () => undefined): () => void {
+    if (everyMs <= 0) return () => undefined;
+    const timer = setInterval(() => {
+      this.retrySweep().then(
+        (r) => {
+          if (r.retried) {
+            log(`retried ${r.retried} failed episode(s): ${r.succeeded} succeeded, ${r.still_failing} still failing`);
+          }
+        },
+        (err) => log(`background retry failed: ${(err as Error)?.message ?? err}`),
+      );
+    }, everyMs);
+    timer.unref();
+    return () => clearInterval(timer);
+  }
+
   /** A job processing a saved episode; a failed extraction fails the job. */
   private enqueue(episode: EpisodicNode, label: string): Job {
     const group = episode.groupId;
@@ -427,6 +499,7 @@ export class MemoryService {
           if (r.status === 'failed') {
             throw new Error(`extraction failed: ${r.error ?? 'unknown error'} (episode stored for retry)`);
           }
+          if (r.episode.status === 'forgotten') throw new Error('the episode was forgotten before it was processed');
           return await this.outcome(group, r);
         } finally {
           this.persistence?.schedule(this.zep);
@@ -517,12 +590,7 @@ export class MemoryService {
   /** One episode with the facts it produced (first evidence) and reinforced. */
   async episode(p: Principal, input: EpisodeInputShape) {
     const group = resolveGroup(p, input.group_id);
-    const id = normaliseId(input.id, 'episode');
-    const episode = UUID_RE.test(id)
-      ? await this.zep.store.getEpisode(id).then((e) => (e && e.groupId === group ? e : undefined))
-      : pickByPrefix(await this.zep.store.getEpisodes(group), id, 'episode');
-    if (!episode) throw new ServiceError(404, 'episode not found');
-
+    const episode = await this.findEpisode(group, input.id);
     const mine = (await this.zep.store.getFacts(group)).filter((f) => f.episodes.includes(episode.uuid));
     const rows = await this.withNames(mine);
     return {
@@ -547,10 +615,74 @@ export class MemoryService {
       this.persistence?.schedule(this.zep);
       return { group_id: group, fact: (await this.withNames([fact]))[0] };
     } catch (err) {
-      if (err instanceof InvalidationError) {
-        throw new ServiceError(err.code === 'not_found' ? 404 : 409, err.message);
-      }
-      throw err;
+      throw asServiceError(err);
+    }
+  }
+
+  /**
+   * Undo a wrong end or retraction: the old record is retracted and kept in
+   * history, and the returned `fact` is its corrected copy (a new uuid).
+   */
+  async reopenFact(p: Principal, input: ReopenFactInputShape) {
+    const group = resolveGroup(p, input.group_id);
+    const id = normaliseId(input.uuid, 'fact');
+    const invalidAt = parseInstant(input.invalid_at, 'invalid_at');
+    const uuid = UUID_RE.test(id) ? id : pickByPrefix(await this.zep.store.getFacts(group), id, 'fact').uuid;
+    try {
+      const r = await this.zep.ingest.reopenFact(uuid, { groupId: group, reason: input.reason, invalidAt });
+      this.persistence?.schedule(this.zep);
+      const [fact, previous] = await this.withNames([r.fact, r.previous]);
+      return { group_id: group, fact, previous };
+    } catch (err) {
+      throw asServiceError(err);
+    }
+  }
+
+  /**
+   * Take back what one episode contributed (see IngestPipeline.forgetEpisode):
+   * the facts only it supported are retracted, the others lose it as
+   * evidence, the facts it closed are reopened unless a later value still
+   * holds, the summaries it wrote last are put back, and it becomes
+   * 'forgotten'.
+   */
+  async forgetEpisode(p: Principal, input: ForgetEpisodeInputShape) {
+    const group = resolveGroup(p, input.group_id);
+    const episode = await this.findEpisode(group, input.id);
+    try {
+      const r = await this.zep.ingest.forgetEpisode(episode.uuid, { groupId: group, reason: input.reason });
+      this.persistence?.schedule(this.zep);
+      const [retracted, unlinked, stillClosed, unmarked, copies, previous] = await Promise.all(
+        [
+          r.retracted,
+          r.unlinked,
+          r.stillClosed,
+          r.unmarked,
+          r.reopened.map((x) => x.fact),
+          r.reopened.map((x) => x.previous),
+        ].map((edges) => this.withNames(edges)),
+      );
+      return {
+        group_id: group,
+        episode: episodeRow(r.episode),
+        retracted,
+        unlinked,
+        reopened: copies.map((fact, i) => ({ fact, previous: previous[i] })),
+        still_closed: stillClosed,
+        unmarked_closures: unmarked,
+        restored_summaries: r.summaries.map(entityRow),
+        orphaned_entities: r.orphaned.map(entityRow),
+      };
+    } catch (err) {
+      throw asServiceError(err);
+    }
+  }
+
+  /** docs/MEMORY-GUIDE.md, read on every call (edits need no restart). */
+  async guide(): Promise<string> {
+    try {
+      return await readFile(GUIDE, 'utf8');
+    } catch {
+      throw new ServiceError(404, 'the memory guide is not installed (docs/MEMORY-GUIDE.md is missing)');
     }
   }
 
@@ -571,6 +703,8 @@ export class MemoryService {
         pending: byStatus('pending'),
         processed: byStatus('processed'),
         failed: byStatus('failed'),
+        given_up: this.givenUp(episodes),
+        forgotten: byStatus('forgotten'),
       },
       entities: entities.length,
       facts: { total: facts.length, active, historical: facts.length - active },
@@ -760,7 +894,7 @@ export class MemoryService {
   }
 
   /** Server details for an authenticated caller (what /health used to expose). */
-  status(p: Principal) {
+  async status(p: Principal) {
     return {
       ok: true,
       store: this.storeLabel,
@@ -768,9 +902,33 @@ export class MemoryService {
       default_group: p.defaultGroup,
       groups: p.groups === 'any' ? null : [...p.groups],
       jobs: this.jobs.statsFor((j) => this.canSee(p, j)),
+      /** over the caller's groups: failed episodes, and those the background retry gave up on */
+      episodes: await this.failures(p),
       /** the zone relative dates in ingested text are resolved in */
       timezone: displayTimeZone(),
     };
+  }
+
+  /**
+   * Failed and given-up episodes over the caller's groups, counted by the
+   * store (the web UI polls /v1/status: no episode is loaded for it). Null
+   * when the store cannot answer: the status still does.
+   */
+  private async failures(p: Principal): Promise<{ failed: number; given_up: number } | null> {
+    const store = this.zep.store;
+    const groups = p.groups === 'any' ? undefined : [...p.groups];
+    try {
+      if (store.countFailedEpisodes) {
+        const counts = await store.countFailedEpisodes(groups, this.retryMax);
+        return { failed: counts.failed, given_up: counts.givenUp };
+      }
+      const episodes = groups
+        ? (await Promise.all(groups.map((g) => store.getEpisodes(g)))).flat()
+        : await store.getEpisodes();
+      return { failed: episodes.filter((e) => e.status === 'failed').length, given_up: this.givenUp(episodes) };
+    } catch {
+      return null;
+    }
   }
 
   /* ---------- lifecycle ---------- */
@@ -804,6 +962,21 @@ export class MemoryService {
   }
 
   /* ---------- helpers ---------- */
+
+  /** The episode of `group` whose uuid is `rawId` or starts with it. */
+  private async findEpisode(group: string, rawId: string): Promise<EpisodicNode> {
+    const id = normaliseId(rawId, 'episode');
+    const episode = UUID_RE.test(id)
+      ? await this.zep.store.getEpisode(id).then((e) => (e && e.groupId === group ? e : undefined))
+      : pickByPrefix(await this.zep.store.getEpisodes(group), id, 'episode');
+    if (!episode) throw new ServiceError(404, 'episode not found');
+    return episode;
+  }
+
+  /** Failed episodes the background retry no longer takes (retry_failed still does). */
+  private givenUp(episodes: EpisodicNode[]): number {
+    return episodes.filter((e) => e.status === 'failed' && (e.attempts ?? 0) >= this.retryMax).length;
+  }
 
   private async outcome(group: string, r: IngestResult): Promise<AddMemoryOutcome> {
     const known = new Map(r.entities.map((e) => [e.uuid, e.name]));
@@ -842,6 +1015,12 @@ export class MemoryService {
     }
     return names;
   }
+}
+
+/** A manual correction the record's state refuses is a 404 or a 409. */
+function asServiceError(err: unknown): unknown {
+  if (err instanceof InvalidationError) return new ServiceError(err.code === 'not_found' ? 404 : 409, err.message);
+  return err;
 }
 
 function emptyResult(episode: EpisodicNode): IngestResult {

@@ -10,6 +10,10 @@
  *   MINIZEP_GROUP              default group id (default "default")
  *   MINIZEP_DRAIN_TIMEOUT_MS   how long to finish queued ingestion when the
  *                              client disconnects or on SIGTERM (default 120000)
+ *   MINIZEP_RETRY_INTERVAL_MS  retry failed episodes in the background this
+ *                              often (default 600000, 0 = off)
+ *   MINIZEP_RETRY_MAX          ... until an episode has been tried this many
+ *                              times (default 3)
  */
 import { MemoryService } from './service.js';
 import { serveStdio } from './stdio.js';
@@ -27,11 +31,13 @@ const service = new MemoryService({
   persistence: rt.persistence,
   llmLabel: rt.llmLabel,
   storeLabel: rt.storeLabel,
+  retryMax: envInt('MINIZEP_RETRY_MAX', 3),
 });
 const stdio = await serveStdio({
   service,
   defaultGroup: process.env.MINIZEP_GROUP ?? 'default',
   drainTimeoutMs: envInt('MINIZEP_DRAIN_TIMEOUT_MS', 120_000),
+  retryIntervalMs: envInt('MINIZEP_RETRY_INTERVAL_MS', 600_000),
   log,
 });
 

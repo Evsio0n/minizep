@@ -58,9 +58,9 @@ export function runStoreConformance(name: string, makeStore: () => Promise<Graph
     ...over,
   });
 
-  test(`[${name}] episodes round-trip every field, including failure state`, async () => {
+  test(`[${name}] episodes round-trip every field, including failure state, which the store counts`, async () => {
     await withStore(async (s) => {
-      const ep = episode({ status: 'failed', error: 'llm down', contentHash: 'abc123' });
+      const ep = episode({ status: 'failed', error: 'llm down', contentHash: 'abc123', attempts: 2 });
       await s.addEpisode(ep);
       const [got] = await s.getEpisodes('g1');
       assert.ok(got);
@@ -71,8 +71,16 @@ export function runStoreConformance(name: string, makeStore: () => Promise<Graph
       assert.equal(got.status, 'failed');
       assert.equal(got.error, 'llm down');
       assert.equal(got.contentHash, 'abc123');
+      assert.equal(got.attempts, 2);
       assert.equal(got.validAt.getTime(), ep.validAt.getTime());
       assert.equal(got.createdAt.getTime(), ep.createdAt.getTime());
+
+      // what /v1/status reports, without loading any episode
+      await s.addEpisode(episode({ groupId: 'g2', status: 'failed', attempts: 1 }));
+      await s.addEpisode(episode({ groupId: 'g2', status: 'processed', attempts: 5 }));
+      assert.deepEqual(await s.countFailedEpisodes?.(['g1'], 2), { failed: 1, givenUp: 1 });
+      assert.deepEqual(await s.countFailedEpisodes?.(['g2', 'g3'], 2), { failed: 1, givenUp: 0 });
+      assert.deepEqual(await s.countFailedEpisodes?.(undefined, 1), { failed: 2, givenUp: 2 });
     });
   });
 
@@ -82,10 +90,11 @@ export function runStoreConformance(name: string, makeStore: () => Promise<Graph
       await s.addEpisode(ep);
       assert.equal((await s.getEpisode(ep.uuid))?.status, 'pending');
 
-      await s.addEpisode({ ...ep, status: 'failed', error: 'embeddings API 502' });
-      await s.addEpisode({ ...ep, status: 'processed', error: undefined });
+      await s.addEpisode({ ...ep, status: 'failed', error: 'embeddings API 502', attempts: 1 });
+      await s.addEpisode({ ...ep, status: 'processed', error: undefined, attempts: 2 });
       const got = await s.getEpisode(ep.uuid);
       assert.equal(got?.status, 'processed');
+      assert.equal(got?.attempts, 2, 'the retry count is updated in place too');
       assert.equal(got?.error, undefined, 'a cleared error is cleared in storage too');
       assert.equal((await s.getEpisodes('g1')).length, 1, 'still one record');
       assert.equal(await s.getEpisode(uuid()), undefined);

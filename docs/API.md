@@ -87,7 +87,7 @@ Every error is `{"error": "<message>"}`:
 | 403 | invalid token; group not permitted for this token |
 | 404 | unknown route, or no such record in the resolved group |
 | 405 | route exists with another method (`Allow` header lists it) |
-| 409 | the request conflicts with the fact's current state (already ended, already retracted, end before start) |
+| 409 | the request conflicts with the record's current state (fact already ended, already retracted, end before start, nothing to reopen; episode already forgotten) |
 | 413 | request body larger than 1 MB |
 | 500 | unexpected server error (`{"error":"internal error"}`, details in the server log) |
 | 502 | ingestion failed upstream (LLM, embedding service or store); the episode is **kept** for retry |
@@ -140,8 +140,10 @@ plus `ends_at` (`invalid_at` as it was known at `as_of`: `null` when that end wa
 later) and `revised_later` (`expired_at > as_of`: a later correction exists).
 
 **Episode**: `{uuid, group_id, name, source, source_description, content, valid_at, created_at,
-status, error}`. `status` is `pending` (saved, not processed yet), `processed` or `failed` (with
-`error`). Records written before statuses were stored report `processed`.
+status, error, attempts}`. `status` is `pending` (saved, not processed yet), `processed`, `failed`
+(with `error`) or `forgotten` (see [forget](#post-v1episodesidforget); `error` holds the reason).
+Records written before statuses were stored report `processed`. `attempts` counts the times
+processing was started, automatic and manual retries included.
 
 ---
 
@@ -157,7 +159,7 @@ Ingest text: extract entities and facts, and close relationships the text says h
 |-------------------|---------|-------|
 | `content`         | string  | required |
 | `group_id`        | string  | see [Groups](#groups) |
-| `valid_at`        | string  | when it happened (default now); also the reference for relative dates ("yesterday") |
+| `valid_at`        | string  | when it happened (default now); also the reference for relative dates ("yesterday"). Left out or within a day of the call, it only dates when the note was written: see below |
 | `source`          | string  | `text` (default), `json` or `markdown` |
 | `name`            | string  | short label (default: start of the content) |
 | `idempotency_key` | string  | 1-200 chars; a resend with the same key in the same group is a duplicate, whatever its content. Without it, the key is the normalised content plus the UTC day of `valid_at` |
@@ -187,7 +189,21 @@ curl -s -X POST http://127.0.0.1:8787/v1/memories \
 ```
 
 - `facts`: new facts; `reinforced`: existing facts this text restated; `invalidated`: existing
-  facts this text ended.
+  facts this text ended. One that was still true can be put back with
+  [reopen](#post-v1factsuuidreopen).
+- A fact's `valid_at` is the date the text gives, else the episode's. When the text gives none and
+  the episode's `valid_at` was left out or is within a day of when it was saved, the fact only held
+  when the note was written and its start is unknown. When a text stored later says, with a date
+  of its own, that this relation ended before the note was written (an invalidation that names the
+  relation and gives its end: a move "in July" stored after a note written in September), the note
+  was out of date already: the fact is retracted (`invalid_at == valid_at`, `reason` "outdated when
+  written; …") and the new fact does not stop at the note's date. A value that only conflicts with
+  the note does not do that, since a document added late looks the same as a correction learned
+  late; nor does an end with no date of its own, one that names no relation, or one that closes a
+  stint the same text records ("from 2015 to 2017"). Like any older statement, such a value ends
+  where the note begins, and a fact with a dated start is never ended by an older statement at
+  all. An old document that only says the relation ended ("left in 2017") still outdates a note
+  about a later stint of it: give the note's start in its text to prevent that.
 - `dropped`: extracted candidates that were discarded. `facts` and `invalidations` name an entity
   that could not be resolved: non-zero means the text said more than the graph recorded. `entities`
   are names that are only a literal value (an IP address, a number, a URL, a version) with no fact
@@ -199,7 +215,7 @@ Other outcomes:
 |--------|-------------|---------|
 | 200    | `duplicate` | this episode was already processed in this group; nothing changed |
 | 202    | `queued`    | `async: true`: the episode is **stored as pending before** this answer; poll `job_id` |
-| 502    | `failed`    | extraction failed; the episode is kept with status `failed` for retry |
+| 502    | `failed`    | extraction failed; the episode is kept with status `failed` and [retried](#durability-and-shutdown) |
 
 ```json
 {
@@ -410,12 +426,73 @@ ingestion result instead.
 
 ### POST /v1/episodes/retry-failed
 
-Re-process, in place, every `failed` episode of the group (e.g. after an LLM or embedding outage).
-Body (optional): `{"group_id": "..."}`. Runs synchronously.
+Re-process, in place, every `failed` episode of the group (e.g. after an LLM or embedding outage),
+oldest first, including the ones the [background retry](#durability-and-shutdown) gave up on. Each
+counts as an attempt. Body (optional): `{"group_id": "..."}`. Runs synchronously.
 
 ```json
 { "group_id": "teamA", "retried": 1, "succeeded": 1, "still_failing": 0 }
 ```
+
+### POST /v1/episodes/:id/forget
+
+Take back what one episode contributed, when the whole note was wrong or not wanted. `:id` is the
+episode uuid or a prefix of at least 8 characters.
+
+| Field      | Type   | Notes |
+|------------|--------|-------|
+| `reason`   | string | required, kept on the episode and on every fact it changes |
+| `group_id` | string | |
+
+Nothing is deleted, and `as_of` before the call still shows what was believed:
+
+- a fact the episode was the **only evidence** for is **retracted** (as with
+  [invalidate](#post-v1factsuuidinvalidate) `retract: true`), also one that another episode found
+  out of date when written (see below): forgetting that episode later does not bring it back;
+- a fact with other evidence only drops the episode from its `episodes`;
+- a fact the episode **closed** is **reopened** (as with [reopen](#post-v1factsuuidreopen)), with
+  the end it had before, if any. Ingestion records which episode closed a fact
+  (`attributes.closedByEpisode`); closures written by an older build carry no such marker and are
+  only reported in `unmarked_closures` (facts closed when this episode's facts were written), for
+  the caller to check and reopen;
+- for a relation that holds one value at a time (`WORKS_AT`, `HAS_ROLE`, `HAS_TITLE`, `LIVES_IN`,
+  `REPORTS_TO`, or a fact flagged `replacesPrevious`), a later value of the same source and
+  relation that still holds (starting after the fact, not retracted by this call) ends the
+  reopened copy where it begins. When that value begins at or before the end the episode gave the
+  fact (another episode states the same change), the fact **stays closed** and is listed in
+  `still_closed`; reopen it by hand if that is wrong;
+- a fact the episode found **out of date when written** (`attributes.outdatedWhenWritten`, see
+  [add](#post-v1memories)) is reopened the same way, and stays closed while such a value that
+  still holds covers the date it was written;
+- an entity **summary** the episode wrote last is **put back** to the one it replaced (listed in
+  `restored_summaries`; an entity the episode created gets an empty summary). Ingestion records
+  on an entity which episode created it (`attributes.createdByEpisode`) and which one last stated
+  its summary, with the summary it replaced (`summaryByEpisode`, `previousSummary`); an episode
+  that restates the summary word for word takes it over. Entities the episode created that are
+  left with no fact and no summary are listed in `orphaned_entities` and kept;
+- the episode gets status `forgotten` and keeps its text; the same text sent again is a new
+  episode, processed afresh. A `pending` or `failed` episode can be forgotten too: it is then never
+  processed.
+
+Labels, a summary another episode rewrote since, entities written before these markers existed,
+and a start the episode moved earlier are left as they are. Only the last change to a summary is
+kept, so after one episode's summary is put back, an earlier episode's cannot be.
+
+```json
+{ "group_id": "teamA",
+  "episode": { "uuid": "b89af07b-…", "status": "forgotten", "error": "not about this Alice", "…": "…" },
+  "retracted": [ { "uuid": "160f2ea7-…", "invalid_at": "2024-03-01T09:00:00.000Z",
+                   "reason": "forgotten episode b89af07b: not about this Alice", "…": "fact row" } ],
+  "unlinked": [],
+  "reopened": [ { "fact": { "uuid": "5c0de1f2-…", "…": "the reopened copy" },
+                  "previous": { "uuid": "0a4e2b17-…", "…": "the closed record, now retracted" } } ],
+  "still_closed": [],
+  "unmarked_closures": [],
+  "restored_summaries": [ { "name": "Alice", "summary": "the summary before this episode", "…": "entity row" } ],
+  "orphaned_entities": [] }
+```
+
+404 when the group has no such episode, 409 when it is already forgotten.
 
 ### POST /v1/facts/:uuid/invalidate
 
@@ -443,7 +520,40 @@ curl -s -X POST http://127.0.0.1:8787/v1/facts/160f2ea7/invalidate \
 Nothing is deleted: queries with an `as_of` before the correction still return what was believed
 then. An earlier end than the recorded one is allowed; 409 when the fact had already ended at or
 before `at` (`fact already ended at …`), when `at` is not after its start, or when it is already
-retracted.
+retracted. To undo a wrong end or retraction, [reopen](#post-v1factsuuidreopen) the fact.
+
+### POST /v1/facts/:uuid/reopen
+
+Undo a wrong end or retraction, e.g. an ingestion that closed a fact which is still true. The end
+may still be in the future (a change "effective next Monday" that should not have ended the fact).
+`:uuid` is the fact uuid or a prefix of at least 8 characters.
+
+| Field        | Type   | Notes |
+|--------------|--------|-------|
+| `reason`     | string | required, kept on both records |
+| `invalid_at` | string | when it really stopped being true, if it did (default: still true); must be after its `valid_at` |
+| `group_id`   | string | |
+
+A row keeps one version of what was believed, so the closed row is not edited back. It is
+**retracted** (its window is emptied and `expired_at` set to now; a row that was already retracted
+keeps its retraction) and a corrected **copy** is inserted: same endpoints, relation, text,
+`valid_at` and evidence, `invalid_at` as given, `created_at` now, and a new uuid. The response has
+both:
+
+```json
+{ "group_id": "teamA",
+  "fact":     { "uuid": "5c0de1f2-…", "valid_at": "2024-03-01T09:00:00.000Z", "invalid_at": null,
+                "created_at": "2026-09-25T08:02:11.130Z", "expired_at": null, "reason": null, "…": "…" },
+  "previous": { "uuid": "160f2ea7-…", "valid_at": "2024-03-01T09:00:00.000Z",
+                "invalid_at": "2024-03-01T09:00:00.000Z", "expired_at": "2026-09-25T08:02:11.130Z",
+                "reason": "reopened as 5c0de1f2: the later note confirms it, ends nothing", "…": "…" } }
+```
+
+An `as_of` before the reopen finds the old row and not the copy; from the reopen on, only the
+copy, and the old row is `retracted` at every `at`. As with any retraction of an ended fact, an
+`as_of` between the wrong end and the reopen sees the old row without that end. 409 when the fact
+has no end and is not retracted (`nothing to reopen`), was already reopened, or `invalid_at` is not
+after its start.
 
 ### GET /v1/stats
 
@@ -451,13 +561,14 @@ retracted.
 
 ```json
 { "group_id": "teamA",
-  "episodes": { "total": 3, "pending": 0, "processed": 3, "failed": 0 },
+  "episodes": { "total": 3, "pending": 0, "processed": 2, "failed": 1, "given_up": 1, "forgotten": 0 },
   "entities": 4,
   "facts": { "total": 2, "active": 1, "historical": 1 },
   "jobs": { "queued": 0, "running": 0 } }
 ```
 
-Counts are for that group only (`jobs` too).
+Counts are for that group only (`jobs` too). `given_up` counts the `failed` episodes tried
+`MINIZEP_RETRY_MAX` times or more, which only [retry-failed](#post-v1episodesretry-failed) takes.
 
 ### GET /v1/status
 
@@ -470,13 +581,23 @@ Server details for an authenticated caller (what `/health` used to expose):
   "default_group": "teamA",
   "groups": ["teamA"],
   "jobs": { "queued": 0, "running": 0 },
+  "episodes": { "failed": 1, "given_up": 0 },
   "sessions": 0,
   "timezone": "Asia/Shanghai" }
 ```
 
-`groups` is `null` in anonymous mode (any group). `jobs` and `sessions` count only what this
-token can see. `timezone` is the zone relative dates in ingested text are resolved in
-(`MINIZEP_TIMEZONE`, else the server's zone).
+`groups` is `null` in anonymous mode (any group). `jobs`, `episodes` (over the token's groups) and
+`sessions` count only what this token can see; `episodes.given_up` as in [stats](#get-v1stats).
+The store counts the episodes (no episode is loaded, the web UI polls this every 10 s);
+`episodes` is `null` when the store cannot answer, and the rest of the status is still returned.
+`timezone` is the zone relative dates in ingested text are resolved in (`MINIZEP_TIMEZONE`, else
+the server's zone).
+
+### GET /v1/guide
+
+The usage guide for agents, as Markdown (`text/markdown`): what to store, how to write and
+search, which tool repairs what, with examples. It is `docs/MEMORY-GUIDE.md`, read on each request,
+and the same text as the `memory_guide` tool.
 
 ### GET /health
 
@@ -500,35 +621,59 @@ use the returned `Mcp-Session-Id` afterwards.
   longest; when every session has a request in progress, `initialize` gets 503.
 - A request without a session id must be `initialize` (else 400). Bodies are limited to 1 MB.
 
+### How the server explains itself
+
+A model that connects needs no client-side instructions:
+
+- The `initialize` result carries `instructions` (about 1,100 characters; the first paragraph,
+  under 512, stands alone): search before answering about people, projects, plans and decisions;
+  add durable facts, one event per call, subjects named, `valid_at` = when it happened; repair the
+  memory when the user contradicts it; which tool repairs what.
+- The `memory_guide` tool returns the full method, [docs/MEMORY-GUIDE.md](MEMORY-GUIDE.md), also
+  served as [GET /v1/guide](#get-v1guide). Keep the instructions (`src/server/tools.ts`) consistent
+  with it.
+- Every tool description says when to use the tool and ends with "See memory_guide."
+- Tool annotations let a client run reads without asking and ask before corrections:
+  `readOnlyHint` on the read tools; `add_memory` is not destructive and idempotent; `retry_failed`
+  is not destructive; `invalidate_fact`, `reopen_fact` and `forget_episode` are destructive
+  (history is kept, but what the memory holds true changes). `openWorldHint` is false everywhere.
+
 ### Tools
 
 Every tool that takes `group_id` follows the [group rules](#groups). Tool results carry a text
 rendering and the same JSON as the REST API in `structuredContent`.
 
-| Tool                | Arguments | REST equivalent |
-|---------------------|-----------|-----------------|
-| `add_memory`        | `content`, `group_id?`, `valid_at?`, `source?`, `name?`, `idempotency_key?`, `async?` | `POST /v1/memories` |
-| `memory_job_status` | `job_id?` (omit to list recent jobs), `limit?` | `GET /v1/memories/jobs/:id` |
-| `search_facts`      | `query`, `group_id?`, `limit?`, `at?`, `as_of?`, `include_historical?` | `POST /v1/search` |
-| `facts_about`       | `entity`, `group_id?`, `at?`, `as_of?`, `include_historical?`, `limit?` | `GET /v1/entities/:name/facts` |
-| `facts_at`          | `timestamp?` (valid time, default now), `as_of?`, `group_id?`, `limit?` (default 100) | `GET /v1/facts` |
-| `list_entities`     | `query?`, `group_id?`, `limit?` | `GET /v1/entities` |
-| `list_episodes`     | `group_id?`, `limit?` | `GET /v1/episodes` (text preview only) |
-| `get_episode`       | `id` (uuid or 8+ char prefix), `group_id?` | `GET /v1/episodes/:id` |
-| `invalidate_fact`   | `uuid`, `reason`, `at?`, `retract?`, `group_id?` | `POST /v1/facts/:uuid/invalidate` |
-| `retry_failed`      | `group_id?` | `POST /v1/episodes/retry-failed` |
-| `graph_stats`       | `group_id?` | `GET /v1/stats` |
+| Tool                | Arguments | REST equivalent | Kind |
+|---------------------|-----------|-----------------|------|
+| `add_memory`        | `content`, `group_id?`, `valid_at?`, `source?`, `name?`, `idempotency_key?`, `async?` | `POST /v1/memories` | write |
+| `memory_job_status` | `job_id?` (omit to list recent jobs), `limit?` | `GET /v1/memories/jobs/:id` | read |
+| `search_facts`      | `query`, `group_id?`, `limit?`, `at?`, `as_of?`, `include_historical?` | `POST /v1/search` | read |
+| `facts_about`       | `entity`, `group_id?`, `at?`, `as_of?`, `include_historical?`, `limit?` | `GET /v1/entities/:name/facts` | read |
+| `facts_at`          | `timestamp?` (valid time, default now), `as_of?`, `group_id?`, `limit?` (default 100) | `GET /v1/facts` | read |
+| `list_entities`     | `query?`, `group_id?`, `limit?` | `GET /v1/entities` | read |
+| `list_episodes`     | `group_id?`, `limit?` | `GET /v1/episodes` (text preview only) | read |
+| `get_episode`       | `id` (uuid or 8+ char prefix), `group_id?` | `GET /v1/episodes/:id` | read |
+| `invalidate_fact`   | `uuid`, `reason`, `at?`, `retract?`, `group_id?` | `POST /v1/facts/:uuid/invalidate` | destructive |
+| `reopen_fact`       | `uuid`, `reason`, `invalid_at?`, `group_id?` | `POST /v1/facts/:uuid/reopen` | destructive |
+| `forget_episode`    | `id` (uuid or 8+ char prefix), `reason`, `group_id?` | `POST /v1/episodes/:id/forget` | destructive |
+| `retry_failed`      | `group_id?` | `POST /v1/episodes/retry-failed` | write |
+| `graph_stats`       | `group_id?` | `GET /v1/stats` | read |
+| `memory_guide`      | none | `GET /v1/guide` | read |
 
 `add_memory` reports `processed`, `duplicate`, `queued` or `failed`; a failed extraction is a tool
 error (`isError: true`) whose text says the episode is stored for retry. Fact lines look like
 
 ```
-[160f2ea7] Alice --WORKS_AT--> Acme | "Alice works at Acme" | since 2024-03-01
+[160f2ea7] Alice --WORKS_AT--> Acme | "Alice works at Acme" | since 2024-03-01 | ep 6eeafffa
 ```
 
 with the validity rendered as `since <start>`, `true <start> → <end>`, `since <start>, until
 <future end>`, `from <future start>`, `still true` (start unknown) or `retracted`. The bracketed
-prefix is what `invalidate_fact` takes.
+prefix is what `invalidate_fact` and `reopen_fact` take. `ep` lists the first three `episodes`
+(8-character prefixes, oldest first, `+N` for the rest): what `get_episode` and `forget_episode`
+take, and the only way to them for a client that shows the model the text alone.
+
+`minizep-proxy` forwards the instructions, the tool list and its annotations as they are.
 
 ### stdio clients
 
@@ -582,6 +727,12 @@ MINIZEP_UI_GROUPS='teamA|shared'      # or '*' for every group
   written too when the server runs without a database). A job then processes it.
 - At startup the server re-enqueues every `pending` episode left by a previous process. Episodes
   written before statuses existed are treated as processed and are not touched.
+- A `failed` episode is retried in the background: every `MINIZEP_RETRY_INTERVAL_MS` (default
+  10 min) the server re-processes the oldest failed episodes tried fewer than `MINIZEP_RETRY_MAX`
+  times (default 3), up to 5 per pass, each under its group's lock like any ingestion. After that
+  it is left alone (`given_up` in [stats](#get-v1stats)) until
+  [retry-failed](#post-v1episodesretry-failed) or a resend of the same text. The stdio server does
+  the same.
 - On SIGTERM/SIGINT the server stops accepting requests, waits up to `MINIZEP_DRAIN_TIMEOUT_MS`
   (default 120 s) for queued and in-flight ingestion, writes the snapshot and exits. Work not done
   by then stays `pending` and is picked up at the next start. A second signal exits at once.
@@ -599,6 +750,8 @@ MINIZEP_UI_GROUPS='teamA|shared'      # or '*' for every group
 | `MINIZEP_MAX_SESSIONS`     | `256`        | MCP session cap |
 | `MINIZEP_DRAIN_TIMEOUT_MS` | `120000`     | shutdown wait for queued ingestion (HTTP and stdio) |
 | `MINIZEP_JOB_CONCURRENCY`  | `2`          | ingestion jobs run at once |
+| `MINIZEP_RETRY_INTERVAL_MS` | `600000`    | how often failed episodes are retried in the background; `0` = never (HTTP and stdio) |
+| `MINIZEP_RETRY_MAX`        | `3`          | the background retry leaves an episode alone once it has been tried this many times |
 | `MINIZEP_UI_GROUPS`        |              | `group[\|group...]` or `*`: serve the [web UI](#web-ui) on `/ui` without a token for these groups; unset = no UI |
 | `MINIZEP_UI_HOSTS`         |              | comma-separated host names the UI may be opened under, besides IP addresses and `localhost` (e.g. a MagicDNS name) |
 

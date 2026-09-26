@@ -21,7 +21,7 @@ import { bindOnce, listenWithRetry, parseHosts, type RetryOptions, type Retrying
 import { createRestHandler, readJsonBody, sendJson } from './rest.js';
 import { MemoryService, type SnapshotWriter } from './service.js';
 import { SessionRegistry } from './sessions.js';
-import { registerTools, SERVER_INFO } from './tools.js';
+import { registerTools, SERVER_INFO, SERVER_OPTIONS } from './tools.js';
 import { sendUiPage, uiPrincipal, uiRefusal, type UiOptions } from './ui.js';
 
 export interface HttpAppOptions {
@@ -42,6 +42,10 @@ export interface HttpAppOptions {
   maxSessions?: number;
   /** how long close() waits for queued ingestion (default 120 s) */
   drainTimeoutMs?: number;
+  /** every this many ms, failed episodes are retried in the background (default 600000; 0 = never) */
+  retryIntervalMs?: number;
+  /** the background retry gives an episode up after this many attempts (default 3) */
+  retryMax?: number;
   /** backoff for listen addresses that do not exist yet */
   listenRetry?: Omit<RetryOptions, 'onRetry'>;
   log?: (...args: unknown[]) => void;
@@ -60,18 +64,20 @@ export interface HttpApp {
   jobs: JobQueue;
   sessions: SessionRegistry<McpSession>;
   /**
-   * Re-enqueue episodes a previous process left pending (first call only),
-   * then listen on every host. Resolves with the addresses bound now; a host
-   * whose address does not exist yet keeps being retried in the background.
-   * Rejects on any other bind error.
+   * Re-enqueue episodes a previous process left pending and start the
+   * background retry of failed ones (first call only), then listen on every
+   * host. Resolves with the addresses bound now; a host whose address does not
+   * exist yet keeps being retried in the background. Rejects on any other bind
+   * error.
    */
   listen(hosts: string | string[], port: number): Promise<AddressInfo[]>;
   /** the addresses currently listening */
   addresses(): AddressInfo[];
   /**
-   * Stop listening, close MCP sessions, wait for queued ingestion (bounded)
-   * and flush persistence. Resolves false when the drain timed out: those
-   * episodes stay pending and are recovered at the next start.
+   * Stop the background retry and listening, close MCP sessions, wait for
+   * queued ingestion (bounded) and flush persistence. Resolves false when the
+   * drain timed out: those episodes stay pending and are recovered at the next
+   * start.
    */
   close(opts?: { drainTimeoutMs?: number }): Promise<boolean>;
 }
@@ -88,6 +94,7 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
     persistence: opts.persistence,
     llmLabel: opts.llmLabel,
     storeLabel: opts.storeLabel,
+    retryMax: opts.retryMax,
   });
   const sessions = new SessionRegistry<McpSession>({ ttlMs: opts.sessionTtlMs, maxSessions: opts.maxSessions });
   sessions.startSweeping();
@@ -103,10 +110,11 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
   const retries: RetryingListen[] = [];
   let recovered = false;
   let closing: Promise<boolean> | undefined;
+  let stopRetrying: () => void = () => undefined;
 
   /** A new MCP server + transport acting for `principal`; registered once initialised. */
   async function openSession(principal: Principal, onReady: () => void): Promise<McpSession> {
-    const server = new McpServer(SERVER_INFO);
+    const server = new McpServer(SERVER_INFO, SERVER_OPTIONS);
     registerTools(server, { service, principal });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
@@ -245,6 +253,7 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
       recovered = true;
       const n = await service.recoverPending();
       if (n) log(`re-enqueued ${n} pending episode(s) from a previous run`);
+      stopRetrying = service.retryEvery(opts.retryIntervalMs ?? 600_000, log);
     }
     const hosts = Array.isArray(hostsArg) ? hostsArg : parseHosts(hostsArg);
     const bound: AddressInfo[] = [];
@@ -272,6 +281,7 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
 
   function close(closeOpts: { drainTimeoutMs?: number } = {}): Promise<boolean> {
     closing ??= (async () => {
+      stopRetrying();
       for (const r of retries) r.cancel();
       const stopped = servers.map(
         (s) =>

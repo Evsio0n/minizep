@@ -1,7 +1,7 @@
 import { Pool, type PoolClient } from 'pg';
 import { isFactActive, type EntityEdge, type EntityNode, type EpisodicNode, type UUID } from '../model/types.js';
 import { bm25TermScores, tokenize, type Bm25Corpus } from '../search/retrieval.js';
-import type { GraphStore } from './memory-store.js';
+import type { FailedEpisodes, GraphStore } from './memory-store.js';
 
 export interface PostgresStoreOptions {
   connectionString?: string;
@@ -89,7 +89,8 @@ export class PostgresStore implements GraphStore {
             created_at TIMESTAMPTZ NOT NULL,
             status TEXT,
             error TEXT,
-            content_hash TEXT
+            content_hash TEXT,
+            attempts INT NOT NULL DEFAULT 0
           );
           CREATE INDEX IF NOT EXISTS episodes_group_hash ON episodes (group_id, content_hash);
 
@@ -133,6 +134,7 @@ export class PostgresStore implements GraphStore {
             ON facts USING hnsw (fact_embedding vector_cosine_ops);
         `);
         await this.migrateSearchText();
+        await this.migrateEpisodeAttempts();
 
         // CREATE TABLE IF NOT EXISTS silently keeps an existing column's vector
         // dimension, so a model change would otherwise surface as a confusing
@@ -234,6 +236,21 @@ export class PostgresStore implements GraphStore {
     }
   }
 
+  /**
+   * episodes.attempts (the retry counter) on a table created before it
+   * existed. The catalog is read first, so a usual start takes no lock; the
+   * ALTER is idempotent, so processes starting together cannot trip on it.
+   */
+  private async migrateEpisodeAttempts(): Promise<void> {
+    const r = await this.pool.query(
+      `SELECT 1 FROM pg_attribute
+        WHERE attrelid = to_regclass($1) AND attname = 'attempts' AND NOT attisdropped`,
+      [`${this.schema}.episodes`],
+    );
+    if (r.rows.length > 0) return;
+    await this.pool.query('ALTER TABLE episodes ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0');
+  }
+
   /** Whether search_text is complete; `column` says if it exists at all. */
   private async searchTextState(db: Pool | PoolClient): Promise<{ ready: boolean; column: boolean }> {
     const q = (name: string) => `${this.schema}.${name}`;
@@ -332,11 +349,11 @@ export class PostgresStore implements GraphStore {
     await this.ensure();
     await this.db.query(
       `INSERT INTO episodes (uuid, group_id, name, source, source_description, content,
-                             valid_at, created_at, status, error, content_hash)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                             valid_at, created_at, status, error, content_hash, attempts)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
        ON CONFLICT (uuid) DO UPDATE SET
          name = EXCLUDED.name, status = EXCLUDED.status, error = EXCLUDED.error,
-         content_hash = EXCLUDED.content_hash`,
+         content_hash = EXCLUDED.content_hash, attempts = EXCLUDED.attempts`,
       [
         ep.uuid,
         ep.groupId,
@@ -349,6 +366,7 @@ export class PostgresStore implements GraphStore {
         ep.status ?? null,
         ep.error ?? null,
         ep.contentHash ?? null,
+        ep.attempts ?? 0,
       ],
     );
   }
@@ -372,6 +390,18 @@ export class PostgresStore implements GraphStore {
   async removeEpisode(uuid: UUID): Promise<void> {
     await this.ensure();
     await this.db.query('DELETE FROM episodes WHERE uuid=$1', [uuid]);
+  }
+
+  async countFailedEpisodes(groupIds: string[] | undefined, maxAttempts: number): Promise<FailedEpisodes> {
+    await this.ensure();
+    const counts =
+      'SELECT count(*) AS failed, count(*) FILTER (WHERE attempts >= $1) AS given_up ' +
+      "FROM episodes WHERE status = 'failed'";
+    const r = groupIds
+      ? await this.db.query(`${counts} AND group_id = ANY($2::text[])`, [maxAttempts, groupIds])
+      : await this.db.query(counts, [maxAttempts]);
+    // count(*) is a bigint, which node-postgres returns as a string
+    return { failed: Number(r.rows[0]?.failed ?? 0), givenUp: Number(r.rows[0]?.given_up ?? 0) };
   }
 
   /* ---------------- entities ---------------- */
@@ -726,6 +756,7 @@ function rowToEpisode(r: Record<string, unknown>): EpisodicNode {
     status: (r.status ?? undefined) as EpisodicNode['status'],
     error: (r.error ?? undefined) as string | undefined,
     contentHash: (r.content_hash ?? undefined) as string | undefined,
+    attempts: Number(r.attempts ?? 0),
   };
 }
 

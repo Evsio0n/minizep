@@ -4,21 +4,21 @@ import { Minizep, OpenAICompatLLM, FallbackEmbedder, MockLLMProvider } from '../
 import { buildExtractionPrompt, buildLLM, formatReferenceTime, parseContradiction } from '../src/provider/openai-llm.js';
 import { HashEmbedder, type Embedder } from '../src/provider/interfaces.js';
 
+type ChatBody = { messages: { role: string; content: string }[]; response_format?: unknown };
+
 /**
  * Replaces global fetch with a chat-completions stub for the duration of `fn`.
- * `reply` sees the parsed request body and returns the assistant's content.
- * Nothing leaves the process.
+ * `reply` sees the parsed request body and returns the assistant's content
+ * (a string as it is, anything else as JSON). Nothing leaves the process.
  */
-async function withChatStub<T>(
-  reply: (body: { messages: { role: string; content: string }[] }) => unknown,
-  fn: (requests: { messages: { role: string; content: string }[] }[]) => Promise<T>,
-): Promise<T> {
-  const requests: { messages: { role: string; content: string }[] }[] = [];
+async function withChatStub<T>(reply: (body: ChatBody) => unknown, fn: (requests: ChatBody[]) => Promise<T>): Promise<T> {
+  const requests: ChatBody[] = [];
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async (_url: unknown, init?: { body?: unknown }) => {
     const body = JSON.parse(String(init?.body));
     requests.push(body);
-    const content = JSON.stringify(reply(body));
+    const answer = reply(body);
+    const content = typeof answer === 'string' ? answer : JSON.stringify(answer);
     return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
   }) as typeof fetch;
   try {
@@ -30,8 +30,8 @@ async function withChatStub<T>(
 
 const stubLLM = () =>
   new OpenAICompatLLM({ baseUrl: 'http://llm.invalid', apiKey: 'test', model: 'stub', timeZone: 'UTC', retries: 1 });
-const userOf = (body: { messages: { role: string; content: string }[] }) => body.messages.find((m) => m.role === 'user')!.content;
-const systemOf = (body: { messages: { role: string; content: string }[] }) => body.messages.find((m) => m.role === 'system')!.content;
+const userOf = (body: ChatBody) => body.messages.find((m) => m.role === 'user')!.content;
+const systemOf = (body: ChatBody) => body.messages.find((m) => m.role === 'system')!.content;
 
 test('provider: regression R4 — the invalidation safety net never overwrites an entity summary', async () => {
   await withChatStub(
@@ -91,7 +91,15 @@ test('provider: the extraction prompt carries the reference time, known summarie
       assert.match(system, /UPDATED\s+summary/);
       // a changed property of one entity replaces its value in the summary, it is not a fact
       assert.match(system, /A summary states current values/);
-      assert.match(system, /for a changing property kept in a fact \(address, port, version, status\) replaces the old one/);
+      assert.match(system, /a new value for a changing property kept\s+in a fact \(address, port, version, status\), replaces the old one/);
+      // one list of the relationships with one target at a time (a team is not one): they, and an
+      // explicit replacement, let the pipeline end another target of the same relation
+      assert.match(system, /replacesPrevious says the target of this fact replaces any earlier one/);
+      assert.match(system, /one target at a time for its source \(employer, title or role, home city, manager, owner\),\s+however the fact is worded/);
+      assert.equal(system.match(/employer, title/g)?.length, 1, 'one list');
+      assert.match(system, /member of several teams, runs several jobs\): a new target there ends nothing/);
+      assert.match(system, /A negation \("does not replace", "is not part of", 并不取代\) never sets it/);
+      assert.match(system, /A negated relationship \("X does not replace Y", "X is not part of Y"\) is neither a fact nor an\s+invalidation/);
     },
   );
 });
@@ -120,10 +128,13 @@ test('provider: start dates are shown as calendar days of the configured zone, l
     () => ({ contradicts: false, which: [] }),
     async (requests) => {
       const llm = new OpenAICompatLLM({ baseUrl: 'http://llm.invalid', apiKey: 'test', model: 'stub', timeZone: 'Asia/Shanghai', retries: 1 });
-      await llm.detectContradiction({ sourceName: 'Alice', targetName: 'Globex', fact: 'Alice joined Globex', validAt: start }, [
-        { fact: 'Alice works at Acme', validAt: start },
-      ]);
+      const verdict = await llm.detectContradiction(
+        { sourceName: 'Alice', targetName: 'Globex', fact: 'Alice joined Globex', validAt: start, replacesPrevious: true },
+        [{ fact: 'Alice works at Acme', validAt: start }],
+      );
+      assert.deepEqual(verdict, { ended: [] }, 'a reply without "same" does not tell restatements apart');
       assert.equal(userOf(requests[0]).match(/\(since 2026-03-01\)/g)?.length, 2);
+      assert.match(userOf(requests[0]), /^New fact \(it replaces an earlier value\): Alice joined Globex/);
     },
   );
 });
@@ -151,33 +162,94 @@ test('provider: facts may reference known entities that the reply did not list a
   await withChatStub(
     () => ({
       entities: [{ name: 'Globex', labels: ['Organization'], summary: '' }],
-      facts: [{ sourceName: 'Alice Chen', targetName: 'Globex', relation: 'WORKS_AT', fact: 'Alice Chen joined Globex', validAt: '2026-02-27T00:00:00+00:00' }],
+      facts: [
+        { sourceName: 'Alice Chen', targetName: 'Globex', relation: 'WORKS_AT', fact: 'Alice Chen joined Globex', validAt: '2026-02-27T00:00:00+00:00', replacesPrevious: true },
+        { sourceName: 'Alice Chen', targetName: 'Globex', relation: 'OWNS_SHARES_IN', fact: 'Alice Chen owns shares in Globex', replacesPrevious: 'yes' },
+      ],
       invalidations: [],
     }),
     async () => {
       const out = await stubLLM().extract('She joined Globex.', ['Alice Chen'], []);
-      assert.equal(out.facts.length, 1, 'the pipeline, not the provider, decides whether an endpoint resolves');
+      assert.equal(out.facts.length, 2, 'the pipeline, not the provider, decides whether an endpoint resolves');
       assert.equal(out.facts[0].validAt?.toISOString(), '2026-02-27T00:00:00.000Z');
+      assert.deepEqual(out.facts.map((f) => f.replacesPrevious), [true, undefined], 'only an explicit true replaces');
     },
   );
 });
 
-test('provider: detectContradiction uses its own prompt and returns the indexes in "which"', async () => {
+test('provider: detectContradiction uses its own prompt and returns the indexes in "which" and "same"', async () => {
   await withChatStub(
-    () => ({ contradicts: true, which: [2] }),
+    () => ({ contradicts: true, which: [2], same: [1, 7] }),
     async (requests) => {
-      const ended = await stubLLM().detectContradiction(
+      const verdict = await stubLLM().detectContradiction(
         { sourceName: 'Alice', targetName: 'Acme', fact: 'Alice was promoted to CTO of Acme', validAt: new Date('2025-01-01') },
         [{ fact: 'Alice owns shares in Acme' }, { fact: 'Alice is a senior engineer at Acme', validAt: new Date('2024-01-01') }],
       );
-      assert.deepEqual(ended, [1], '"which" is 1-based in the prompt');
+      assert.deepEqual(verdict, { ended: [1], same: [0] }, '"which" and "same" are 1-based in the prompt');
       const system = systemOf(requests[0]);
       assert.doesNotMatch(system, /extract a temporal knowledge graph/, 'not the extraction prompt');
       assert.match(system, /"which"/);
+      // strict: only facts that cannot both hold are ended, and doubt ends nothing
+      assert.match(system, /ended ONLY when it and the new fact cannot both be true at the same time/);
+      assert.match(system, /a restatement, elaboration or confirmation of the same relationship/);
+      assert.match(system, /another value of a relationship that can have several at once/);
+      assert.match(system, /does not replace, is separate from, or is in addition to another/);
+      assert.match(system, /When unsure, the existing fact is not ended/);
+      // a new version or status ends the old one; only another dataset or run is another scope
+      assert.match(system, /a new\s+version, port, address or status of the same thing ends the old one/);
+      assert.match(system, /- a result for another dataset, split or experiment run\./);
+      assert.doesNotMatch(system, /another dataset, version or run|period that does not overlap/);
+      // dates are the pipeline's business, so a backfilled older value is still judged
+      assert.match(system, /The system handles the order in time: decide as if both\s+facts held at the same moment/);
+      // a separate fact between the same two things is not folded into an existing one
+      assert.match(system, /"same" lists the existing facts that the new fact only restates/);
+      assert.match(userOf(requests[0]), /^New fact: Alice was promoted/);
       assert.match(userOf(requests[0]), /2\. Alice is a senior engineer at Acme \(since 2024-01-01\)/);
     },
   );
-  assert.deepEqual(await stubLLM().detectContradiction({ sourceName: 'a', targetName: 'b', fact: 'x' }, []), [], 'no call for nothing');
+  assert.deepEqual(await stubLLM().detectContradiction({ sourceName: 'a', targetName: 'b', fact: 'x' }, []), { ended: [], same: [] }, 'no call for nothing');
+});
+
+test('provider: JSON mode is asked for, and a reply that does not parse is sent back once before the call fails', async () => {
+  let replies = ['{"entities": [}', '{"entities":[{"name":"Alice","labels":["Person"],"summary":"Engineer."}]}'];
+  await withChatStub(
+    () => replies.shift() ?? 'unused',
+    async (requests) => {
+      const out = await stubLLM().extract('Alice is an engineer.', []);
+      assert.deepEqual(out.entities.map((e) => e.name), ['Alice']);
+      assert.equal(requests.length, 2);
+      assert.deepEqual(requests[0].response_format, { type: 'json_object' });
+      const [system, user, reply, repair] = requests[1].messages;
+      assert.deepEqual([system, user], requests[0].messages, 'the same question');
+      assert.deepEqual(reply, { role: 'assistant', content: '{"entities": [}' });
+      assert.equal(repair.role, 'user');
+      assert.match(repair.content, /^Your reply is not valid JSON: invalid JSON \(.+\)\. Return valid JSON only/);
+
+      // a second reply that does not parse either fails the call, after one retry only
+      replies = ['No contradiction here.', '{"contradicts": tru}'];
+      await assert.rejects(
+        stubLLM().detectContradiction({ sourceName: 'a', targetName: 'b', fact: 'x' }, [{ fact: 'y' }]),
+        /^Error: invalid JSON \(.+\) in LLM output: \{"contradicts": tru\}/,
+      );
+      assert.equal(requests.length, 4);
+      assert.match(requests[3].messages[3].content, /not valid JSON: no JSON object\./);
+    },
+  );
+
+  const saved = process.env.MINIZEP_LLM_JSON_MODE;
+  try {
+    process.env.MINIZEP_LLM_JSON_MODE = '0';
+    await withChatStub(
+      () => ({ entities: [], facts: [], invalidations: [] }),
+      async (requests) => {
+        await stubLLM().extract('x', []);
+        assert.equal(requests[0].response_format, undefined, 'turned off for an endpoint that rejects it');
+      },
+    );
+  } finally {
+    if (saved === undefined) delete process.env.MINIZEP_LLM_JSON_MODE;
+    else process.env.MINIZEP_LLM_JSON_MODE = saved;
+  }
 });
 
 test('provider: parseContradiction tolerates the shapes models actually return', () => {

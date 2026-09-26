@@ -48,7 +48,8 @@ async function connect(): Promise<Client> {
 }
 
 let remote: Promise<Client> = connect();
-await remote;
+// the server's instructions (how to use the memory) reach this client too
+const instructions = (await remote).getInstructions();
 log(`connected to ${url}`);
 
 /**
@@ -75,7 +76,7 @@ async function forward<T>(call: (client: Client) => Promise<T>): Promise<T> {
 
 const server = new Server(
   { name: 'minizep', version: '1.0.0' },
-  { capabilities: { tools: {}, resources: {}, prompts: {} } },
+  { capabilities: { tools: {}, resources: {}, prompts: {} }, instructions },
 );
 
 // Forward verbatim: the HTTP server owns the tool definitions, so this shim
