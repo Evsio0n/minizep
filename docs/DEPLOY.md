@@ -143,6 +143,15 @@ systemd-analyze security minizep              # 查看沙箱评分
 
 ## 4. Token 与 group
 
+多人共用一台服务时，用数据库里的用户：每人一个 workspace（`bob`、`bob/*`），按 group 授予
+reader / writer / owner，token 各自可再收窄、可单独吊销，不用改 env 文件也不用重启：
+
+```bash
+cd /srv/minizep && sudo node --env-file=/etc/minizep/minizep.env dist/cli/admin.js user add bob
+```
+
+详见 [ACCESS.md](ACCESS.md)。下面的 `MINIZEP_TOKENS` 照旧可用，两者可以并存。
+
 `MINIZEP_TOKENS` 是逗号分隔的 `<token>:<group>[|<group>...]` 列表：
 
 ```
@@ -293,7 +302,14 @@ curl -sS "${auth[@]}" "$MINIZEP_URL/v1/stats?group_id=teamA"
 ## 8. Web UI（可选）
 
 服务可以附带一个浏览器页面：按 group 浏览图谱（有效时间 `at` 和知识时间 `as_of` 都可以拖动）、事实、实体和
-episode，写入记忆，手动结束或撤回事实。默认关闭，在 env 文件里设置 `MINIZEP_UI_GROUPS` 才开启：
+episode，写入记忆，手动结束或撤回事实。默认关闭。
+
+推荐 `MINIZEP_UI=1`：页面要求用 token（用户的或 `MINIZEP_TOKENS` 里的）登录，换成 HttpOnly 会话 cookie
+（`MINIZEP_UI_SESSION_DAYS`，默认 30 天），之后页面的权限就是这个 token 的权限，吊销立即生效；同一地址
+5 分钟内失败 10 次后返回 429。详见 [ACCESS.md](ACCESS.md#web-ui-login)。下面的 Host / Origin 检查同样适用。
+
+以下是**已弃用**的不登录方式（服务启动时会告警；不能与 `MINIZEP_UI=1` 同时设置），在 env 文件里设置
+`MINIZEP_UI_GROUPS` 开启：
 
 ```
 MINIZEP_UI_GROUPS=teamA|shared

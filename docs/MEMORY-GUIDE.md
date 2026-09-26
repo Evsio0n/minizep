@@ -98,11 +98,14 @@ Not like this:
 ## Groups
 
 Memory is split into groups (namespaces), usually one per person, assistant or project. Without `group_id`
-every tool uses your default group; the connection instructions list the groups you may use.
+every tool uses your default group; the connection instructions and `list_groups` list the groups you may
+use and your role in each: reader (read-only), writer or owner.
 
 - Working on a project or topic that has its own group: pass that `group_id` on every call, reads and writes.
 - The default group has nothing about what you are working on: call `list_groups` and search the group that
   matches before concluding the memory is empty.
+- A read-only group (reader) is there to be searched: do not try to add, correct or forget anything in it.
+  When something there is wrong or missing, tell the user, and ask them which group a new note should go to.
 - Never copy facts from one group into another to "share" them; ask the user which group a new topic belongs to.
 
 ## Repairs: situation → tool
