@@ -159,7 +159,7 @@ Ingest text: extract entities and facts, and close relationships the text says h
 |-------------------|---------|-------|
 | `content`         | string  | required |
 | `group_id`        | string  | see [Groups](#groups) |
-| `valid_at`        | string  | when it happened (default now); also the reference for relative dates ("yesterday") |
+| `valid_at`        | string  | when it happened (default now); also the reference for relative dates ("yesterday"). Left out or within a day of the call, it only dates when the note was written: see below |
 | `source`          | string  | `text` (default), `json` or `markdown` |
 | `name`            | string  | short label (default: start of the content) |
 | `idempotency_key` | string  | 1-200 chars; a resend with the same key in the same group is a duplicate, whatever its content. Without it, the key is the normalised content plus the UTC day of `valid_at` |
@@ -191,6 +191,14 @@ curl -s -X POST http://127.0.0.1:8787/v1/memories \
 - `facts`: new facts; `reinforced`: existing facts this text restated; `invalidated`: existing
   facts this text ended. One that was still true can be put back with
   [reopen](#post-v1factsuuidreopen).
+- A fact's `valid_at` is the date the text gives, else the episode's. When the text gives none and
+  the episode's `valid_at` was left out or is within a day of when it was saved, the fact only held
+  when the note was written and its start is unknown. When a text stored later ends it at an
+  earlier date, or replaces it with a value that began earlier and still held when the note was
+  written (a move "in July" stored after a note written in September), the note was out of date
+  already: the fact is retracted (`invalid_at == valid_at`, `reason` "outdated when written; …")
+  and the new fact does not stop at the note's date. A fact with a dated start is never ended by
+  an older statement: that statement ends where the fact begins.
 - `dropped`: extracted candidates that were discarded. `facts` and `invalidations` name an entity
   that could not be resolved: non-zero means the text said more than the graph recorded. `entities`
   are names that are only a literal value (an IP address, a number, a URL, a version) with no fact
@@ -447,6 +455,9 @@ Nothing is deleted, and `as_of` before the call still shows what was believed:
   reopened copy where it begins. When that value begins at or before the end the episode gave the
   fact (another episode states the same change), the fact **stays closed** and is listed in
   `still_closed`; reopen it by hand if that is wrong;
+- a fact the episode found **out of date when written** (`attributes.outdatedWhenWritten`, see
+  [add](#post-v1memories)) is reopened the same way, and stays closed while such a value that
+  still holds covers the date it was written;
 - an entity **summary** the episode wrote last is **put back** to the one it replaced (listed in
   `restored_summaries`; an entity the episode created gets an empty summary). Ingestion records
   on an entity which episode created it (`attributes.createdByEpisode`) and which one last stated

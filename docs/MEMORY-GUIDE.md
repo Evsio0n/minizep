@@ -52,7 +52,9 @@ Do not store:
   project". Facts connect named things: a sentence without names adds nothing.
 - **`valid_at` is when it happened** in the world (ISO-8601), not when you write it down. Relative
   dates in the text ("yesterday", "next Friday") are read against it; writing the absolute date
-  into the sentence is safer still. Leave it out only for something happening now.
+  into the sentence is safer still. Leave it out only for something happening now. A note with no
+  date of its own (no `valid_at`, or the current time, and none in the text) only says it held
+  when you wrote it: a change stored later with an earlier date replaces it entirely.
 - **State a change as a change**: "moved from X to Y", "no longer", "left", "was cancelled", "now
   listens on". The fact it replaces closes by itself; do not invalidate it first.
 - **Keep the details** in the sentence: versions, ports, amounts, dates, reasons.

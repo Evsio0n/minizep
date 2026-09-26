@@ -843,6 +843,14 @@ test('ingest: forgetting an episode retracts what only it said, unlinks it elsew
     joined: scenario([entity('Alice'), entity('Initech', ['Organization'])], [
       fact('Alice', 'Initech', 'WORKS_AT', { validAt: at('2025-06-01') }),
     ]),
+    // a note with no date of its own, and a change dated before it, stated twice
+    home: scenario([entity('Alice'), entity('Maple Court', ['Location'])], [fact('Alice', 'Maple Court', 'LIVES_IN')]),
+    relocated: scenario([entity('Alice'), entity('Cedar Tower', ['Location'])], [
+      fact('Alice', 'Cedar Tower', 'LIVES_IN', { validAt: at('2025-07-01') }),
+    ]),
+    settled: scenario([entity('Alice'), entity('Cedar Tower', ['Location'])], [
+      fact('Alice', 'Cedar Tower', 'LIVES_IN', { validAt: at('2025-07-01') }),
+    ]),
     // one named thing: only its summary changes
     kicked: scenario([{ name: 'Atlas', labels: ['Project'], summary: 'The Atlas project started in 2025' }]),
     cancelled: scenario([{ name: 'Atlas', labels: ['Project'], summary: 'The Atlas project was cancelled' }]),
@@ -950,6 +958,16 @@ test('ingest: forgetting an episode retracts what only it said, unlinks it elsew
   assert.deepEqual(restated.unlinked.map((f) => f.uuid), [globex3.uuid]);
   assert.deepEqual(restated.summaries, [], 'Globex\'s summary was restated by the other note');
   assert.deepEqual(await factsAt('2026-01-01', undefined, 'm'), [globex3.uuid]);
+
+  // the same for a note written without a date that a change dated before it outdated
+  const [maple] = (await zep.ingest.addEpisode({ groupId: 'p', content: 'home at Maple Court' })).facts;
+  const relocated = await add('relocated to Cedar Tower', '2025-07-01', 'p');
+  assert.deepEqual(relocated.invalidated.map((f) => [f.uuid, f.attributes.outdatedWhenWritten]), [[maple.uuid, true]]);
+  const [cedar] = relocated.facts;
+  assert.deepEqual((await add('settled at Cedar Tower', '2025-08-01', 'p')).reinforced.map((f) => f.uuid), [cedar.uuid]);
+  const outdated = await zep.ingest.forgetEpisode(relocated.episode.uuid, { groupId: 'p', reason: 'x' });
+  assert.deepEqual([outdated.reopened, outdated.stillClosed.map((f) => f.uuid)], [[], [maple.uuid]]);
+  assert.deepEqual(await factsAt(new Date().toISOString(), undefined, 'p'), [cedar.uuid]);
 
   // a note that only changed a summary is taken back there
   await add('kicked off Atlas', '2025-01-01', 'n');
