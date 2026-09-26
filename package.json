@@ -36,7 +36,8 @@
     "minizep-serve": "dist/server/http.js",
     "minizep-mcp": "dist/server/mcp.js",
     "minizep-proxy": "dist/server/stdio-proxy.js",
-    "minizep-migrate": "dist/cli/migrate.js"
+    "minizep-migrate": "dist/cli/migrate.js",
+    "minizep-admin": "dist/cli/admin.js"
   },
   "files": [
     "dist",
@@ -59,6 +60,7 @@
     "mcp:smoke": "tsx demo/mcp-smoke.ts",
     "proxy:smoke": "tsx demo/proxy-smoke.ts",
     "migrate": "tsx src/cli/migrate.ts",
+    "admin": "tsx src/cli/admin.ts",
     "serve": "tsx src/server/http.ts",
     "serve:dist": "node dist/server/http.js",
     "http:smoke": "tsx demo/http-smoke.ts",

@@ -61,7 +61,9 @@ sudo deploy/install.sh --user minizep     # 启用、重启、等 /health 就绪
 
 - [docs/DEPLOY.md](docs/DEPLOY.md)：拓扑、只在 VPN 上暴露、token 与 group、轮换 token、接入 MCP 客户端、
   REST 快速上手、Web UI、测试数据库、升级与回滚、embedding 换班
-- [docs/API.md](docs/API.md)：MCP 工具与 REST（`/v1`）接口，以及可选的 Web UI（`/ui`，`MINIZEP_UI_GROUPS`）
+- [docs/API.md](docs/API.md)：MCP 工具与 REST（`/v1`）接口，以及可选的 Web UI（`/ui`，`MINIZEP_UI=1`，用 token 登录；
+  按角色只读或可写，owner 管理 group 成员，Access 页管理自己的 token，管理员管理用户、授权与 token）
+- [docs/ACCESS.md](docs/ACCESS.md)：用户、角色（reader / writer / owner）与按 group 授权，`minizep-admin`，从 `MINIZEP_TOKENS` 迁移
 
 ## 生产化状态
 
@@ -77,6 +79,7 @@ sudo deploy/install.sh --user minizep     # 启用、重启、等 /health 就绪
 | 测试隔离（独立 schema） | ✅ 每个测试文件独立 schema，可并行 |
 | 检索下推数据库 | ✅ pgvector 向量 + Postgres 全文检索，与内存路径结果一致 |
 | HTTP 服务 + token 鉴权 | ✅ token → 允许的 group 列表（第一个为默认），越权 `group_id` 被拒绝；会话绑定创建它的 token |
+| 用户、角色与按 group 授权 | ✅ 每个用户有自己的 workspace（`bob`、`bob/*`），可按 reader / writer / owner 共享；token 可再收窄；见 [docs/ACCESS.md](docs/ACCESS.md) |
 | 异步摄取 + 任务队列 | ✅ 有界并发、任务状态可查；返回 job id 前 episode 已落盘，重启不丢 |
 | stdio ↔ HTTP 桥接 | ✅ 只支持 stdio 的客户端也能共享同一份图谱 |
 | embedding 常驻 | ✅ 到时限前滚动换班（新作业健康后才切换），作业消失时自动重投 |
@@ -118,8 +121,10 @@ npm run serve                                           # http://127.0.0.1:8787/
 curl localhost:8787/health                              # 只返回 {"ok":true}
 ```
 
-没有配置 token 时服务**拒绝启动**（除非显式设 `MINIZEP_ALLOW_ANONYMOUS=1`，仅限本地开发）。
+既没有配置 token、数据库里也没有用户时服务**拒绝启动**（除非显式设 `MINIZEP_ALLOW_ANONYMOUS=1`，仅限本地开发）。
 每个 token 只能读写它列出的 group：不传 `group_id` 用默认 group，传了不在列表里的 group 会被拒绝；
+多人共用一台服务时改用数据库里的用户和他们的 token（`minizep-admin user add bob`，见 [docs/ACCESS.md](docs/ACCESS.md)），
+每个 group 可以只读、可写或可管理成员；
 MCP 会话绑定创建它的 token，别的 token 拿着这个会话 id 会得到 403。
 
 **stdio 桥接 （客户端只支持 stdio，但要共享同一份图谱）**：
@@ -248,6 +253,10 @@ npm run build
 |---|---|---|
 | `MINIZEP_DB` | `~/.minizep/graph.json` | 快照路径 |
 | `MINIZEP_GROUP` | `default` | stdio 模式的默认 group（HTTP 模式由 token 决定） |
+| `MINIZEP_TOKENS` | — | HTTP 模式的环境变量 token：`token:groupA\|groupB,...`，对列出的 group 可读写；用户和他们的 token 在数据库里（[docs/ACCESS.md](docs/ACCESS.md)） |
+| `MINIZEP_UI` | — | `1` = 在 `/ui` 提供 Web UI，用 token 登录（HttpOnly 会话 cookie） |
+| `MINIZEP_UI_SESSION_DAYS` | `30` | UI 登录的有效天数 |
+| `MINIZEP_UI_GROUPS` | — | 已弃用：不登录的 UI，对这些 group 可读写；不能与 `MINIZEP_UI` 同时设置 |
 | `MINIZEP_LLM_PROVIDER` | `deepseek` | 从 `~/.openclaw/openclaw.json` 读取凭据 |
 | `MINIZEP_LLM_MODEL` | `deepseek-flash` | **不要用 `deepseek-v4-pro`**（见下） |
 | `MINIZEP_LLM_API_KEY` / `MINIZEP_LLM_BASE_URL` | — | 显式覆盖，优先于配置文件 |
@@ -329,7 +338,7 @@ npm run build                 # 编译到 dist/
 npm pack                      # 生成 minizep-0.2.0.tgz（53 文件 / 46.5 kB）
 ```
 
-包内含 4 个可执行文件：
+包内含 5 个可执行文件：
 
 | 命令 | 用途 |
 |---|---|
@@ -337,12 +346,13 @@ npm pack                      # 生成 minizep-0.2.0.tgz（53 文件 / 46.5 kB�
 | `minizep-mcp` | stdio MCP 服务（单客户端，本地进程内图谱） |
 | `minizep-proxy` | stdio ↔ HTTP 桥接 |
 | `minizep-migrate` | JSON 快照 → 数据库迁移 |
+| `minizep-admin` | 用户、授权与 token 管理（需要 Postgres，见 [docs/ACCESS.md](docs/ACCESS.md)） |
 
 安装后可直接使用：
 
 ```bash
 npm install ./minizep-0.2.0.tgz
-npx minizep-serve            # 缺 token 时会明确拒绝启动
+npx minizep-serve            # 既无 token 也无用户时会明确拒绝启动
 ```
 
 ### 生产必需的环境变量
@@ -351,7 +361,7 @@ npx minizep-serve            # 缺 token 时会明确拒绝启动
 
 | 变量 | 必需 | 说明 |
 |---|---|---|
-| `MINIZEP_TOKENS` | ✅ | `token:groupA\|groupB,...`（第一个 group 为默认）；不设则拒绝启动 |
+| `MINIZEP_TOKENS` | ✅ | `token:groupA\|groupB,...`（第一个 group 为默认）；不设且数据库里没有用户（`minizep-admin user add`）则拒绝启动 |
 | `MINIZEP_LLM_API_KEY` + `MINIZEP_LLM_BASE_URL` | ✅ | 抽取用的 LLM |
 | `MINIZEP_REQUIRE_REAL_PROVIDERS=1` | 建议 | 缺少 LLM 时**直接启动失败**，而不是静默降级成 mock 抽取器 |
 | `MINIZEP_DATABASE_URL` | 建议 | 不设则用进程内内存图 |

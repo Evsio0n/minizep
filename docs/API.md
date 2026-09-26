@@ -8,8 +8,9 @@ and one ingestion queue:
 | `/health`         | liveness probe, always `{"ok":true}`                   | none   |
 | `/mcp`            | MCP over Streamable HTTP (tools, see below)            | bearer |
 | `/v1/...`         | REST API, JSON in / JSON out                           | bearer |
-| `/ui`             | web UI page, only when `MINIZEP_UI_GROUPS` is set      | none, see [Web UI](#web-ui) |
-| `/ui/api/v1/...`  | the same REST API for the UI, limited to the UI groups | none, see [Web UI](#web-ui) |
+| `/ui`             | web UI page, only when `MINIZEP_UI` (or the deprecated `MINIZEP_UI_GROUPS`) is set | none, see [Web UI](#web-ui) |
+| `/ui/api/login`, `/ui/api/logout`, `/ui/api/me` | the UI's login | see [Web UI](#web-ui) |
+| `/ui/api/v1/...`  | the same REST API for the UI                           | session cookie, see [Web UI](#web-ui) |
 
 Everything below applies to both `/mcp` and `/v1`: the MCP tools and the REST routes call the
 same operations with the same validation.
@@ -24,37 +25,52 @@ Every `/mcp` and `/v1` request carries a bearer token:
 Authorization: Bearer <token>
 ```
 
-Tokens are configured on the server:
+Tokens come from two places:
 
-```bash
-MINIZEP_TOKENS="tokA:teamA,tokB:teamB,tokC:teamC|shared"
-```
+- **Users' tokens** (`mz_...`), kept in the database: each belongs to a user, whose role in each
+  group (reader, writer or owner) the token may narrow. They are made with `minizep-admin`, by an
+  admin over `/v1/admin`, or by their user over `/v1/me/tokens`. See [ACCESS.md](ACCESS.md).
+- **Env tokens**, configured on the server:
 
-Each entry is `token:group[|group...]`. The token is everything before the **last** colon (tokens
-may contain colons). The groups after it are the memory namespaces the token may read and write;
-the **first** one is the token's default.
+  ```bash
+  MINIZEP_TOKENS="tokA:teamA,tokB:teamB,tokC:teamC|shared"
+  ```
+
+  Each entry is `token:group[|group...]`. The token is everything before the **last** colon
+  (tokens may contain colons). The groups after it are the memory namespaces the token may read
+  and write (a group name cannot contain `*`); the **first** one is the token's default. They are
+  checked first.
 
 | Situation                                   | Status | Body                                        |
 |---------------------------------------------|--------|---------------------------------------------|
 | no `Authorization` header, or not `Bearer`  | 401    | `{"error":"missing bearer token"}` (+ `WWW-Authenticate: Bearer`) |
-| unknown token                               | 403    | `{"error":"invalid token"}`                 |
+| unknown token; revoked or expired token; disabled user | 403 | `{"error":"invalid token"}`   |
 | server started without any token            | 401    | `{"error":"authentication is not configured"}` |
 
-With no tokens configured the server refuses to start, unless `MINIZEP_ALLOW_ANONYMOUS=1` is set
-(local development only). In that mode every request is one trusted user who may use any group
-(default group `default`).
+With neither an env token nor a user in the database the server refuses to start, unless
+`MINIZEP_ALLOW_ANONYMOUS=1` is set (local development only). In that mode every request is one
+trusted user who may use any group (default group `default`) and add users; once a user exists,
+every request needs a token.
 
 ## Groups
 
 Every operation works inside exactly one memory group, chosen by the optional `group_id`
 parameter (in the JSON body for `POST`, in the query string for `GET`):
 
-1. absent or empty: the token's default group (its first group);
-2. a group the token holds: that group;
+1. absent or empty: the token's default group (an env token's first group; a user's token: its
+   own default group, else its user's); when the caller cannot read it, **403**
+   `{"error":"no default group: pass group_id"}`;
+2. a group the caller may read: that group;
 3. anything else: **403** `{"error":"group not permitted for this token"}` (an MCP tool returns
    the same message as a tool error, `isError: true`). Nothing is read or written.
 
-Names match exactly (case and whitespace included). Records are addressed inside the resolved
+Writes (`POST /v1/memories`, the `invalidate`, `reopen`, `forget` and `retry-failed` routes and
+their tools) need the writer role: in a group the caller may only read they answer **403**
+`{"error":"read-only access to group \"<g>\""}`. Env tokens are writers on their groups; see
+[ACCESS.md](ACCESS.md#roles) for the roles of users.
+
+Names match exactly (case and whitespace included); a user's grant may also cover every group
+starting with a prefix (`bob/*`). Records are addressed inside the resolved
 group: an episode, fact or job id that belongs to another group answers **404**, exactly like an
 id that does not exist, so a token cannot probe other tenants.
 
@@ -83,12 +99,13 @@ Every error is `{"error": "<message>"}`:
 | Status | Meaning |
 |--------|---------|
 | 400 | invalid JSON, body not an object, a missing/invalid field, bad timestamp, id prefix too short or ambiguous |
-| 401 | missing bearer token |
-| 403 | invalid token; group not permitted for this token |
+| 401 | missing bearer token; (UI) `login required` |
+| 403 | invalid token; group not permitted for this token; no default group; read-only access to the group; not an owner of the group or not an admin ([ACCESS.md](ACCESS.md)) |
 | 404 | unknown route, or no such record in the resolved group |
 | 405 | route exists with another method (`Allow` header lists it) |
-| 409 | the request conflicts with the record's current state (fact already ended, already retracted, end before start, nothing to reopen; episode already forgotten) |
+| 409 | the request conflicts with the record's current state (fact already ended, already retracted, end before start, nothing to reopen; episode already forgotten; user name taken) |
 | 413 | request body larger than 1 MB |
+| 429 | (UI) too many failed logins from this address |
 | 500 | unexpected server error (`{"error":"internal error"}`, details in the server log) |
 | 502 | ingestion failed upstream (LLM, embedding service or store); the episode is **kept** for retry |
 | 503 | server shutting down; or (MCP) session limit reached with every session busy |
@@ -379,16 +396,19 @@ The nodes and edges of one group at one (`at`, `as_of`) instant, for drawing the
 
 ### GET /v1/groups
 
-The groups the caller may open, most recent episode first:
+The groups the caller may open, most recent episode first, with its role in each (`reader`,
+`writer` or `owner`):
 
 ```json
 { "default_group": "teamA",
-  "groups": [ { "group_id": "teamA", "entities": 4, "facts": 2, "active_facts": 1,
+  "groups": [ { "group_id": "teamA", "role": "writer", "entities": 4, "facts": 2, "active_facts": 1,
                 "episodes": 3, "failed_episodes": 0, "last_episode_at": "2026-09-25T06:14:54.414Z" } ] }
 ```
 
-A token lists its own groups (empty ones included). A caller allowed any group (anonymous mode,
-or the UI with `MINIZEP_UI_GROUPS=*`) lists every group that holds an episode or an entity.
+A token lists the groups it holds by name (empty ones included), every group holding data that a
+pattern it holds matches (`bob/*`), and its default group when it may read it. A caller allowed
+any group (anonymous mode, an admin's unrestricted token, or the UI with `MINIZEP_UI_GROUPS=*`)
+lists every group that holds an episode or an entity.
 
 ### GET /v1/facts
 
@@ -586,7 +606,8 @@ Server details for an authenticated caller (what `/health` used to expose):
   "timezone": "Asia/Shanghai" }
 ```
 
-`groups` is `null` in anonymous mode (any group). `jobs`, `episodes` (over the token's groups) and
+`groups` lists the names and patterns the caller may read; it is `null` for a caller allowed any
+group (anonymous mode, an admin's unrestricted token). `jobs`, `episodes` (over the token's groups) and
 `sessions` count only what this token can see; `episodes.given_up` as in [stats](#get-v1stats).
 The store counts the episodes (no episode is loaded, the web UI polls this every 10 s);
 `episodes` is `null` when the store cannot answer, and the rest of the status is still returned.
@@ -603,6 +624,12 @@ and the same text as the `memory_guide` tool.
 
 Unauthenticated liveness probe for load balancers and container health checks. Always
 `{"ok":true}`, nothing else.
+
+### Users, tokens and members
+
+`GET /v1/me` (who the caller is and what it may do), `/v1/me/tokens` (a user's own tokens),
+`/v1/groups/:g/members` (the members of a group the caller owns) and `/v1/admin/*` (users,
+tokens and grants, for admins) are described in [ACCESS.md](ACCESS.md#rest).
 
 ---
 
@@ -629,9 +656,14 @@ A model that connects needs no client-side instructions:
   under 512, stands alone): search before answering about people, projects, plans and decisions;
   add durable facts, one event per call, subjects named, `valid_at` = when it happened; repair the
   memory when the user contradicts it; which tool repairs what.
-- The instructions end with the groups the connection may use (its token's groups, or "any group" for
-  stdio and anonymous mode) and tell the model to pass `group_id` for a project's own group and to call
-  `list_groups` before concluding the default group has nothing.
+- The instructions end with the groups the connection may use and its role in each (its token's
+  groups, or "any group" for stdio and anonymous mode), name the read-only ones, and tell the model to
+  pass `group_id` for a project's own group and to call `list_groups` before concluding the default
+  group has nothing.
+- A connection that may write nowhere (every group read-only) is not offered the write tools
+  (`add_memory`, `invalidate_fact`, `reopen_fact`, `forget_episode`, `retry_failed`). A session
+  follows grant and token changes at its next request: a revoked token gets 403, a group that became
+  read-only a tool error.
 - The `memory_guide` tool returns the full method, [docs/MEMORY-GUIDE.md](MEMORY-GUIDE.md), also
   served as [GET /v1/guide](#get-v1guide). Keep the instructions (`src/server/tools.ts`) consistent
   with it.
@@ -693,35 +725,50 @@ MINIZEP_HTTP_URL=http://127.0.0.1:8787/mcp MINIZEP_TOKEN=$TOKEN minizep-proxy
 ## Web UI
 
 A single page for browsing and editing the graph: groups, the graph at any (`at`, `as_of`)
-instant, facts, entities, episodes, adding memories and ending or retracting facts. It is off
-unless `MINIZEP_UI_GROUPS` is set.
+instant, facts, entities, episodes, adding memories and ending or retracting facts. With the
+login it follows the caller's role (read-only where it is reader), lets owners manage a group's
+members and has an Access page for one's own tokens and, for admins, users, grants and tokens
+([ACCESS.md](ACCESS.md#web-ui-login)). It is off
+unless `MINIZEP_UI=1` (with a login) or the deprecated `MINIZEP_UI_GROUPS` (without) is set; both
+at once stop the server at start.
 
 ```bash
-MINIZEP_UI_GROUPS='teamA|shared'      # or '*' for every group
+MINIZEP_UI=1
 # open http://127.0.0.1:8787/ui  (or http://<VPN address>:8787/ui)
 ```
 
-- **No login.** The page (`GET /ui`) and its API (`/ui/api/v1/...`, the REST routes above) need
-  no token: they act as one fixed caller whose groups are `MINIZEP_UI_GROUPS` (the first is its
-  default; `*` = any group, default `default`). Anyone who can reach the listen address can read
-  and write those groups, so enable it only on a private network (loopback or a VPN), and list
-  only the groups meant to be browsed. Token auth on `/v1` and `/mcp` is unchanged.
+- **Login** (`MINIZEP_UI=1`). The page (`GET /ui`) is served without one and shows a login form
+  while `GET /ui/api/me` answers 401. `POST /ui/api/login` with `{"token": "..."}` (a user's token
+  or an env token) sets an `HttpOnly`, `SameSite=Strict` session cookie for `/ui`, valid for
+  `MINIZEP_UI_SESSION_DAYS` (default 30); `POST /ui/api/logout` ends it. The API
+  (`/ui/api/v1/...`, the REST routes above) then acts as that token, resolved again on each
+  request, so a revocation or a grant change applies at once; without a valid session it answers
+  401 `login required`. After 10 failed logins within 5 minutes an address gets 429. Details and
+  the exact answers: [ACCESS.md](ACCESS.md#web-ui-login).
+- **No login** (`MINIZEP_UI_GROUPS='teamA|shared'`, or `*` for every group; deprecated, the server
+  logs a warning). The API acts as one fixed caller, writer on those groups (the first is its
+  default; `*` = any group, default `default`); `/ui/api/me` answers that caller and there is no
+  login. Anyone who can reach the listen address can read and write those groups, so enable it
+  only on a private network (loopback or a VPN), and list only the groups meant to be browsed.
+- Token auth on `/v1` and `/mcp` is unchanged either way.
 - `GET /` and `GET /ui/` redirect to `/ui` (the page calls the relative `ui/api/v1`, so it also
-  works behind a path prefix). The page is `ui/index.html`, read on each request and served with
-  a restrictive `Content-Security-Policy`, `X-Content-Type-Options: nosniff` and
-  `Cache-Control: no-cache`.
-- Every `/`, `/ui` and `/ui/api` request is refused with **403** unless:
+  works behind a path prefix, where the cookie path needs rewriting). The page is `ui/index.html`,
+  read on each request and served with a restrictive `Content-Security-Policy`,
+  `X-Content-Type-Options: nosniff` and `Cache-Control: no-cache`.
+- Every `/`, `/ui` and `/ui/api` request, login included, is refused with **403** unless:
   - the `Host` header (without port) is an IP address, `localhost`, or a name listed in
     `MINIZEP_UI_HOSTS` (a DNS-rebinding page arrives under the attacker's own domain name); and
   - when the browser sends an `Origin`, it is exactly `http://<Host header>` and
     `Sec-Fetch-Site` is absent or `same-origin` (a page on another site can neither write nor
     read). Request bodies must be `application/json`, as everywhere.
 - Anonymous mode (`MINIZEP_ALLOW_ANONYMOUS=1`) keeps its rules for `/v1` and `/mcp` (loopback
-  `Host`, no browser `Origin`); the UI works there too, through `/ui/api`.
+  `Host`, no browser `Origin`); the UI without login works there too, through `/ui/api`.
 - Working on the page: `npm run ui:dev` serves it on http://127.0.0.1:8788/ui from an in-memory
   graph seeded with every fact state (active, ended, future, retracted), a failed episode and a
   Chinese group, using a scripted LLM and the hash embedder, so nothing leaves the machine. Edits
-  to `ui/index.html` show on reload. See `demo/ui-dev.ts` for its settings.
+  to `ui/index.html` show on reload. `MINIZEP_UI=1 npm run ui:dev` serves it with the login and
+  prints the tokens of two users, an admin and a user with an owner and a reader group. See
+  `demo/ui-dev.ts` for its settings.
 
 ---
 
@@ -748,15 +795,17 @@ MINIZEP_UI_GROUPS='teamA|shared'      # or '*' for every group
 |----------------------------|--------------|---------|
 | `MINIZEP_HOST`             | `127.0.0.1`  | comma-separated listen addresses, e.g. `127.0.0.1,100.64.0.10`. An address that does not exist yet (a VPN interface that comes up later) is retried with backoff (1 s doubling to 30 s) instead of failing; other bind errors are fatal |
 | `MINIZEP_PORT`             | `8787`       | |
-| `MINIZEP_TOKENS`           |              | `token:group[\|group...],...` |
-| `MINIZEP_ALLOW_ANONYMOUS`  |              | `1` = no authentication, any group (development only) |
+| `MINIZEP_TOKENS`           |              | `token:group[\|group...],...`: writer on exactly those groups; users' tokens are in the database ([ACCESS.md](ACCESS.md)) |
+| `MINIZEP_ALLOW_ANONYMOUS`  |              | `1` = no authentication, any group, while there is no env token and no user (development only) |
 | `MINIZEP_SESSION_TTL_MS`   | `1800000`    | idle MCP session lifetime |
 | `MINIZEP_MAX_SESSIONS`     | `256`        | MCP session cap |
 | `MINIZEP_DRAIN_TIMEOUT_MS` | `120000`     | shutdown wait for queued ingestion (HTTP and stdio) |
 | `MINIZEP_JOB_CONCURRENCY`  | `2`          | ingestion jobs run at once |
 | `MINIZEP_RETRY_INTERVAL_MS` | `600000`    | how often failed episodes are retried in the background; `0` = never (HTTP and stdio) |
 | `MINIZEP_RETRY_MAX`        | `3`          | the background retry leaves an episode alone once it has been tried this many times |
-| `MINIZEP_UI_GROUPS`        |              | `group[\|group...]` or `*`: serve the [web UI](#web-ui) on `/ui` without a token for these groups; unset = no UI |
+| `MINIZEP_UI`               |              | `1` = serve the [web UI](#web-ui) on `/ui`, with a login by token |
+| `MINIZEP_UI_SESSION_DAYS`  | `30`         | how long a UI login lasts |
+| `MINIZEP_UI_GROUPS`        |              | deprecated: `group[\|group...]` or `*`: serve the web UI on `/ui` without a login for these groups; not together with `MINIZEP_UI` |
 | `MINIZEP_UI_HOSTS`         |              | comma-separated host names the UI may be opened under, besides IP addresses and `localhost` (e.g. a MagicDNS name) |
 
 Storage, LLM and embedding settings (`MINIZEP_DATABASE_URL`, `MINIZEP_DB`, `MINIZEP_LLM_*`,

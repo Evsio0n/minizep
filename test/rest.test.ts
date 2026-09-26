@@ -257,7 +257,7 @@ test('rest: search, entities, facts about an entity, facts at an instant', async
     assert.equal(groups.body.default_group, 'teamA');
     assert.deepEqual(
       groups.body.groups.map((g: Record<string, unknown>) => ({ ...g, last_episode_at: typeof g.last_episode_at })),
-      [{ group_id: 'teamA', entities: 3, facts: 2, active_facts: 1, episodes: 2, failed_episodes: 0, last_episode_at: 'string' }],
+      [{ group_id: 'teamA', role: 'writer', entities: 3, facts: 2, active_facts: 1, episodes: 2, failed_episodes: 0, last_episode_at: 'string' }],
     );
     assert.equal(typeof (await api(srv.base, 'GET', '/v1/status', tok)).body.timezone, 'string');
   } finally {

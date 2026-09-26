@@ -10,7 +10,10 @@
  * ui/index.html is read on every request: edit it and reload the page.
  *
  *   UI_DEV_PORT        port (default 8788; the host is always 127.0.0.1)
- *   MINIZEP_UI_GROUPS  groups the UI may open (default "*")
+ *   MINIZEP_UI         1 = the UI with login: users "root" (admin) and "ana" (owner of
+ *                      team-a, reader of 中文示例, nothing else) are added and their
+ *                      tokens printed
+ *   MINIZEP_UI_GROUPS  without MINIZEP_UI: groups the UI may open without login (default "*")
  *   MINIZEP_UI_HOSTS   extra host names for the UI (see docs/API.md)
  *   MINIZEP_TOKENS     tokens for /v1 and /mcp (default none: /v1 answers 401)
  *
@@ -25,7 +28,7 @@ import type {
   LLMProvider,
 } from '../src/provider/interfaces.js';
 import { createHttpApp } from '../src/server/app.js';
-import { parseTokens } from '../src/server/auth.js';
+import { localPrincipal, parseTokens } from '../src/server/auth.js';
 import { envInt, onShutdownSignal } from '../src/server/runtime.js';
 import { uiFromEnv } from '../src/server/ui.js';
 
@@ -259,7 +262,8 @@ await seed();
 const facts = (await zep.store.getFacts()).length;
 log(`seeded ${facts} facts in team-a, 中文示例 and edge-cases (today is ${now.toISOString().slice(0, 10)}; "future" starts ${nextMonth.toISOString().slice(0, 10)}, ${Math.round((nextMonth.getTime() - now.getTime()) / DAY)} days on)`);
 
-const ui = uiFromEnv({ ...process.env, MINIZEP_UI_GROUPS: process.env.MINIZEP_UI_GROUPS?.trim() || '*' });
+const login = process.env.MINIZEP_UI === '1';
+const ui = uiFromEnv(login ? process.env : { ...process.env, MINIZEP_UI_GROUPS: process.env.MINIZEP_UI_GROUPS?.trim() || '*' });
 const tokens = parseTokens(process.env.MINIZEP_TOKENS);
 const app = createHttpApp({
   zep,
@@ -269,9 +273,19 @@ const app = createHttpApp({
   storeLabel: 'memory (ui-dev, not saved)',
   log,
 });
+if (login) {
+  const admin = localPrincipal('team-a');
+  const root = await app.access.createUser(admin, { name: 'root', admin: true });
+  const ana = await app.access.createUser(admin, { name: 'ana', default_group: 'team-a', workspace: false });
+  await app.access.setGrant(admin, { user: 'ana', pattern: 'team-a', role: 'owner' });
+  await app.access.setGrant(admin, { user: 'ana', pattern: '中文示例', role: 'reader' });
+  log(`log in as root (admin): ${root.token}`);
+  log(`log in as ana (owner of team-a, reader of 中文示例): ${ana.token}`);
+}
 const port = envInt('UI_DEV_PORT', 8788);
 await app.listen(['127.0.0.1'], port);
-log(`open http://127.0.0.1:${port}/ui  (/v1: ${tokens.size ? `${tokens.size} token(s)` : 'no tokens configured, 401'})`);
+const v1 = login || tokens.size ? `${tokens.size} env token(s)${login ? ' and the users above' : ''}` : 'no tokens configured, 401';
+log(`open http://127.0.0.1:${port}/ui  (/v1: ${v1})`);
 
 onShutdownSignal(async (signal) => {
   log(`${signal}: stopping`);

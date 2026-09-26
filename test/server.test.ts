@@ -10,8 +10,14 @@ import {
   resolveGroup,
   localPrincipal,
   GroupNotPermittedError,
+  canWrite,
+  effectiveGrants,
+  matchesPattern,
+  roleIn,
   type Principal,
 } from '../src/server/auth.js';
+import { AccessControl } from '../src/server/access.js';
+import { MemoryAccessStore } from '../src/store/access-store.js';
 import { JobQueue } from '../src/jobs/queue.js';
 import { SessionRegistry } from '../src/server/sessions.js';
 import { listenWithRetry, parseHosts } from '../src/server/listen.js';
@@ -52,7 +58,7 @@ test('auth: a valid bearer token resolves to its principal, which never carries 
   const result = authorize('Bearer tokA', tokens);
   assert.equal(result.ok, true);
   const p = (result as { principal: Principal }).principal;
-  assert.deepEqual(p.groups, ['teamA']);
+  assert.deepEqual(p.grants, [{ pattern: 'teamA', role: 'writer' }]);
   assert.ok(!JSON.stringify(p).includes('tokA'), 'the principal id is a digest, not the secret');
   // stable across requests, distinct across tokens (sessions are bound to it)
   const again = authorize('Bearer tokA', tokens) as { principal: Principal };
@@ -76,11 +82,11 @@ test('auth: an unconfigured server refuses everyone unless anonymous is explicit
   const anon = authorize(undefined, empty, true);
   assert.equal(anon.ok, true);
   assert.equal(anon.ok && anon.principal.defaultGroup, 'default');
-  assert.equal(anon.ok && anon.principal.groups, 'any');
+  assert.equal(anon.ok && anon.principal.grants, 'any');
 });
 
 function pick(r: ReturnType<typeof authorize>) {
-  return r.ok ? { status: r.status, groups: r.principal.groups } : { status: r.status, error: r.error };
+  return r.ok ? { status: r.status, grants: r.principal.grants } : { status: r.status, error: r.error };
 }
 
 test('groups: absent -> default, permitted -> itself, anything else -> not permitted', () => {
@@ -98,6 +104,50 @@ test('groups: the local stdio user may use any group', () => {
   const p = localPrincipal('default');
   assert.equal(resolveGroup(p, undefined), 'default');
   assert.equal(resolveGroup(p, 'anything'), 'anything');
+});
+
+test('roles: patterns, the highest role wins, a token narrows its user, only an unrestricted token is admin', async () => {
+  assert.ok(matchesPattern('bob/*', 'bob/notes') && matchesPattern('bob/*', 'bob/x/y') && matchesPattern('*', 'any'));
+  assert.ok(!matchesPattern('bob/*', 'bob') && !matchesPattern('bob/*', 'bobby') && !matchesPattern('bob', 'bob/x'));
+
+  const bob: Principal = {
+    id: 'tk_bob',
+    defaultGroup: 'bob',
+    admin: false,
+    grants: [
+      { pattern: 'bob', role: 'owner' },
+      { pattern: 'bob/*', role: 'owner' },
+      { pattern: 'team/*', role: 'reader' },
+      { pattern: 'team/asr', role: 'writer' },
+    ],
+  };
+  assert.deepEqual(['bob/x/y', 'team/asr', 'team/x', 'alice'].map((g) => roleIn(bob, g)), ['owner', 'writer', 'reader', undefined]);
+  assert.equal(resolveGroup(bob, 'bob/notes', 'manage'), 'bob/notes');
+  assert.throws(() => resolveGroup(bob, 'team/x', 'write'), /^Error: read-only access to group "team\/x"$/);
+  assert.throws(() => resolveGroup(bob, 'team/asr', 'manage'), /managing members of "team\/asr" needs the owner role/);
+  assert.throws(() => resolveGroup(bob, 'alice'), /group not permitted for this token/);
+
+  // the token: some of bob's groups, read-only; its default must be readable to be used
+  const narrowed: Principal = { ...bob, restriction: { groups: ['bob/*', 'team/asr'], role: 'reader' } };
+  assert.deepEqual(['bob', 'bob/notes', 'team/asr', 'team/x'].map((g) => roleIn(narrowed, g)), [undefined, 'reader', 'reader', undefined]);
+  assert.deepEqual(effectiveGrants(narrowed), [
+    { pattern: 'bob/*', role: 'reader' },
+    { pattern: 'team/asr', role: 'reader' },
+  ]);
+  assert.equal(canWrite(narrowed), false);
+  assert.throws(() => resolveGroup(narrowed, undefined), /^Error: no default group: pass group_id$/);
+  assert.equal(resolveGroup({ ...narrowed, defaultGroup: 'bob/notes' }, ''), 'bob/notes');
+
+  // from the store: admin only without restriction, default group token ?? user, env tokens never admin
+  const access = new AccessControl({ store: new MemoryAccessStore() });
+  const root = await access.createUser(localPrincipal('x'), { name: 'root', admin: true, default_group: 'ops' });
+  const full = (await access.principalFor(root.token))!;
+  assert.deepEqual([full.admin, full.grants, full.defaultGroup, full.user], [true, 'any', 'ops', 'root']);
+  const capped = await access.createToken(full, 'root', { role: 'writer', default_group: 'ops/x' });
+  const limited = (await access.principalFor(capped.token))!;
+  assert.deepEqual([limited.admin, roleIn(limited, 'anything'), limited.defaultGroup], [false, 'writer', 'ops/x']);
+  assert.equal(await access.principalFor(`${root.token}x`), undefined);
+  assert.equal((authorize('Bearer tokA', parseTokens('tokA:teamA')) as { principal: Principal }).principal.admin, false);
 });
 
 /* ---------------- sessions ---------------- */

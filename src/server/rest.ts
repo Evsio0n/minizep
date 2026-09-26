@@ -9,6 +9,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { z } from 'zod';
 import type { Principal } from './auth.js';
+import { accessShapes, type AccessControl } from './access.js';
 import { ServiceError, shapes, type AddMemoryOutcome, type MemoryService } from './service.js';
 
 /** request bodies larger than this are refused with 413 */
@@ -16,6 +17,8 @@ export const MAX_BODY_BYTES = 1024 * 1024;
 
 export interface RestContext {
   service: MemoryService;
+  /** users, tokens and group members (the /v1/me, /v1/groups/:g/members and /v1/admin routes) */
+  access: AccessControl;
   /** number of MCP sessions the caller holds, for /v1/status */
   sessionsOf?: (principal: Principal) => number;
   log?: (...args: unknown[]) => void;
@@ -69,7 +72,7 @@ export async function readJsonBody(req: IncomingMessage, limit = MAX_BODY_BYTES)
 }
 
 /** Validate against a tool shape; the first problem becomes a 400. */
-function parse<S extends z.ZodRawShape>(shape: S, value: unknown): z.infer<z.ZodObject<S>> {
+export function parse<S extends z.ZodRawShape>(shape: S, value: unknown): z.infer<z.ZodObject<S>> {
   const r = z.object(shape).safeParse(value);
   if (r.success) return r.data;
   const issue = r.error.issues[0];
@@ -142,6 +145,7 @@ interface Route {
 
 function routes(ctx: RestContext): Route[] {
   const s = ctx.service;
+  const a = ctx.access;
   return [
     {
       method: 'POST',
@@ -254,6 +258,95 @@ function routes(ctx: RestContext): Route[] {
       method: 'GET',
       pattern: /^\/v1\/status$/,
       handler: async ({ p }) => ({ body: { ...(await s.status(p)), sessions: ctx.sessionsOf?.(p) ?? 0 } }),
+    },
+
+    /* ---------- access (see docs/ACCESS.md) ---------- */
+    {
+      method: 'GET',
+      pattern: /^\/v1\/me$/,
+      handler: async ({ p }) => ({ body: await a.me(p) }),
+    },
+    {
+      method: 'GET',
+      pattern: /^\/v1\/me\/tokens$/,
+      handler: async ({ p }) => ({ body: await a.myTokens(p) }),
+    },
+    {
+      method: 'POST',
+      pattern: /^\/v1\/me\/tokens$/,
+      handler: async ({ p, body }) => ({
+        status: 201,
+        body: await a.createMyToken(p, parse(accessShapes.myToken, asObject(await body()))),
+      }),
+    },
+    {
+      method: 'POST',
+      pattern: /^\/v1\/me\/tokens\/([^/]+)\/revoke$/,
+      handler: async ({ p, params }) => ({ body: await a.revokeMyToken(p, pathParam(params[0])) }),
+    },
+    {
+      method: 'GET',
+      pattern: /^\/v1\/groups\/([^/]+)\/members$/,
+      handler: async ({ p, params }) => ({ body: await a.members(p, pathParam(params[0])) }),
+    },
+    {
+      method: 'POST',
+      pattern: /^\/v1\/groups\/([^/]+)\/members$/,
+      handler: async ({ p, params, body }) => ({
+        body: await a.setMember(p, pathParam(params[0]), parse(accessShapes.member, asObject(await body()))),
+      }),
+    },
+    {
+      method: 'POST',
+      pattern: /^\/v1\/groups\/([^/]+)\/members\/remove$/,
+      handler: async ({ p, params, body }) => ({
+        body: await a.removeMember(p, pathParam(params[0]), parse(accessShapes.removeMember, asObject(await body()))),
+      }),
+    },
+    {
+      method: 'GET',
+      pattern: /^\/v1\/admin\/users$/,
+      handler: async ({ p }) => ({ body: await a.listUsers(p) }),
+    },
+    {
+      method: 'POST',
+      pattern: /^\/v1\/admin\/users$/,
+      handler: async ({ p, body }) => ({
+        status: 201,
+        body: await a.createUser(p, parse(accessShapes.createUser, asObject(await body()))),
+      }),
+    },
+    {
+      method: 'POST',
+      pattern: /^\/v1\/admin\/users\/([^/]+)$/,
+      handler: async ({ p, params, body }) => ({
+        body: await a.updateUser(p, pathParam(params[0]), parse(accessShapes.updateUser, asObject(await body()))),
+      }),
+    },
+    {
+      method: 'POST',
+      pattern: /^\/v1\/admin\/users\/([^/]+)\/tokens$/,
+      handler: async ({ p, params, body }) => ({
+        status: 201,
+        body: await a.createToken(p, pathParam(params[0]), parse(accessShapes.token, asObject(await body()))),
+      }),
+    },
+    {
+      method: 'POST',
+      pattern: /^\/v1\/admin\/tokens\/([^/]+)\/revoke$/,
+      handler: async ({ p, params }) => ({ body: await a.revokeToken(p, pathParam(params[0])) }),
+    },
+    {
+      method: 'POST',
+      pattern: /^\/v1\/admin\/grants$/,
+      handler: async ({ p, body }) => ({ body: await a.setGrant(p, parse(accessShapes.grant, asObject(await body()))) }),
+    },
+    {
+      method: 'POST',
+      pattern: /^\/v1\/admin\/grants\/revoke$/,
+      handler: async ({ p, body }) => ({
+        body: await a.removeGrant(p, parse(accessShapes.revokeGrant, asObject(await body()))),
+      }),
     },
   ];
 }

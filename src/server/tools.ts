@@ -1,6 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import type { Principal } from './auth.js';
+import { canWrite, effectiveGrants, permits, unrestricted, type Principal } from './auth.js';
 import { calendarDay, displayTimeZone } from '../util/time.js';
 import { shapes, type AddMemoryOutcome, type FactRow, type JobRow, type MemoryService } from './service.js';
 
@@ -36,14 +36,28 @@ export const SERVER_OPTIONS = { instructions: INSTRUCTIONS };
 
 /**
  * The instructions for one connection: the shared text plus the groups this
- * caller may use, so a model working on some project finds that project's
- * memory instead of searching only the default group.
+ * caller may use and its role in each, so a model working on some project
+ * finds that project's memory instead of searching only the default group,
+ * and does not try to write where it may only read.
  */
 export function instructionsFor(p: Principal): string {
-  const groups =
-    p.groups === 'any'
-      ? `Groups: this connection may use any group; the default is "${p.defaultGroup}". Call list_groups to see them.`
-      : `Groups this connection may use: ${p.groups.map((g) => (g === p.defaultGroup ? `${g} (default)` : g)).join(', ')}.`;
+  const grants = effectiveGrants(p);
+  let groups: string;
+  if (unrestricted(p)) {
+    const readOnly = p.restriction?.role === 'reader' ? ' (read-only)' : '';
+    groups = `Groups: this connection may use any group${readOnly}; the default is "${p.defaultGroup}". Call list_groups to see them.`;
+  } else if (grants.length === 0) {
+    groups = 'This connection may use no group yet: ask the user to be given access to one.';
+  } else {
+    const named = grants.map((g) => `${g.pattern} (${g.role}${g.pattern === p.defaultGroup ? ', default' : ''})`);
+    groups = `Groups this connection may use: ${named.join(', ')}.`;
+    if (grants.some((g) => g.pattern.endsWith('*'))) groups += ' A name ending in * stands for every group starting with it.';
+    if (!permits(p, p.defaultGroup)) groups += ' There is no default group: pass group_id on every call.';
+    else if (!grants.some((g) => g.pattern === p.defaultGroup)) groups += ` The default is "${p.defaultGroup}".`;
+    const readOnly = grants.filter((g) => g.role === 'reader').map((g) => g.pattern);
+    if (readOnly.length === grants.length) groups += ' All of them are read-only: search, never write.';
+    else if (readOnly.length) groups += ` Read-only (search them, never write there): ${readOnly.join(', ')}.`;
+  }
   return [
     INSTRUCTIONS,
     '',
@@ -73,11 +87,13 @@ const CORRECTS = { readOnlyHint: false, destructiveHint: true, openWorldHint: fa
 /**
  * Everything the tool handlers need, injected so transports can differ: the
  * shared service and who is calling (a token's principal over HTTP, the local
- * user over stdio).
+ * user over stdio). The principal is read at every call: the HTTP server
+ * refreshes it from each request's authentication, so a revoked grant applies
+ * to a session already open.
  */
 export interface ToolContext {
   service: MemoryService;
-  principal: Principal;
+  principal: () => Principal;
 }
 
 // calendar days in the zone the extraction LLM resolved them in
@@ -204,9 +220,61 @@ function describeJob(job: JobRow): string {
   return lines.join('\n');
 }
 
+/**
+ * `server` offering only the read-only tools: registering any other is
+ * skipped. For a caller that may write nowhere, the write tools would only
+ * fail.
+ */
+function readOnlyTools(server: McpServer): McpServer {
+  const view = Object.create(server) as McpServer;
+  view.registerTool = ((name: string, config: { annotations?: { readOnlyHint?: boolean } }, handler: unknown) =>
+    config.annotations?.readOnlyHint
+      ? (server.registerTool as (...args: unknown[]) => unknown).call(server, name, config, handler)
+      : undefined) as McpServer['registerTool'];
+  return view;
+}
+
+/**
+ * Wraps tool registration so that a call which fell back to the default group
+ * says so, and names the caller's other groups. Instructions are not shown to
+ * the model by every client; a tool result always is. Without this, a model
+ * working on a project searched the default group, saw unrelated facts, and
+ * wrote the project's notes there. The groups are read at each call, like the
+ * principal.
+ */
+function withGroupHints(server: McpServer, principal: () => Principal): McpServer {
+  const register = server.registerTool.bind(server) as (...args: unknown[]) => unknown;
+  const wrapped = Object.create(server) as McpServer;
+  wrapped.registerTool = ((name: string, config: { inputSchema?: object }, handler: (...a: unknown[]) => unknown) => {
+    if (!config.inputSchema || !('group_id' in config.inputSchema)) return register(name, config, handler);
+    return register(name, config, async (args: { group_id?: string } | undefined, extra: unknown) => {
+      const result = (await handler(args, extra)) as { content?: { type: string; text?: string }[] };
+      const first = result.content?.[0];
+      if (args?.group_id || first?.type !== 'text') return result;
+      const p = principal();
+      const others = unrestricted(p)
+        ? 'any other group'
+        : effectiveGrants(p)
+            .map((g) => g.pattern)
+            .filter((g) => g !== p.defaultGroup)
+            .join(', ');
+      if (!others) return result;
+      const hint =
+        name === 'add_memory'
+          ? `(no group_id: stored in the default group "${p.defaultGroup}". This connection also has ${others}; ` +
+            'if this belongs to one of them, call forget_episode on this episode and add it again with that group_id.)'
+          : `(no group_id: this used the default group "${p.defaultGroup}". This connection can also use ${others}; ` +
+            'pass group_id to look there, or call list_groups.)';
+      return { ...result, content: [{ ...first, text: `${first.text ?? ''}\n${hint}` }, ...result.content!.slice(1)] };
+    });
+  }) as McpServer['registerTool'];
+  return wrapped;
+}
+
 /** Registers every minizep tool on a server instance. Shared by stdio and HTTP. */
-export function registerTools(server: McpServer, ctx: ToolContext): void {
+export function registerTools(target: McpServer, ctx: ToolContext): void {
   const { service, principal: p } = ctx;
+  const server = withGroupHints(canWrite(p()) ? target : readOnlyTools(target), p);
 
   server.registerTool(
     'add_memory',
@@ -223,7 +291,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     (args) =>
       guard(async () => {
         const started = Date.now();
-        return describeAdd(await service.addMemory(p, args), Date.now() - started);
+        return describeAdd(await service.addMemory(p(), args), Date.now() - started);
       }),
   );
 
@@ -240,7 +308,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     },
     (args) =>
       guard(async () => {
-        const r = await service.search(p, args);
+        const r = await service.search(p(), args);
         const note = r.degraded ? '\n(keyword ranking only: the embedding service is unavailable)' : '';
         if (!r.facts.length) return ok(`no matching facts${note}`, r);
         return ok(r.facts.map(formatFact).join('\n') + note, r);
@@ -259,7 +327,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     },
     (args) =>
       guard(async () => {
-        const r = await service.factsAbout(p, args);
+        const r = await service.factsAbout(p(), args);
         if (!r.entity) return ok(`no entity matches "${args.entity}"`, r);
         const lines = [`facts about ${r.entity.name}:`];
         lines.push(...(r.facts.length ? r.facts.map(formatFact) : ['(none)']));
@@ -285,7 +353,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     },
     ({ timestamp, ...rest }) =>
       guard(async () => {
-        const r = await service.factsAt(p, { ...rest, at: timestamp });
+        const r = await service.factsAt(p(), { ...rest, at: timestamp });
         if (!r.facts.length) return ok(`nothing was true at ${r.at}`, r);
         return ok(r.facts.map(formatFact).join('\n'), r);
       }),
@@ -303,7 +371,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     },
     (args) =>
       guard(async () => {
-        const r = await service.entities(p, args);
+        const r = await service.entities(p(), args);
         if (!r.entities.length) return ok('no entities', r);
         return ok(r.entities.map((e) => `${e.name} [${e.labels.join(',')}] — ${e.summary}`).join('\n'), r);
       }),
@@ -321,7 +389,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     },
     (args) =>
       guard(async () => {
-        const r = await service.episodes(p, args);
+        const r = await service.episodes(p(), args);
         // the full text is one get_episode away; the listing only previews it
         const episodes = r.episodes.map(({ content, ...e }) => ({ ...e, preview: content.slice(0, 200) }));
         if (!episodes.length) return ok('no episodes', { ...r, episodes });
@@ -346,7 +414,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     },
     (args) =>
       guard(async () => {
-        const r = await service.episode(p, args);
+        const r = await service.episode(p(), args);
         const e = r.episode;
         const lines = [
           `episode  : ${e.uuid}`,
@@ -379,7 +447,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     },
     (args) =>
       guard(async () => {
-        const r = await service.invalidateFact(p, args);
+        const r = await service.invalidateFact(p(), args);
         const what = args.retract ? 'retracted' : `ended at ${r.fact.invalid_at}`;
         return ok(`${what}: ${formatFact(r.fact)}`, r);
       }),
@@ -398,7 +466,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     },
     (args) =>
       guard(async () => {
-        const r = await service.reopenFact(p, args);
+        const r = await service.reopenFact(p(), args);
         return ok(`reopened [${r.previous.uuid.slice(0, 8)}] as: ${formatFact(r.fact)}`, r);
       }),
   );
@@ -416,7 +484,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     },
     (args) =>
       guard(async () => {
-        const r = await service.retryFailed(p, args);
+        const r = await service.retryFailed(p(), args);
         const text =
           `retried ${plural(r.retried, 'failed episode')} in group "${r.group_id}": ` +
           `${r.succeeded} succeeded, ${r.still_failing} still failing`;
@@ -440,10 +508,10 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     ({ job_id, limit }) =>
       guard(async () => {
         if (job_id) {
-          const job = service.job(p, job_id);
+          const job = service.job(p(), job_id);
           return ok(describeJob(job), job);
         }
-        const jobs = service.listJobs(p, limit ?? 20);
+        const jobs = service.listJobs(p(), limit ?? 20);
         if (jobs.length === 0) return ok('no jobs', { jobs });
         return ok(jobs.map((j) => `${j.id.slice(0, 8)} ${j.status.padEnd(9)} ${j.label}`).join('\n'), { jobs });
       }),
@@ -454,18 +522,19 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     {
       title: 'List groups',
       description:
-        'Use to see which memory groups (namespaces) you can use and how much each holds, e.g. when the default ' +
-        'group has nothing about the project you are working on. See memory_guide.',
+        'Use to see which memory groups (namespaces) you can use, your role in each (reader: read-only) and how ' +
+        'much each holds, e.g. when the default group has nothing about the project you are working on. ' +
+        'See memory_guide.',
       inputSchema: {},
       annotations: READ_ONLY,
     },
     () =>
       guard(async () => {
-        const r = await service.groups(p);
+        const r = await service.groups(p());
         if (!r.groups.length) return ok('no groups hold data yet', r);
         const lines = r.groups.map(
           (g) =>
-            `${g.group_id}${g.group_id === r.default_group ? ' (default)' : ''}: ${g.active_facts} current facts, ` +
+            `${g.group_id} (${g.role}${g.group_id === r.default_group ? ', default' : ''}): ${g.active_facts} current facts, ` +
             `${g.facts} in all, ${g.episodes} episodes${g.last_episode_at ? `, last ${g.last_episode_at.slice(0, 10)}` : ''}`,
         );
         return ok(lines.join('\n'), r);
@@ -484,7 +553,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     },
     (args) =>
       guard(async () => {
-        const s = await service.stats(p, args);
+        const s = await service.stats(p(), args);
         const e = s.episodes;
         const lines = [
           `group    : ${s.group_id}`,
@@ -520,7 +589,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
     },
     (args) =>
       guard(async () => {
-        const r = await service.forgetEpisode(p, args);
+        const r = await service.forgetEpisode(p(), args);
         const list = (rows: FactRow[]) => rows.map((f) => `  ${formatFact(f)}`);
         const lines = [
           `forgot episode ${r.episode.uuid.slice(0, 8)} in group "${r.group_id}" (its text is kept)`,

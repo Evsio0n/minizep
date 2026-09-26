@@ -154,7 +154,7 @@ test('stdio proxy: forwards the instructions and every tool of the HTTP server u
   try {
     await client.connect(transport);
     assert.ok(client.getInstructions()?.startsWith(INSTRUCTIONS));
-    assert.match(client.getInstructions() ?? '', /Groups this connection may use: teamA \(default\)\./);
+    assert.match(client.getInstructions() ?? '', /Groups this connection may use: teamA \(writer, default\)\./);
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name);
     for (const tool of ['add_memory', 'get_episode', 'invalidate_fact', 'reopen_fact', 'forget_episode', 'retry_failed', 'facts_at', 'memory_guide']) {
