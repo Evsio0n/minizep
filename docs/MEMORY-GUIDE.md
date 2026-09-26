@@ -54,7 +54,8 @@ Do not store:
   dates in the text ("yesterday", "next Friday") are read against it; writing the absolute date
   into the sentence is safer still. Leave it out only for something happening now. A note with no
   date of its own (no `valid_at`, or the current time, and none in the text) only says it held
-  when you wrote it: a change stored later with an earlier date replaces it entirely.
+  when you wrote it: a change stored later that dates the end of that value earlier ("moved out
+  in July") replaces it entirely, while a different value that only conflicts with it does not.
 - **State a change as a change**: "moved from X to Y", "no longer", "left", "was cancelled", "now
   listens on". The fact it replaces closes by itself; do not invalidate it first.
 - **Keep the details** in the sentence: versions, ports, amounts, dates, reasons.

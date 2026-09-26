@@ -306,30 +306,36 @@ test('temporal: an older statement that contradicts a newer fact is stored alrea
   // a model may also judge the older statement not to end the newer one: an
   // earlier record of the same (source, relation, target) still ends there.
   // The newer fact is dated by its episode, or by its own text in a note
-  // written today without valid_at: either way its start is known, and it wins
-  for (const datedBy of ['episode', 'text'] as const) for (const contradicts of [true, false]) {
+  // written today without valid_at: either way its start is known, and it wins.
+  // So does a note with no date at all (its start is only when it was written):
+  // the older text is a document added late as far as anyone can tell, also
+  // when its extraction ends the note without giving a date for that
+  for (const datedBy of ['episode', 'text', 'none'] as const) for (const contradicts of [true, false]) {
     const cto = says('Alice', 'Acme', 'HAS_TITLE', 'Alice is CTO of Acme', datedBy === 'text' ? { validAt: d('2022-01-01') } : {});
+    const junior = says('Alice', 'Acme', 'HAS_TITLE', 'Alice is a junior engineer at Acme');
     const { zep } = scripted(
       {
         'Alice became CTO of Acme': scenario(pair, [cto]),
-        'Alice is a junior engineer at Acme': scenario(pair, [says('Alice', 'Acme', 'HAS_TITLE', 'Alice is a junior engineer at Acme')]),
+        'Alice is a junior engineer at Acme': scenario(pair, [junior], [invalidation('Alice', 'Acme', 'HAS_TITLE')]),
       },
       contradicts,
     );
     const newer = await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice became CTO of Acme', validAt: datedBy === 'episode' ? d('2022-01-01') : undefined });
-    assert.deepEqual([newer.facts[0].validAt, newer.facts[0].attributes.startFromEpisode], [d('2022-01-01'), undefined], `a known start (${datedBy})`);
+    const [top] = newer.facts;
+    assert.equal(top.attributes.startFromEpisode, datedBy === 'none' ? true : undefined, `a known start (${datedBy})`);
+    if (datedBy !== 'none') assert.deepEqual(top.validAt, d('2022-01-01'));
     const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'Alice is a junior engineer at Acme', validAt: d('2020-01-01') });
 
     assert.equal(res.invalidated.length, 0, 'an older episode cannot end a newer fact');
-    const [junior] = res.facts;
-    assert.equal(junior.validAt?.getTime(), d('2020-01-01').getTime());
-    assert.equal(junior.invalidAt?.getTime(), d('2022-01-01').getTime(), `it ends where the newer fact begins (contradicts: ${contradicts}, dated by ${datedBy})`);
+    const [older] = res.facts;
+    assert.equal(older.validAt?.getTime(), d('2020-01-01').getTime());
+    assert.equal(older.invalidAt?.getTime(), top.validAt?.getTime(), `it ends where the newer fact begins (contradicts: ${contradicts}, dated by ${datedBy})`);
     assert.deepEqual((await zep.factsAt(new Date(), 'g')).map((r) => r.fact.fact), ['Alice is CTO of Acme']);
     assert.deepEqual((await zep.factsAt(d('2021-01-01'), 'g')).map((r) => r.fact.fact), ['Alice is a junior engineer at Acme']);
   }
 });
 
-test('temporal: an earlier-dated change ends a fact whose start is only when its note was written, whether the judge or an invalidation says so', async () => {
+test('temporal: an end dated before a fact whose start is only when its note was written outdates it; a value that only conflicts with it does not', async () => {
   const day = 86_400_000;
   const moved = new Date(Date.now() - 90 * day); // "in July"
   const between = new Date(Date.now() - 45 * day); // a day in August
@@ -338,15 +344,14 @@ test('temporal: an earlier-dated change ends a fact whose start is only when its
   // the city is the entity, the address only in the sentence
   const home = (text: string, ends: ReturnType<typeof invalidation>[] = []) =>
     scenario([entity('Dana Wu'), entity('Riverton', ['Location'])], [says('Dana Wu', 'Riverton', 'LIVES_IN', text)], ends);
-  // the change is read as replacing the note by the judge, or only by an explicit invalidation;
-  // the stale note carries no valid_at, or one an agent set to the moment it wrote it
-  for (const [invalidates, judge] of [[false, true], [true, false]] as const) {
+  // the change dates the end of the note's value (an invalidation with its own date), and the judge
+  // reads it as replacing the note or not; the stale note carries no valid_at, or one an agent set
+  // to the moment it wrote it
+  const ended = invalidation('Dana Wu', 'Riverton', 'LIVES_IN', moved);
+  for (const judge of [true, false]) {
     for (const staleValidAt of [undefined, new Date()]) {
-      const where = `invalidation: ${invalidates}, valid_at: ${staleValidAt ? 'now' : 'none'}`;
-      const { zep } = scripted(
-        { stale: home(STALE), move: home(MOVE, invalidates ? [invalidation('Dana Wu', 'Riverton', 'LIVES_IN', moved)] : []) },
-        judge,
-      );
+      const where = `judge: ${judge}, valid_at: ${staleValidAt ? 'now' : 'none'}`;
+      const { zep } = scripted({ stale: home(STALE), move: home(MOVE, [ended]) }, judge);
       const [note] = (await zep.ingest.addEpisode({ groupId: 'g', content: 'stale', validAt: staleValidAt })).facts;
       assert.equal(note.attributes.startFromEpisode, true, 'the start is only when the note was written');
       const change = await zep.ingest.addEpisode({ groupId: 'g', content: 'move', validAt: moved });
@@ -368,14 +373,27 @@ test('temporal: an earlier-dated change ends a fact whose start is only when its
     }
   }
 
-  // an earlier value that had ended before the note was written does not make it out of date
+  // without that end, an earlier value that the judge says ends the note leaves it alone and ends
+  // where it begins: the same move (a correction learned late and a document added late look
+  // alike), a value that had ended before the note was written, and an open one from a document
+  // added late whose extraction also ends the note without a date
   const lakeside = says('Dana Wu', 'Lakeside', 'LIVES_IN', 'Dana Wu lived in Lakeside', { validAt: d('2019-01-01'), invalidAt: d('2020-01-01') });
-  const { zep, llm } = scripted({ stale: home(STALE), earlier: scenario([entity('Dana Wu'), entity('Lakeside', ['Location'])], [lakeside]) }, true);
-  await zep.ingest.addEpisode({ groupId: 'g', content: 'stale' });
-  const earlier = await zep.ingest.addEpisode({ groupId: 'g', content: 'earlier', validAt: d('2019-01-01') });
-  assert.deepEqual(llm.contradictionCalls.map((c) => c.existing.map((e) => e.fact)), [[STALE]], 'the judge ends the note');
-  assert.deepEqual(earlier.invalidated, [], 'but Lakeside was over before it was written');
-  assert.deepEqual((await zep.factsAt(new Date(), 'g')).map((r) => r.fact.fact), [STALE]);
+  const harbor = says('Dana Wu', 'Harbor City', 'LIVES_IN', 'Dana Wu lives in Harbor City', { replacesPrevious: true });
+  const texts = {
+    move: [home(MOVE), moved],
+    earlier: [scenario([entity('Dana Wu'), entity('Lakeside', ['Location'])], [lakeside]), d('2019-01-01')],
+    backfilled: [scenario([entity('Dana Wu'), entity('Harbor City', ['Location'])], [harbor], [invalidation('Dana Wu', 'Riverton', 'LIVES_IN')]), d('2021-06-01')],
+  } as const;
+  for (const [content, [script, validAt]] of Object.entries(texts)) {
+    const { zep, llm } = scripted({ stale: home(STALE), [content]: script }, true);
+    const [note] = (await zep.ingest.addEpisode({ groupId: 'g', content: 'stale' })).facts;
+    const res = await zep.ingest.addEpisode({ groupId: 'g', content, validAt });
+    assert.deepEqual(llm.contradictionCalls.map((c) => c.existing.map((e) => e.fact)), [[STALE]], `the judge ends the note (${content})`);
+    assert.deepEqual(res.invalidated, [], `but it is not out of date (${content})`);
+    const [value] = res.facts;
+    assert.ok(value.invalidAt && value.invalidAt <= note.validAt!, `the earlier value ends by the note's start (${content})`);
+    assert.deepEqual((await zep.factsAt(new Date(), 'g')).map((r) => r.fact.fact), [STALE]);
+  }
 });
 
 test('temporal: an older, differently worded statement before an ended stint does not reopen the relation', async () => {
@@ -413,15 +431,31 @@ test('temporal: an older mention of the same fact extends its start back instead
 
 test('temporal: an invalidation dated before a newer fact does not close it', async () => {
   const people = [entity('Bob'), entity('Initech', ['Organization'])];
-  const { zep } = scripted({
-    'Bob rejoined Initech': scenario(people, [says('Bob', 'Initech', 'WORKS_AT', 'Bob rejoined Initech')]),
+  const rejoined = scenario(people, [
+    says('Bob', 'Initech', 'WORKS_AT', 'Bob rejoined Initech'),
+    says('Bob', 'Initech', 'OWNS_SHARES_IN', 'Bob holds shares in Initech'),
+  ]);
+  const stint = says('Bob', 'Initech', 'WORKS_AT', 'Bob worked at Initech from 2023 to February 2025', { validAt: d('2023-01-01'), invalidAt: d('2025-02-01') });
+  const older = {
     'Bob left Initech': scenario([], [], [invalidation('Bob', 'Initech', 'WORKS_AT', d('2025-02-01'))]),
-  });
-  await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob rejoined Initech', validAt: d('2025-06-01') });
-  const res = await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob left Initech', validAt: d('2025-03-01') });
+    // no date of its own (the episode's stands in), no relation named, or the stint it ended is in the text
+    'Bob no longer works at Initech': scenario([], [], [invalidation('Bob', 'Initech', 'WORKS_AT')]),
+    'Bob and Initech parted ways': scenario([], [], [invalidation('Bob', 'Initech', undefined, d('2025-02-01'))]),
+    'Bob worked at Initech until February': scenario(people, [stint], [invalidation('Bob', 'Initech', 'WORKS_AT', d('2025-02-01'))]),
+  };
+  // the newer facts have a dated start, or only the date their note was written: such a note is
+  // out of date only when the older text dates the end of that relation itself, and says no more
+  // about it (the first text, see the test above)
+  for (const [content, ends] of Object.entries(older)) for (const dated of [true, false]) {
+    if (!dated && content === 'Bob left Initech') continue;
+    const { zep } = scripted({ 'Bob rejoined Initech': rejoined, [content]: ends }, true);
+    await zep.ingest.addEpisode({ groupId: 'g', content: 'Bob rejoined Initech', validAt: dated ? d('2025-06-01') : undefined });
+    const res = await zep.ingest.addEpisode({ groupId: 'g', content, validAt: d('2025-03-01') });
 
-  assert.equal(res.invalidated.length, 0);
-  assert.equal((await zep.factsAt(new Date(), 'g')).length, 1);
+    assert.deepEqual(res.invalidated, [], `${content} (dated: ${dated})`);
+    const now = (await zep.factsAt(new Date(), 'g')).map((r) => r.fact.fact).sort();
+    assert.deepEqual(now, ['Bob holds shares in Initech', 'Bob rejoined Initech'], `${content} (dated: ${dated})`);
+  }
 });
 
 test('temporal: a change effective in the future keeps the old fact active until then', async () => {

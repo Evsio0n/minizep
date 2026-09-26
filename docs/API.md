@@ -193,12 +193,17 @@ curl -s -X POST http://127.0.0.1:8787/v1/memories \
   [reopen](#post-v1factsuuidreopen).
 - A fact's `valid_at` is the date the text gives, else the episode's. When the text gives none and
   the episode's `valid_at` was left out or is within a day of when it was saved, the fact only held
-  when the note was written and its start is unknown. When a text stored later ends it at an
-  earlier date, or replaces it with a value that began earlier and still held when the note was
-  written (a move "in July" stored after a note written in September), the note was out of date
-  already: the fact is retracted (`invalid_at == valid_at`, `reason` "outdated when written; …")
-  and the new fact does not stop at the note's date. A fact with a dated start is never ended by
-  an older statement: that statement ends where the fact begins.
+  when the note was written and its start is unknown. When a text stored later says, with a date
+  of its own, that this relation ended before the note was written (an invalidation that names the
+  relation and gives its end: a move "in July" stored after a note written in September), the note
+  was out of date already: the fact is retracted (`invalid_at == valid_at`, `reason` "outdated when
+  written; …") and the new fact does not stop at the note's date. A value that only conflicts with
+  the note does not do that, since a document added late looks the same as a correction learned
+  late; nor does an end with no date of its own, one that names no relation, or one that closes a
+  stint the same text records ("from 2015 to 2017"). Like any older statement, such a value ends
+  where the note begins, and a fact with a dated start is never ended by an older statement at
+  all. An old document that only says the relation ended ("left in 2017") still outdates a note
+  about a later stint of it: give the note's start in its text to prevent that.
 - `dropped`: extracted candidates that were discarded. `facts` and `invalidations` name an entity
   that could not be resolved: non-zero means the text said more than the graph recorded. `entities`
   are names that are only a literal value (an IP address, a number, a URL, a version) with no fact
@@ -442,7 +447,8 @@ episode uuid or a prefix of at least 8 characters.
 Nothing is deleted, and `as_of` before the call still shows what was believed:
 
 - a fact the episode was the **only evidence** for is **retracted** (as with
-  [invalidate](#post-v1factsuuidinvalidate) `retract: true`);
+  [invalidate](#post-v1factsuuidinvalidate) `retract: true`), also one that another episode found
+  out of date when written (see below): forgetting that episode later does not bring it back;
 - a fact with other evidence only drops the episode from its `episodes`;
 - a fact the episode **closed** is **reopened** (as with [reopen](#post-v1factsuuidreopen)), with
   the end it had before, if any. Ingestion records which episode closed a fact

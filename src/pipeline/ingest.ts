@@ -377,7 +377,8 @@ export class IngestPipeline {
    * Take back what one episode contributed, under both of the group's locks
    * (no episode is processed, and none of the same text saved, meanwhile):
    *   - a fact it was the only evidence for is retracted, as invalidateFact
-   *     with retract does (as_of before now still finds it);
+   *     with retract does (as_of before now still finds it); one that another
+   *     episode outdated too, so forgetting that episode does not reopen it;
    *   - a fact with other evidence only loses it from its evidence list;
    *   - a fact it closed (attributes.closedByEpisode) is reopened, as
    *     reopenFact does: its end before the episode, if it had one, comes
@@ -434,12 +435,18 @@ export class IngestPipeline {
           const closed =
             !!f.invalidAt && (!isRetracted(f) || isOutdated(f)) && typeof f.attributes?.reopenedAs !== 'string';
           if (cited && others.length === 0) {
-            if (isRetracted(f)) continue; // nothing left to take back
+            // a retracted fact has nothing left to take back, except one another
+            // episode outdated: that episode could still reopen it, with only
+            // this forgotten one as evidence, so it loses that episode's marker
+            const outdated = closed && isOutdated(f);
+            if (isRetracted(f) && !outdated) continue;
+            const { outdatedWhenWritten: _outdated, ...attributes } = withoutEpisodeClosure(f.attributes);
             result.retracted.push({
               ...f,
               invalidAt: f.validAt,
-              expiredAt: now,
-              attributes: { ...withoutEpisodeClosure(f.attributes), retracted: true, invalidatedBy: why },
+              // (an outdated fact has not been believed since it was outdated)
+              expiredAt: outdated ? f.expiredAt : now,
+              attributes: { ...attributes, retracted: true, invalidatedBy: why },
             });
             continue;
           }
@@ -870,6 +877,8 @@ class EpisodeRun {
   private invalidated: EntityEdge[] = [];
   private dropped = { entities: 0, facts: 0, invalidations: 0 };
   private vectors = new Map<string, number[]>();
+  /** the facts this episode states (see recordsStint) */
+  private plans: FactPlan[] = [];
   /**
    * The episode's date says no more than when the note was written: the caller
    * gave no valid_at, or one within a day of when the episode was saved (an
@@ -914,10 +923,11 @@ class EpisodeRun {
       if (!node.nameEmbedding?.length) node.nameEmbedding = await this.vector(node.name);
     }
     for (const plan of plans) await this.vector(plan.text);
+    this.plans = plans;
 
-    // an invalidation dated before the start of a fact whose start is only when
-    // its note was written empties that fact first (see outdate), so none of
-    // this episode's facts runs into it; the others are applied after them
+    // an invalidation that dates the end of a note's value before the note was
+    // written empties that note first (see applyInvalidation), so none of this
+    // episode's facts runs into it; the others are applied after them
     for (const inv of extraction.invalidations ?? []) await this.applyInvalidation(inv, true);
     for (const plan of this.collapseRepeats(plans)) await this.resolveFact(plan);
     for (const inv of extraction.invalidations ?? []) await this.applyInvalidation(inv);
@@ -1192,13 +1202,12 @@ class EpisodeRun {
     const covering = records.find((f) => isSame(f) && holds(f));
     if (covering) return this.reinforce(covering, invalidAt, text);
 
-    // the later records of this relationship, the nearest first
-    const after = validAt
+    // the nearest later record of this relationship
+    const later = validAt
       ? records
           .filter((f) => f.validAt && f.validAt > validAt)
-          .sort((a, b) => a.validAt!.getTime() - b.validAt!.getTime())
-      : [];
-    const later = after[0];
+          .sort((a, b) => a.validAt!.getTime() - b.validAt!.getTime())[0]
+      : undefined;
     if (later && validAt && isSame(later) && !(invalidAt && invalidAt < later.validAt!)) {
       // evidence that `later` really began at its validAt: something in the
       // same slot ended in between (a transition)
@@ -1214,8 +1223,8 @@ class EpisodeRun {
       }
     }
 
-    // a new edge, within the end the text states (and the ones below)
-    let end = invalidAt;
+    // a new edge; an earlier stint must not overlap the later record
+    let end = earliest(invalidAt, later?.validAt);
 
     // records of this relationship over t that say something else ("Bob is a
     // senior developer at Initech" vs "Bob works at Initech"). They are
@@ -1273,14 +1282,14 @@ class EpisodeRun {
     if (same) return this.reinforce(same, invalidAt, text);
     for (const f of alongside) end = earliest(end, f.invalidAt);
 
-    // (`ended` is only filled when validAt is known.) A later fact that this
-    // statement ends and whose start was only when its note was written is
-    // settled last, once this statement's end is known
-    const noted = (f: EntityEdge) => ended.includes(f) && startDefaulted(f) && f.validAt! > validAt!;
+    // (`ended` is only filled when validAt is known)
     for (const old of ended) {
-      if (noted(old)) continue;
       if (old.validAt && old.validAt > validAt!) {
-        // an older statement cannot end a newer, dated fact: it ends where that one begins
+        // an older statement cannot end a newer fact: it ends where that one
+        // begins. That holds for a note whose start is only when it was written
+        // too: a value that conflicts with it may come from a document added
+        // late as well as from a correction learned late, and only a text that
+        // dates the end of the note's value tells them apart (see applyInvalidation)
         end = earliest(end, old.validAt);
         continue;
       }
@@ -1290,15 +1299,6 @@ class EpisodeRun {
       // old one's known end either
       end = earliest(end, old.invalidAt);
       this.close(old, at, `superseded by: ${text}`);
-    }
-    // an earlier stint must not overlap a later record of this relationship
-    for (const f of after) if (!noted(f)) end = earliest(end, f.validAt);
-    // this statement still held when such a note was written: the note was out
-    // of date already, so it is emptied (see outdate) and does not cap this
-    // statement. A note written after this statement ended does not conflict
-    // with it.
-    for (const old of ended) {
-      if (noted(old) && (!end || end > old.validAt!)) this.outdate(old, `superseded by: ${text}`);
     }
 
     const edge: EntityEdge = {
@@ -1338,13 +1338,14 @@ class EpisodeRun {
 
   /**
    * Where a change dated `at` ends fact f, or undefined when it cannot: f
-   * started after `at` (an older statement cannot end a newer fact; the
-   * callers outdate one whose start was only when its note was written) or had
-   * already ended by then. When f starts exactly at `at` — coarse dates
-   * collide: "March 2024" is 2024-03-01 for both the old and the new value — it
-   * ends when this episode was written (the change had happened by then), or
-   * failing that right after its start, so it keeps a non-empty window and
-   * stays in history instead of vanishing.
+   * started after `at` (an older statement cannot end a newer fact; an
+   * invalidation may outdate one whose start was only when its note was
+   * written, see applyInvalidation) or had already ended by then. When f
+   * starts exactly at `at` — coarse dates collide: "March 2024" is 2024-03-01
+   * for both the old and the new value — it ends when this episode was
+   * written (the change had happened by then), or failing that right after
+   * its start, so it keeps a non-empty window and stays in history instead of
+   * vanishing.
    */
   private endFor(f: EntityEdge, at: Date): Date | undefined {
     if (f.invalidAt && f.invalidAt <= at) return undefined;
@@ -1377,14 +1378,14 @@ class EpisodeRun {
   }
 
   /**
-   * A change dated before the start of an existing fact whose start was only
-   * when its note was written (startFromEpisode): the note was out of date
-   * already when it was written ("home is X" noted today, "moved from X to Y
-   * in July" learned since). It held at no instant from its recorded start on,
-   * and when it really began is unknown: its window is emptied at that start,
-   * as a retraction does, and it is marked outdatedWhenWritten. The row stays in
-   * history (as_of before now still finds it), closed by this episode for
-   * forgetEpisode to reopen.
+   * An end dated before the start of an existing fact whose start was only
+   * when its note was written (startFromEpisode, see applyInvalidation): the
+   * note was out of date already when it was written ("home is X" noted today,
+   * "moved from X to Y in July" learned since). It held at no instant from its
+   * recorded start on, and when it really began is unknown: its window is
+   * emptied at that start, as a retraction does, and it is marked
+   * outdatedWhenWritten. The row stays in history (as_of before now still
+   * finds it), closed by this episode for forgetEpisode to reopen.
    */
   private outdate(f: EntityEdge, reason: string): void {
     this.close(f, f.validAt!, `outdated when written; ${reason}`);
@@ -1394,8 +1395,19 @@ class EpisodeRun {
   /**
    * c. explicit invalidation: close existing relations WITHOUT creating a
    * redundant "LEFT/QUIT/ENDED" edge (the fix for termination modeling).
-   * `outdatedOnly`: only outdate the facts it predates whose start was only when
-   * their note was written (the pass before this episode's facts are resolved).
+   *
+   * It outdates (see outdate) a fact whose start was only when its note was
+   * written and that begins after the end, when the text says the note's
+   * value had ended by then: it dates that end itself (not the episode's date
+   * standing in for a missing one: a document added late may end whatever
+   * the extraction was shown as current), names the relation (not a plain
+   * "they parted ways", which would empty every relation of the pair), and
+   * does not also record a stint of that relation between the pair that is
+   * over by then ("worked there from 2015 to 2017, left in 2017": the end of
+   * that stint says nothing about a note written since). Otherwise such a
+   * fact is left alone, as an older statement leaves any newer fact.
+   * `outdatedOnly`: only outdate (the pass before this episode's facts are
+   * resolved).
    */
   private async applyInvalidation(inv: ExtractedInvalidation, outdatedOnly = false): Promise<void> {
     const src = await this.lookup(inv.sourceName ?? '');
@@ -1404,17 +1416,19 @@ class EpisodeRun {
       if (!outdatedOnly) this.dropped.invalidations++;
       return;
     }
-    const end = validDate(inv.invalidAt) ?? this.episode.validAt;
+    const stated = validDate(inv.invalidAt);
+    const end = stated ?? this.episode.validAt;
     const reason = inv.reason ?? this.episode.content.slice(0, 120);
     // when the LLM named a relation, prefer it; otherwise close all relations
     // between this pair (a plain "they parted ways" statement)
     const relation = inv.relation ? normaliseRelation(inv.relation) : undefined;
+    const outdates = !!stated && !!relation && !this.recordsStint(src, tgt, relation, stated);
     for (const f of await this.factsOf(src)) {
       if (!connects(f, src, tgt) || (relation && !sameRelation(f, relation)) || isRetracted(f)) continue;
       // an edge this text just introduced ends only if it began strictly before
       if (this.created.has(f) && !(f.validAt && f.validAt < end)) continue;
-      // it ended before the note that started it was even written
-      if (startDefaulted(f) && f.validAt && end < f.validAt) {
+      // its value had ended before the note that started it was even written
+      if (outdates && startDefaulted(f) && f.validAt && end < f.validAt) {
         this.outdate(f, reason);
         continue;
       }
@@ -1424,6 +1438,16 @@ class EpisodeRun {
       const at = this.endFor(f, end);
       if (at) this.close(f, at, reason);
     }
+  }
+
+  /** Does this episode state a stint of `relation` between the pair (either way) that is over by `end`? */
+  private recordsStint(a: EntityNode, b: EntityNode, relation: string, end: Date): boolean {
+    return this.plans.some((p) => {
+      const between =
+        (p.src.uuid === a.uuid && p.tgt.uuid === b.uuid) || (p.src.uuid === b.uuid && p.tgt.uuid === a.uuid);
+      const until = between && p.relation === relation ? this.window(p.cand).invalidAt : undefined;
+      return !!until && until <= end;
+    });
   }
 
   /* ---------------- embeddings & writes ---------------- */
