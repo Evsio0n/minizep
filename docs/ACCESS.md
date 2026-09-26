@@ -28,6 +28,15 @@ use). A server without a database keeps them in memory only: they are gone when 
 
   The token's role in a group is the lower of its user's role there and its cap, and none outside
   its `groups`. Only a token with neither `groups` nor `role` of an admin user is an admin.
+
+  A new token must reach at least one group: its user's grants (every group for an admin) within
+  its `groups`. One that reaches none is refused with 400
+  `this token would reach none of the groups of "<user>" (their grants: <patterns>)`, and so is a
+  `default_group` it cannot read (400 `default group "<g>" is outside this token's reach`). A
+  token with `groups` but no `default_group`, which cannot read its user's default group, gets
+  the first exact group name (no `*`) of its `groups` that it can read as its `default_group`, or
+  none when there is no such name. This is checked when the token is made, not after later grant
+  changes. The first token of a new user is not narrowed.
 - **Default group** (used when a request names none): the token's, else its user's. When the
   caller cannot read it, a request without `group_id` fails with 403
   `no default group: pass group_id`.
@@ -55,8 +64,11 @@ caller's role in each group, so a model knows where it may only search.
 
 `minizep-admin user add bob` creates user `bob` with default group `bob` and grants him `owner`
 on `bob` and on `bob/*`: his own group and any sub-group he opens (`bob/notes`, `bob/asr`). A
-group comes into existence with its first memory. `--no-workspace` skips both grants,
-`--default-group` sets another default group.
+group comes into existence with its first memory.
+
+The workspace is always the default group and its sub-groups: `--default-group pff` makes it
+`pff` and `pff/*` (grants of `owner` on both, whatever the user's name). `--no-workspace` skips
+both grants: the user can then read its default group only once it is granted.
 
 Bob shares `bob/notes` with Alice as a reader:
 
@@ -79,7 +91,7 @@ npm run admin -- user list            # from a checkout, with MINIZEP_DATABASE_U
 ```
 
 ```
-user add <name> [--admin] [--default-group g] [--no-workspace]   # prints a first token (all rights)
+user add <name> [--admin] [--default-group g] [--no-workspace]   # owner of g (else <name>) and g/*; prints a first token (all rights)
 user list
 user set <name> [--admin | --no-admin] [--default-group g] [--disable | --enable]
 grant <user> <pattern> <reader|writer|owner>
@@ -90,9 +102,11 @@ token list [--user u]
 token revoke <token-id>
 ```
 
-`--json` prints the JSON of the matching REST endpoint. A running server sees changes made with
-the CLI within 30 seconds (it caches each token's rights that long); changes made through its
-own REST endpoints apply at once.
+`token create` refuses a token that would reach none of the user's groups, or whose
+`--default-group` it cannot read, and gives a narrowed one a default group it can read (see
+[Concepts](#concepts), Token). `--json` prints the JSON of the matching REST endpoint. A running
+server sees changes made with the CLI within 30 seconds (it caches each token's rights that
+long); changes made through its own REST endpoints apply at once.
 
 ## REST
 
@@ -135,6 +149,8 @@ expires_at: null}`; anonymous mode and the UI without login have `token: null`.
 The `/v1/me/tokens` routes need a user account (403 for env tokens). A token made there can never
 do more than the token that made it: its `groups` are intersected with the caller's (403 when
 nothing is left), its `role` is the lower of both, and it expires no later than the caller's.
+It must then reach one of the account's groups and be able to read its `default_group` (400
+otherwise; see [Concepts](#concepts), Token).
 `name` is required (1–100 characters), `expires_days` is 1–3650. Revoking someone else's token
 is 404 `token not found`, like a missing one.
 
@@ -160,9 +176,9 @@ Everything else is 403 `admin rights required`.
 | Route | Body | Answer |
 |---|---|---|
 | `GET /v1/admin/users` | | 200 `{users: [user + {grants: [{pattern, role, created_at}], tokens: [token]}]}` |
-| `POST /v1/admin/users` | `{name, admin?, default_group?, workspace? = true}` | 201 `{user, grants: [grant], token: "<secret>", record: token}`; 409 when the name is taken |
+| `POST /v1/admin/users` | `{name, admin?, default_group?, workspace? = true}` | 201 `{user, grants: [grant], token: "<secret>", record: token}`, `grants` owner of the default group (`default_group`, else `name`) and its `/*`, none without a workspace; 409 when the name is taken |
 | `POST /v1/admin/users/:name` | `{admin?, disabled?, default_group?}` | 200 `{user}`; 404 |
-| `POST /v1/admin/users/:name/tokens` | `{name?, groups?, role?, default_group?, expires_days?}` | 201 `{token: "<secret>", record: token}`; 404 |
+| `POST /v1/admin/users/:name/tokens` | `{name?, groups?, role?, default_group?, expires_days?}` | 201 `{token: "<secret>", record: token}`; 400 when it would reach none of the user's groups or cannot read `default_group`; 404 |
 | `POST /v1/admin/tokens/:id/revoke` | | 200 `{record: token}`; 404 |
 | `POST /v1/admin/grants` | `{user, pattern, role}` | 200 `{grant}` (inserted or its role changed); 404 unknown user |
 | `POST /v1/admin/grants/revoke` | `{user, pattern}` | 200 `{removed: true}`; 404 |
