@@ -957,6 +957,17 @@ test('access: an admin adds users; each works in its own workspace, shares it by
     const alice = (await api(srv.base, 'POST', '/v1/admin/users', { token: root, body: { name: 'alice' } })).body.token;
     assert.equal((await api(srv.base, 'GET', '/v1/admin/users', { token: bob })).status, 403, 'admins only');
 
+    // the workspace follows the default group; a new token must reach a group of its user, and its default
+    const pff = await api(srv.base, 'POST', '/v1/admin/users', { token: root, body: { name: 'panff', default_group: 'pff' } });
+    assert.deepEqual(pff.body.grants.map((g: Row) => `${g.pattern}:${g.role}`), ['pff:owner', 'pff/*:owner']);
+    const tokenFor = (body: unknown) => api(srv.base, 'POST', '/v1/admin/users/panff/tokens', { token: root, body });
+    const nowhere = await tokenFor({ groups: ['panff/*'] });
+    assert.deepEqual([nowhere.status, nowhere.body.error], [400, 'this token would reach none of the groups of "panff" (their grants: pff, pff/*)']);
+    const outside = await tokenFor({ groups: ['pff/*'], default_group: 'pff' });
+    assert.deepEqual([outside.status, outside.body.error], [400, 'default group "pff" is outside this token\'s reach']);
+    const notes = await api(srv.base, 'POST', '/v1/me/tokens', { token: bob, body: { name: 'notes', groups: ['bob/notes'] } });
+    assert.deepEqual([notes.status, notes.body.record.default_group], [201, 'bob/notes'], 'its one exact group, not bob');
+
     // bob's workspace: his group and its sub-groups; nobody else's
     for (const group_id of [undefined, 'bob/notes']) {
       const r = await api(srv.base, 'POST', '/v1/memories', { token: bob, body: { content: 'Bob works at Borealis.', group_id } });

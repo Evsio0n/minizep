@@ -30,7 +30,9 @@ const USAGE = `usage: minizep-admin <command> [--json]
   token list [--user u]
   token revoke <token-id>
 
-A pattern is a group name, or a prefix ending in "*" ("bob/*"; "*" = every group).`;
+A pattern is a group name, or a prefix ending in "*" ("bob/*"; "*" = every group).
+The workspace of "user add" is its default group g (--default-group, else <name>) and g/*:
+the user is owner of both, unless --no-workspace.`;
 
 const ADMIN: Principal = { id: 'cli', defaultGroup: 'default', grants: 'any', admin: true };
 

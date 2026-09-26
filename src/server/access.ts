@@ -24,6 +24,7 @@ import {
   matchEnvToken,
   envPrincipal,
   resolveGroup,
+  roleIn,
   type AuthResult,
   type Principal,
 } from './auth.js';
@@ -230,9 +231,7 @@ export class AccessControl {
     if (token.revokedAt || (token.expiresAt && token.expiresAt.getTime() <= now)) return undefined;
     const user = await this.store.getUser(token.user);
     if (!user || user.disabled) return undefined;
-    const grants = user.admin
-      ? 'any'
-      : (await this.store.listGrants({ user: user.name })).map(({ pattern, role }) => ({ pattern, role }));
+    const grants = await this.grantsOf(user);
     const restricted = token.groups !== null || token.role !== null;
     return {
       id: token.id,
@@ -346,7 +345,8 @@ export class AccessControl {
     const asked = this.expiry(input.expires_days);
     const until = own?.expiresAt ?? null;
     const expiresAt = asked && until ? (asked < until ? asked : until) : (asked ?? until);
-    return this.issue({ user, name: input.name, groups, role, defaultGroup: input.default_group ?? null, expiresAt });
+    const defaultGroup = await this.defaultWithin(await this.existingUser(user), groups, input.default_group ?? null);
+    return this.issue({ user, name: input.name, groups, role, defaultGroup, expiresAt });
   }
 
   async revokeMyToken(p: Principal, id: string) {
@@ -400,24 +400,26 @@ export class AccessControl {
   }
 
   /**
-   * A user, by default with its workspace (owner of `name` and `name/*`) and
-   * default group `name`, and a first token with all of its rights.
+   * A user with default group `default_group` (else `name`), by default with
+   * its workspace there (owner of that group and of its sub-groups, `group/*`),
+   * and a first token with all of its rights.
    */
   async createUser(p: Principal, input: CreateUserInput) {
     requireAdmin(p);
     const name = input.name;
+    const home = input.default_group ?? name;
     const user = await this.store.createUser({
       name,
       admin: input.admin ?? false,
       disabled: false,
-      defaultGroup: input.default_group ?? name,
+      defaultGroup: home,
     });
     if (!user) throw new ServiceError(409, `user "${name}" already exists`);
     this.usersSeen = true;
     const grants =
       input.workspace === false
         ? []
-        : [await this.store.setGrant(name, name, 'owner'), await this.store.setGrant(name, `${name}/*`, 'owner')];
+        : [await this.store.setGrant(name, home, 'owner'), await this.store.setGrant(name, `${home}/*`, 'owner')];
     const first = await this.issue({ user: name, name: 'first token', groups: null, role: null, defaultGroup: null, expiresAt: null });
     return { user: userRow(user), grants: grants.map(grantRow), ...first };
   }
@@ -436,13 +438,14 @@ export class AccessControl {
 
   async createToken(p: Principal, name: string, input: TokenInput) {
     requireAdmin(p);
-    await this.existingUser(name);
+    const user = await this.existingUser(name);
+    const groups = input.groups ?? null;
     return this.issue({
       user: name,
       name: input.name ?? '',
-      groups: input.groups ?? null,
+      groups,
       role: input.role ?? null,
-      defaultGroup: input.default_group ?? null,
+      defaultGroup: await this.defaultWithin(user, groups, input.default_group ?? null),
       expiresAt: this.expiry(input.expires_days),
     });
   }
@@ -480,6 +483,36 @@ export class AccessControl {
   }
 
   /* ---------- helpers ---------- */
+
+  /** What a user's tokens start from: its grants, 'any' for an admin. */
+  private async grantsOf(user: UserRecord): Promise<Principal['grants']> {
+    return user.admin ? 'any' : (await this.store.listGrants({ user: user.name })).map(({ pattern, role }) => ({ pattern, role }));
+  }
+
+  /**
+   * The default group of a new token of `user` within `groups`, checked
+   * against what the token could use (its user's grants, narrowed): one that
+   * reaches no group, or an explicit default it cannot read, is refused (400).
+   * Without an explicit one, a narrowed token that cannot read its user's
+   * default gets the first exact group of `groups` it can read, else none
+   * (calls then pass group_id). Checked here only: later grant changes are not.
+   */
+  private async defaultWithin(user: UserRecord, groups: string[] | null, asked: string | null): Promise<string | null> {
+    const grants = await this.grantsOf(user);
+    const restriction = groups ? { groups } : undefined;
+    const token: Principal = { id: 'new', defaultGroup: user.defaultGroup, grants, admin: false, restriction };
+    if (effectiveGrants(token).length === 0) {
+      // only a user's own grants can miss: 'any' meets every pattern
+      const held = grants === 'any' ? '*' : grants.map((g) => g.pattern).join(', ') || 'none';
+      throw new ServiceError(400, `this token would reach none of the groups of "${user.name}" (their grants: ${held})`);
+    }
+    if (asked !== null) {
+      if (!roleIn(token, asked)) throw new ServiceError(400, `default group "${asked}" is outside this token's reach`);
+      return asked;
+    }
+    if (!groups || roleIn(token, user.defaultGroup)) return null;
+    return groups.find((g) => !g.includes('*') && roleIn(token, g)) ?? null;
+  }
 
   /** The secret is in this answer only. */
   private async issue(t: NewToken) {

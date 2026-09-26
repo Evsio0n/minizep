@@ -939,7 +939,7 @@ const S = {
   defaultGroupPh: 'the user name',
   fAdmin: 'Admin: owner of every group, manages users, grants and tokens',
   fWorkspace: 'Create workspace',
-  workspaceHelp: (n) => `Owner of ${n || '<name>'} and ${n || '<name>'}/*.`,
+  workspaceHelp: (g) => `Owner of the default group and its sub-groups: ${g || '<name>'} and ${g || '<name>'}/*.`,
   createUser: 'Create user',
   userCreated: (n) => `User ${n} created`,
   firstTokenLead: (n) => `The first token of ${n}, with all of the account’s rights. Hand it over through a safe channel.`,
@@ -4980,7 +4980,10 @@ function openCreateUser() {
   const admin = h('input', { type: 'checkbox' });
   const ws = h('input', { type: 'checkbox', checked: true });
   const wsHelp = h('div', { class: 'help' }, S.workspaceHelp(''));
-  name.addEventListener('input', () => { wsHelp.textContent = S.workspaceHelp(name.value.trim()); });
+  // the workspace follows the default group, which is the name unless given
+  const syncWs = () => { wsHelp.textContent = S.workspaceHelp(dg.value.trim() || name.value.trim()); };
+  name.addEventListener('input', syncWs);
+  dg.addEventListener('input', syncWs);
   const body = h('div', { class: 'form' },
     field(S.fName, name, h('div', { class: 'help' }, S.userNameHelp)),
     field(`${S.fDefaultGroup} (${S.optional})`, dg),
