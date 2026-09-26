@@ -103,6 +103,8 @@ every tool uses your default group; the connection instructions list the groups 
 - Working on a project or topic that has its own group: pass that `group_id` on every call, reads and writes.
 - The default group has nothing about what you are working on: call `list_groups` and search the group that
   matches before concluding the memory is empty.
+- A result that ends with "(no group_id: …)" came from the default group; the note lists your other groups.
+  If you just stored something that belongs to one of them, `forget_episode` it and add it there.
 - Never copy facts from one group into another to "share" them; ask the user which group a new topic belongs to.
 
 ## Repairs: situation → tool

@@ -204,9 +204,42 @@ function describeJob(job: JobRow): string {
   return lines.join('\n');
 }
 
+/**
+ * Wraps tool registration so that a call which fell back to the default group
+ * says so, and names the caller's other groups. Instructions are not shown to
+ * the model by every client; a tool result always is. Without this, a model
+ * working on a project searched the default group, saw unrelated facts, and
+ * wrote the project's notes there.
+ */
+function withGroupHints(server: McpServer, p: Principal): McpServer {
+  const others = p.groups === 'any' ? [] : p.groups.filter((g) => g !== p.defaultGroup);
+  if (others.length === 0) return server;
+  const read =
+    `(no group_id: this used the default group "${p.defaultGroup}". This connection can also use ` +
+    `${others.join(', ')}; pass group_id to look there, or call list_groups.)`;
+  const write =
+    `(no group_id: stored in the default group "${p.defaultGroup}". This connection also has ` +
+    `${others.join(', ')}; if this belongs to one of them, call forget_episode on this episode and add it ` +
+    'again with that group_id.)';
+  const register = server.registerTool.bind(server) as (...args: unknown[]) => unknown;
+  const wrapped = Object.create(server) as McpServer;
+  wrapped.registerTool = ((name: string, config: { inputSchema?: object }, handler: (...a: unknown[]) => unknown) => {
+    if (!config.inputSchema || !('group_id' in config.inputSchema)) return register(name, config, handler);
+    return register(name, config, async (args: { group_id?: string } | undefined, extra: unknown) => {
+      const result = (await handler(args, extra)) as { content?: { type: string; text?: string }[] };
+      const first = result.content?.[0];
+      if (args?.group_id || first?.type !== 'text') return result;
+      const hint = name === 'add_memory' ? write : read;
+      return { ...result, content: [{ ...first, text: `${first.text ?? ''}\n${hint}` }, ...result.content!.slice(1)] };
+    });
+  }) as McpServer['registerTool'];
+  return wrapped;
+}
+
 /** Registers every minizep tool on a server instance. Shared by stdio and HTTP. */
-export function registerTools(server: McpServer, ctx: ToolContext): void {
+export function registerTools(target: McpServer, ctx: ToolContext): void {
   const { service, principal: p } = ctx;
+  const server = withGroupHints(target, p);
 
   server.registerTool(
     'add_memory',
