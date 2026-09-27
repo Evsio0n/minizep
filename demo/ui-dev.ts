@@ -17,6 +17,15 @@
  *   MINIZEP_UI_HOSTS   extra host names for the UI (see docs/API.md)
  *   MINIZEP_TOKENS     tokens for /v1 and /mcp (default none: /v1 answers 401)
  *
+ * Performance aids (the size of a real group, and writes landing while you look):
+ *   UI_DEV_BIG=1       also seed "big-zh": ~530 entities, ~720 facts (a few hubs;
+ *                      ended, retracted and future ones), 140 episodes, CJK names,
+ *                      written straight into the store (no LLM)
+ *   UI_DEV_LLM_MS      how long the scripted LLM takes for typed text (default 700)
+ *   MINIZEP_JOB_CONCURRENCY  jobs run at once (default 2; 1 = they finish one by one)
+ *   UI_DEV_DRIP_S      every N seconds a background writer (like an MCP agent) adds
+ *                      an async memory to big-zh (default off; needs UI_DEV_BIG=1)
+ *
  * A development tool, not a test: the data is invented and nothing is saved.
  */
 import { Minizep } from '../src/index.js';
@@ -27,6 +36,8 @@ import type {
   KnownFact,
   LLMProvider,
 } from '../src/provider/interfaces.js';
+import { JobQueue } from '../src/jobs/queue.js';
+import { uuid } from '../src/model/types.js';
 import { createHttpApp } from '../src/server/app.js';
 import { localPrincipal, parseTokens } from '../src/server/auth.js';
 import { envInt, onShutdownSignal } from '../src/server/runtime.js';
@@ -195,7 +206,7 @@ class DevLLM implements LLMProvider {
     if (content.includes('[fail]')) throw new Error('scripted failure (the text contains "[fail]")');
     const script = SCRIPTS.get(content);
     if (script) return { entities: [], invalidations: [], ...script };
-    await new Promise((r) => setTimeout(r, 700));
+    await new Promise((r) => setTimeout(r, envInt('UI_DEV_LLM_MS', 700)));
     return this.rules.extract(content, known, knownFacts);
   }
 
@@ -258,7 +269,108 @@ async function seed(): Promise<void> {
   await add(edge, 'This text makes the scripted LLM fail. [fail]', undefined, { name: 'A failed episode' });
 }
 
+/**
+ * A group the size of a real one, written straight into the store: entity
+ * weights follow a Zipf curve, so a few hubs carry most facts; most other
+ * entities have one to three and ~30 none. Deterministic (seeded PRNG).
+ */
+const BIG = 'big-zh';
+async function seedBig(): Promise<void> {
+  let seedN = 42;
+  const rnd = () => { // mulberry32
+    seedN = (seedN + 0x6d2b79f5) | 0;
+    let t = Math.imul(seedN ^ (seedN >>> 15), 1 | seedN);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+  const pick = <T,>(a: readonly T[]) => a[Math.floor(rnd() * a.length)];
+  const HAN = '學校國家經濟文化歷史社會政治教育言語漢字意味音韻語彙文法發音聲調辭典訓練評價資料模型';
+  const SUR = '金李朴崔鄭姜趙尹張林';
+  const GIV = ['敏俊', '瑞妍', '志勳', '秀賢', '惠媛', '東玄', '智雅', '成民', '夏恩', '俊浩', '藝琳', '在元'];
+  const KINDS: Array<[string, number, (i: number) => string]> = [
+    ['Person', 70, (i) => SUR[i % SUR.length] + GIV[Math.floor(i / SUR.length) % GIV.length]],
+    ['Concept', 200, () => pick([...HAN]) + pick([...HAN]) + (rnd() < 0.3 ? pick([...HAN]) : '')],
+    ['Dataset', 40, (i) => `${pick(['AIHub', 'KsponSpeech', '漢字語', 'Zeroth'])} ${pick(['訓練', '評價', 'dev', 'test'])}-${i}`],
+    ['Model', 30, (i) => `${pick(['whisper', 'wav2vec2', 'klue-bert', 'hanja-wsd'])}-${pick(['base', 'large', 'turbo', 'ft'])}-v${i}`],
+    ['Tool', 60, (i) => `${pick(['train', 'eval', 'align', 'dump', 'score'])}_${pick(['asr', 'wsd', 'gold', 'lm'])}${i}.${pick(['py', 'sh', 'ts'])}`],
+    ['Job', 80, () => `slurm-${100000 + Math.floor(rnd() * 900000)}`],
+    ['Document', 30, (i) => `docs/${pick(['PLAN', 'ASR-PLAN', 'EVAL', 'NOTES', '實驗'])}-${i}.md`],
+    ['Machine', 15, (i) => `${pick(['storage', 'gpu', 'v100', 'b100'])}-${String(i).padStart(2, '0')}`],
+  ];
+  const HUBS: Array<[string, string]> = [
+    ['Hanja Lab', 'Organization'], ['Whisper Turbo', 'Model'], ['漢字語 WSD', 'Project'], ['storage-01', 'Machine'], ['AIHub 한자', 'Dataset'], ['論文 CP7', 'Document'],
+  ];
+  const names = new Set<string>();
+  const ents: Array<{ name: string; label: string }> = HUBS.map(([name, label]) => { names.add(name); return { name, label }; });
+  for (const [label, n, make] of KINDS) {
+    for (let i = 0; i < n; i++) {
+      let name = make(i);
+      if (names.has(name)) name = `${name}·${i}`;
+      names.add(name);
+      ents.push({ name, label });
+    }
+  }
+  for (let i = ents.length - 1; i > HUBS.length; i--) { // shuffle all but the hubs
+    const j = HUBS.length + Math.floor(rnd() * (i - HUBS.length + 1));
+    [ents[i], ents[j]] = [ents[j], ents[i]];
+  }
+  const w = ents.map((_, i) => 1 / (i + 1) ** 0.9);
+  const total = w.reduce((a, b) => a + b, 0);
+  const zipf = () => { let r = rnd() * total; for (let i = 0; i < w.length; i++) if ((r -= w[i]) <= 0) return i; return w.length - 1; };
+
+  const start = now.getTime() - 90 * DAY;
+  const eps = Array.from({ length: 140 }, (_, k) => {
+    const at = new Date(start + (k + rnd()) * ((90 * DAY) / 140));
+    const failed = k % 60 === 59;
+    return {
+      type: 'episode' as const, uuid: uuid(), groupId: BIG, name: `實驗記錄 ${k + 1}`, source: 'text' as const, sourceDescription: 'ui-dev big seed',
+      content: Array.from({ length: 4 + Math.floor(rnd() * 8) }, () => `${pick(ents).name}與${pick(ents).name}有關；${pick([...HAN])}${pick([...HAN])}。`).join(' '),
+      validAt: at, createdAt: at, status: failed ? ('failed' as const) : ('processed' as const), error: failed ? 'scripted: LLM answered HTTP 500' : undefined, attempts: 1,
+    };
+  });
+  for (const ep of eps) await zep.store.addEpisode(ep);
+
+  const RELS = ['USES', 'PART_OF', 'TRAINED_ON', 'EVALUATED_ON', 'DEPENDS_ON', 'RUNS_ON', 'AUTHORED', 'MENTIONS', 'RELATED_TO', 'IMPROVES', 'REPLACES', 'MEANS'];
+  const facts: Array<Parameters<typeof zep.store.addFact>[0]> = [];
+  const firstSeen = new Map<number, Date>();
+  const uuids = ents.map(() => uuid());
+  for (let k = 0; k < 720; k++) {
+    const s = k < 470 ? HUBS.length + k : zipf(); // most entities get at least one fact
+    let t = zipf();
+    while (t === s) t = zipf();
+    const ep = eps[Math.floor((k / 720) * eps.length)];
+    const created = ep.createdAt;
+    const rel = pick(RELS);
+    const r = rnd();
+    const later = new Date(Math.min(now.getTime() - DAY, created.getTime() + (1 + rnd() * 30) * DAY));
+    for (const i of [s, t]) if (!firstSeen.has(i)) firstSeen.set(i, created);
+    facts.push({
+      type: 'fact', uuid: uuid(), groupId: BIG, sourceNodeUuid: uuids[s], targetNodeUuid: uuids[t], name: rel,
+      fact: `${ents[s].name} ${rel.toLowerCase().replace(/_/g, ' ')} ${ents[t].name}（${pick([...HAN])}${pick([...HAN])}）`,
+      episodes: [ep.uuid], createdAt: created, attributes: {},
+      validAt: r > 0.97 ? new Date(now.getTime() + (10 + rnd() * 50) * DAY) : created, // 3% future
+      invalidAt: r < 0.12 ? later : undefined, // 12% ended
+      expiredAt: r < 0.12 || (r >= 0.12 && r < 0.16) ? later : undefined, // 4% retracted
+    });
+  }
+  for (let i = 0; i < ents.length; i++) {
+    const e = ents[i];
+    await zep.store.upsertEntity({
+      type: 'entity', uuid: uuids[i], groupId: BIG, name: e.name, labels: [e.label], attributes: {},
+      summary: `${e.name}：${Array.from({ length: 2 + Math.floor(rnd() * 5) }, () => pick([...HAN]) + pick([...HAN])).join('、')}。`,
+      nameEmbedding: await zep.embedder.embed(e.name),
+      createdAt: firstSeen.get(i) ?? pick(eps).createdAt,
+    });
+  }
+  for (const f of facts) await zep.store.addFact({ ...f, factEmbedding: await zep.embedder.embed(f.fact) });
+  const deg = new Map<string, number>();
+  for (const f of facts) for (const id of [f.sourceNodeUuid, f.targetNodeUuid]) deg.set(id, (deg.get(id) ?? 0) + 1);
+  const top = [...deg.values()].sort((a, b) => b - a);
+  log(`seeded ${BIG}: ${ents.length} entities (${ents.length - deg.size} isolated; top degrees ${top.slice(0, 6).join(', ')}), ${facts.length} facts, ${eps.length} episodes`);
+}
+
 await seed();
+if (process.env.UI_DEV_BIG === '1') await seedBig();
 const facts = (await zep.store.getFacts()).length;
 log(`seeded ${facts} facts in team-a, 中文示例 and edge-cases (today is ${now.toISOString().slice(0, 10)}; "future" starts ${nextMonth.toISOString().slice(0, 10)}, ${Math.round((nextMonth.getTime() - now.getTime()) / DAY)} days on)`);
 
@@ -267,6 +379,7 @@ const ui = uiFromEnv(login ? process.env : { ...process.env, MINIZEP_UI_GROUPS: 
 const tokens = parseTokens(process.env.MINIZEP_TOKENS);
 const app = createHttpApp({
   zep,
+  jobs: new JobQueue({ concurrency: envInt('MINIZEP_JOB_CONCURRENCY', 2) }),
   tokens,
   ui,
   llmLabel: 'scripted (ui-dev)',
@@ -287,7 +400,22 @@ await app.listen(['127.0.0.1'], port);
 const v1 = login || tokens.size ? `${tokens.size} env token(s)${login ? ' and the users above' : ''}` : 'no tokens configured, 401';
 log(`open http://127.0.0.1:${port}/ui  (/v1: ${v1})`);
 
+const dripS = envInt('UI_DEV_DRIP_S', 0);
+let dripTimer: NodeJS.Timeout | undefined;
+if (dripS > 0 && process.env.UI_DEV_BIG === '1') {
+  let n = 0;
+  const hubs = ['Hanja Lab', 'Whisper Turbo'];
+  dripTimer = setInterval(() => {
+    n++;
+    const content = `Agent${n} works at ${hubs[n % hubs.length]}. Agent${n} likes Tester${n}.`;
+    app.service.addMemory(localPrincipal(BIG), { group_id: BIG, content, async: true, name: `drip ${n}` })
+      .then((r) => log(`drip ${n}: ${r.status}`), (e) => log(`drip ${n} failed: ${e}`));
+  }, dripS * 1000);
+  log(`background writer: an async memory into ${BIG} every ${dripS}s`);
+}
+
 onShutdownSignal(async (signal) => {
+  clearInterval(dripTimer);
   log(`${signal}: stopping`);
   await app.close({ drainTimeoutMs: 2000 });
   process.exit(0);
