@@ -14,6 +14,7 @@ export type {
   ExtractOptions,
   KnownEntity,
   KnownFact,
+  LLMCallContext,
   ContradictionCandidate,
   ContradictionExisting,
   ContradictionVerdict,

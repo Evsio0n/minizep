@@ -9,6 +9,7 @@ import { FilePersistence, Minizep } from '../src/index.js';
 import { MemoryGraphStore, type GraphStore } from '../src/store/memory-store.js';
 import { PostgresStore } from '../src/store/postgres-store.js';
 import type { EpisodicNode } from '../src/model/types.js';
+import { JobQueue } from '../src/jobs/queue.js';
 import { ScriptedLLM, deterministicEmbedder, entity, fact } from './helpers.js';
 import { parseUiHosts, uiFromEnv } from '../src/server/ui.js';
 import { localPrincipal } from '../src/server/auth.js';
@@ -637,7 +638,7 @@ test('shutdown: a drain that times out reports it and leaves the episode pending
  * ================================================================ */
 
 test('retry: failed episodes are retried in the background until they succeed or reach the limit; retry_failed still takes those', async () => {
-  const srv = await startServer({ retryIntervalMs: 20, retryMax: 2 });
+  const srv = await startServer({ retryIntervalMs: 20, retryMax: 2, jobs: new JobQueue({ concurrency: 1 }) });
   try {
     const a = await connect(srv.base, 'tokA');
     srv.llm.failWith = 'LLM HTTP 500: upstream error';
@@ -655,10 +656,19 @@ test('retry: failed episodes are retried in the background until they succeed or
     assert.match(stats.text, /1 of them tried 2 times or more .* call retry_failed/);
     assert.deepEqual((await api(srv.base, 'GET', '/v1/status', { token: 'tokA' })).body.episodes, { failed: 1, given_up: 1 });
 
-    // one that failed once is picked up and processed once the LLM is back
+    // one that failed once is picked up and processed once the LLM is back, but not while
+    // a write of its group waits for a job slot: the retry would hold the group's lock first
     srv.llm.failWith = null;
+    srv.llm.hold();
+    const calls = srv.llm.calls;
+    await call((await connect(srv.base, 'tokB')).client, 'add_memory', { content: 'Carol works at Cyberdyne.', async: true });
+    await waitFor(() => srv.llm.calls === calls + 1);
+    await call(a.client, 'add_memory', { content: 'Dan works at Dynamics.', async: true });
     const earlier = pendingEpisode('teamA', 'Bob works at Borealis.', 'failed');
     await srv.zep.store.addEpisode(earlier);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(srv.llm.calls, calls + 1, 'teamA is left alone while its write is queued');
+    srv.llm.release();
     await waitFor(async () => (await srv.zep.store.getEpisode(earlier.uuid))?.status === 'processed');
     assert.equal((await stored())?.status, 'failed', 'the given-up one is not');
 

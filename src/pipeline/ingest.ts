@@ -7,6 +7,7 @@ import type {
   ExtractionResult,
   KnownEntity,
   KnownFact,
+  LLMCallContext,
   LLMProvider,
 } from '../provider/interfaces.js';
 import type { EntityEdge, EntityNode, EpisodicNode } from '../model/types.js';
@@ -127,6 +128,11 @@ export interface RetryOptions {
   maxAttempts?: number;
   /** at most this many, oldest first (default: all) */
   limit?: number;
+  /**
+   * Leave the episodes of a group alone when this says so. Asked again before
+   * each episode: a write may come in for its group while another is retried.
+   */
+  skipGroup?: (groupId: string) => boolean;
 }
 
 /** A manual invalidation, reopen or forget that cannot be applied, with why. */
@@ -249,24 +255,29 @@ export class IngestPipeline {
    * is the recovery path for an LLM or embedding outage. A failed retry keeps
    * the same record with a fresh error. Every retry counts as an attempt; the
    * background retry passes `maxAttempts` and `limit` to leave the episodes
-   * that keep failing alone and to take a few at a time.
+   * that keep failing alone and to take a few at a time, and `skipGroup` to
+   * stay out of the way of a user's write.
    */
   async retryFailed(
     groupId?: string,
     options: RetryOptions = {},
   ): Promise<{ retried: number; succeeded: number; stillFailing: number }> {
+    const skip = (ep: EpisodicNode) => options.skipGroup?.(ep.groupId) === true;
     const failed = (await this.store.getEpisodes(groupId))
-      .filter((e) => e.status === 'failed' && (e.attempts ?? 0) < (options.maxAttempts ?? Infinity))
+      .filter((e) => e.status === 'failed' && (e.attempts ?? 0) < (options.maxAttempts ?? Infinity) && !skip(e))
       .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime())
       .slice(0, options.limit ?? Infinity);
+    let retried = 0;
     let succeeded = 0;
     let stillFailing = 0;
     for (const ep of failed) {
+      if (skip(ep)) continue;
+      retried++;
       const res = await this.processEpisode(ep.uuid);
       if (res.status === 'failed') stillFailing++;
       else succeeded++;
     }
-    return { retried: failed.length, succeeded, stillFailing };
+    return { retried, succeeded, stillFailing };
   }
 
   /**
@@ -887,6 +898,8 @@ class EpisodeRun {
    * as a known date.
    */
   private readonly datedWhenWritten: boolean;
+  /** names the episode in the LLM provider's log lines */
+  private readonly callContext: LLMCallContext;
 
   constructor(
     private store: GraphStore,
@@ -895,6 +908,7 @@ class EpisodeRun {
     private episode: EpisodicNode,
   ) {
     this.groupId = episode.groupId;
+    this.callContext = { episodeId: episode.uuid, groupId: episode.groupId };
     this.datedWhenWritten = Math.abs(episode.validAt.getTime() - episode.createdAt.getTime()) < DAY_MS;
   }
 
@@ -973,7 +987,7 @@ class EpisodeRun {
       content,
       known.map((e) => e.name),
       knownFacts,
-      { referenceTime: this.episode.validAt, knownEntities: known },
+      { referenceTime: this.episode.validAt, knownEntities: known, context: this.callContext },
     );
   }
 
@@ -1283,6 +1297,7 @@ class EpisodeRun {
         const answer: unknown = await this.llm.detectContradiction(
           { sourceName: src.name, targetName: tgt.name, fact: text, relation, validAt, replacesPrevious: flagged },
           shown.map((f) => ({ fact: f.fact, validAt: f.validAt, invalidAt: f.invalidAt })),
+          this.callContext,
         );
         ({ ended, same: restates } = readVerdict(answer, shown));
       }

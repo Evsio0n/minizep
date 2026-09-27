@@ -8,6 +8,7 @@ import type {
   ExtractionResult,
   ExtractOptions,
   KnownFact,
+  LLMCallContext,
   LLMProvider,
 } from './interfaces.js';
 import { calendarDay, localTimeZone } from '../util/time.js';
@@ -18,18 +19,22 @@ import { join } from 'node:path';
 
 /**
  * OpenAI-compatible chat-completions client used as the graph extraction LLM.
- * Verified against DeepSeek (`api.deepseek.com`): use `deepseek-flash`, NOT
- * `deepseek-v4-pro` — the pro model is a reasoning model whose entire
- * max_tokens budget gets consumed by reasoning_content, yielding empty content.
+ * Verified against DeepSeek (`api.deepseek.com`). Both `deepseek-flash` and
+ * `deepseek-v4-pro` reason before they answer, and the reasoning counts
+ * against max_tokens: a budget spent on it yields empty or cut-off content
+ * (see chat()).
  */
 export interface LLMConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
-  /** reasoning models spend tokens before emitting content */
+  /** max_tokens of a first request; reasoning models spend tokens before emitting content (default 8000) */
   maxTokens?: number;
+  /** a reply cut off by max_tokens is asked again with the budget doubled, up to this (default 4 × maxTokens) */
+  maxTokensCap?: number;
+  /** per request (default 120000) */
   timeoutMs?: number;
-  /** retry attempts for transient failures (default 3) */
+  /** attempts in all for transient failures (default 3) */
   retries?: number;
   /** base backoff in ms, doubled per attempt (default 500) */
   backoffMs?: number;
@@ -45,7 +50,18 @@ export interface LLMConfig {
    * Turn it off for an endpoint that rejects the field.
    */
   jsonMode?: boolean;
+  /**
+   * Fields merged into every request body, for provider-specific switches
+   * such as turning reasoning off. The model, messages and max_tokens stay
+   * this client's.
+   */
+  extraBody?: Record<string, unknown>;
 }
+
+const DEFAULT_MAX_TOKENS = 8000;
+
+/** Empty content from a reply that used this share of max_tokens: the budget ran out, most likely on reasoning. */
+const NEAR_BUDGET = 0.9;
 
 type ChatMessage = { role: 'system' | 'user' | 'assistant'; content: string };
 
@@ -185,10 +201,14 @@ Return ONLY JSON: {"contradicts": true|false, "which": [numbers of the ended fac
 export class OpenAICompatLLM implements LLMProvider {
   private readonly timeZone: string;
   private readonly jsonMode: boolean;
+  private readonly maxTokens: number;
+  private readonly maxTokensCap: number;
 
   constructor(private cfg: LLMConfig) {
     this.timeZone = cfg.timeZone ?? process.env.MINIZEP_TIMEZONE ?? localTimeZone();
     this.jsonMode = cfg.jsonMode ?? envFlag('MINIZEP_LLM_JSON_MODE', true);
+    this.maxTokens = cfg.maxTokens ?? DEFAULT_MAX_TOKENS;
+    this.maxTokensCap = Math.max(cfg.maxTokensCap ?? 4 * this.maxTokens, this.maxTokens);
     // an unknown zone would fail every extraction; fail at construction instead
     try {
       formatReferenceTime(new Date(), this.timeZone);
@@ -200,50 +220,66 @@ export class OpenAICompatLLM implements LLMProvider {
   /**
    * One chat completion, with retries.
    *
-   * Two failure modes are treated as retryable because they are transient and
-   * observed in practice against DeepSeek:
-   *   - HTTP 429 / 5xx (rate limit, upstream hiccup)
-   *   - empty `content` because the reasoning budget consumed all max_tokens
+   * Transient failures are sent again as they are, after a backoff, up to
+   * `retries` attempts in all: HTTP 429 / 5xx, a network error or timeout,
+   * and empty content. A reply cut off by max_tokens is not: a reasoning
+   * model that spent the budget thinking would spend it again, so the request
+   * goes again with the budget doubled, up to maxTokensCap, and fails there.
+   * Returns the reply and the budget it took.
    */
-  private async chat(messages: ChatMessage[], maxTokens: number): Promise<string> {
+  private async chat(
+    messages: ChatMessage[],
+    maxTokens: number,
+    label: string,
+  ): Promise<{ content: string; maxTokens: number }> {
     const attempts = this.cfg.retries ?? 3;
-    let lastErr: Error | undefined;
-
-    for (let i = 0; i < attempts; i++) {
+    let failures = 0;
+    for (;;) {
       try {
-        return await this.chatOnce(messages, maxTokens);
+        return { content: await this.chatOnce(messages, maxTokens, label), maxTokens };
       } catch (err) {
-        lastErr = err as Error;
-        const retryable = /empty content|HTTP (429|5\d\d)|fetch failed|timeout|aborted/i.test(lastErr.message);
-        if (!retryable || i === attempts - 1) break;
-        const backoff = (this.cfg.backoffMs ?? 500) * 2 ** i;
-        console.error(`[minizep] LLM attempt ${i + 1}/${attempts} failed (${lastErr.message.slice(0, 80)}); retrying in ${backoff}ms`);
+        if (err instanceof BudgetExhaustedError) {
+          if (maxTokens >= this.maxTokensCap) {
+            throw new BudgetExhaustedError(
+              `${err.message}; that is the cap: raise MINIZEP_LLM_MAX_TOKENS_CAP, or turn reasoning off with MINIZEP_LLM_EXTRA_BODY`,
+            );
+          }
+          maxTokens = Math.min(maxTokens * 2, this.maxTokensCap);
+          console.error(`[minizep] LLM ${label}: ${err.message}; asking again with max_tokens=${maxTokens}`);
+          continue;
+        }
+        const e = err as Error;
+        failures++;
+        const retryable = /empty content|HTTP (429|5\d\d)|fetch failed|timeout|aborted/i.test(e.message);
+        if (!retryable || failures >= attempts) throw e;
+        const backoff = (this.cfg.backoffMs ?? 500) * 2 ** (failures - 1);
+        console.error(`[minizep] LLM attempt ${failures}/${attempts} failed (${e.message.slice(0, 80)}); retrying in ${backoff}ms`);
         await new Promise((r) => setTimeout(r, backoff));
       }
     }
-    throw lastErr;
   }
 
   /**
-   * A chat answered with one JSON object. A reply that does not parse is
-   * handed back once with the parse error; a second bad reply throws, which
-   * fails the episode like any other extraction error.
+   * A chat answered with one JSON object. A complete reply that does not
+   * parse is handed back once with the parse error, with the budget that
+   * reply took; a second bad reply throws, which fails the episode like any
+   * other extraction error. A cut-off reply never gets here (see chat()).
    */
-  private async chatJson(system: string, userPrompt: string, maxTokens: number): Promise<unknown> {
+  private async chatJson(system: string, userPrompt: string, label: string): Promise<unknown> {
     const messages: ChatMessage[] = [
       { role: 'system', content: system },
       { role: 'user', content: userPrompt },
     ];
-    const raw = await this.chat(messages, maxTokens);
+    const first = await this.chat(messages, this.maxTokens, label);
     try {
-      return parseJsonObject(raw);
+      return parseJsonObject(first.content);
     } catch (err) {
       if (!(err instanceof JsonReplyError)) throw err;
-      console.error(`[minizep] LLM reply is not valid JSON (${err.problem}); asking once more`);
+      console.error(`[minizep] LLM ${label}: reply is not valid JSON (${err.problem}); asking once more`);
       const again = await this.chat(
         [
           ...messages,
-          { role: 'assistant', content: raw },
+          { role: 'assistant', content: first.content },
           {
             role: 'user',
             content:
@@ -251,42 +287,60 @@ export class OpenAICompatLLM implements LLMProvider {
               'Return valid JSON only: the whole object, no prose, no markdown fences.',
           },
         ],
-        maxTokens,
+        first.maxTokens,
+        `${label} (repair)`,
       );
-      return parseJsonObject(again);
+      return parseJsonObject(again.content);
     }
   }
 
-  private async chatOnce(messages: ChatMessage[], maxTokens: number): Promise<string> {
-    const res = await fetch(`${this.cfg.baseUrl.replace(/\/$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${this.cfg.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: this.cfg.model,
-        messages,
-        temperature: 0,
-        max_tokens: maxTokens,
-        ...(this.jsonMode ? { response_format: { type: 'json_object' } } : {}),
-      }),
-      signal: AbortSignal.timeout(this.cfg.timeoutMs ?? 120_000),
-    });
-    if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
-    const data = (await res.json()) as {
-      choices: { message: { content?: string; reasoning_content?: string } }[];
-      usage?: { completion_tokens_details?: { reasoning_tokens?: number } };
-    };
-    const msg = data.choices?.[0]?.message;
-    const content = msg?.content ?? '';
-    if (!content.trim()) {
+  /** One request, logged in one line: what it was for, how long it took, what the budget went to. */
+  private async chatOnce(messages: ChatMessage[], maxTokens: number, label: string): Promise<string> {
+    const started = Date.now();
+    let outcome = '';
+    try {
+      const res = await fetch(`${this.cfg.baseUrl.replace(/\/$/, '')}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${this.cfg.apiKey}`,
+        },
+        body: JSON.stringify({
+          temperature: 0,
+          ...(this.jsonMode ? { response_format: { type: 'json_object' } } : {}),
+          ...this.cfg.extraBody,
+          model: this.cfg.model,
+          messages,
+          max_tokens: maxTokens,
+        }),
+        signal: AbortSignal.timeout(this.cfg.timeoutMs ?? 120_000),
+      });
+      if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
+      const data = (await res.json()) as {
+        choices?: { message?: { content?: string | null; reasoning_content?: string }; finish_reason?: string | null }[];
+        usage?: { completion_tokens?: number; completion_tokens_details?: { reasoning_tokens?: number } };
+      };
+      const choice = data.choices?.[0];
+      const finish = choice?.finish_reason ?? '?';
+      const completion = data.usage?.completion_tokens;
       const reasoning = data.usage?.completion_tokens_details?.reasoning_tokens;
-      throw new Error(
-        `empty content (reasoning_tokens=${reasoning ?? '?'}) — raise max_tokens or use a non-reasoning model`,
-      );
+      outcome = ` finish_reason=${finish} completion_tokens=${completion ?? '?'} reasoning_tokens=${reasoning ?? '?'}`;
+      const content = choice?.message?.content ?? '';
+      const spent = Math.max(completion ?? 0, reasoning ?? 0);
+      if (finish === 'length' || (!content.trim() && spent >= maxTokens * NEAR_BUDGET)) {
+        throw new BudgetExhaustedError(
+          `reply cut off by max_tokens=${maxTokens} (finish_reason=${finish}, reasoning_tokens=${reasoning ?? '?'})`,
+        );
+      }
+      if (!content.trim()) throw new Error(`empty content (reasoning_tokens=${reasoning ?? '?'})`);
+      return content;
+    } catch (err) {
+      outcome += err instanceof BudgetExhaustedError ? ' cut off' : ` failed: ${((err as Error)?.message ?? String(err)).slice(0, 120)}`;
+      throw err;
+    } finally {
+      const secs = ((Date.now() - started) / 1000).toFixed(1);
+      console.error(`[minizep] LLM ${label} ${secs}s max_tokens=${maxTokens}${outcome}`);
     }
-    return content;
   }
 
   async extract(
@@ -300,7 +354,7 @@ export class OpenAICompatLLM implements LLMProvider {
     const parsed = (await this.chatJson(
       EXTRACTION_SYSTEM,
       buildExtractionPrompt(content, knownEntityNames, knownFacts, opts, this.timeZone),
-      this.cfg.maxTokens ?? 8000,
+      callLabel('extract', options.context),
     )) as {
       entities?: { name: string; labels?: string[]; summary?: string }[];
       facts?: {
@@ -391,6 +445,7 @@ export class OpenAICompatLLM implements LLMProvider {
   async detectContradiction(
     candidate: ContradictionCandidate,
     existing: ContradictionExisting[],
+    context?: LLMCallContext,
   ): Promise<ContradictionVerdict> {
     if (existing.length === 0) return { ended: [], same: [] };
     const list = existing.map((e, i) => `${i + 1}. ${e.fact}${since(e.validAt, this.timeZone)}`).join('\n');
@@ -398,7 +453,7 @@ export class OpenAICompatLLM implements LLMProvider {
       CONTRADICTION_SYSTEM,
       `New fact${candidate.replacesPrevious ? ' (it replaces an earlier value)' : ''}: ` +
         `${candidate.fact}${since(candidate.validAt, this.timeZone)}\n\nExisting facts:\n${list}`,
-      this.cfg.maxTokens ?? 8000,
+      callLabel('judge', context),
     );
     const same = parseSame(parsed, existing.length);
     return { ended: parseContradiction(parsed, existing.length), ...(same ? { same } : {}) };
@@ -508,6 +563,20 @@ export function formatReferenceTime(d: Date, timeZone = 'UTC'): string {
   );
 }
 
+/** "extract episode=0760aeb1 group=hanja-asr": what a call was for, in the log. */
+function callLabel(kind: string, context?: LLMCallContext): string {
+  const parts = [kind];
+  if (context?.episodeId) parts.push(`episode=${context.episodeId.slice(0, 8)}`);
+  if (context?.groupId) parts.push(`group=${context.groupId}`);
+  return parts.join(' ');
+}
+
+/**
+ * A reply cut off by max_tokens, or with no content after using up nearly all
+ * of it: a larger budget may finish it, the same request would not.
+ */
+class BudgetExhaustedError extends Error {}
+
 /** A reply that holds no parseable JSON object; `problem` says why, without the reply. */
 class JsonReplyError extends Error {
   constructor(
@@ -547,9 +616,11 @@ function toDate(v: string | null | undefined): Date | undefined {
  * MINIZEP_REQUIRE_REAL_PROVIDERS=1 in production so a missing key is fatal.
  */
 export function buildLLM(): { llm: LLMProvider; label: string } {
+  // outside the try: a bad setting fails the start, it is no reason to fall back
+  const settings = llmSettingsFromEnv();
   let cfg: LLMConfig;
   try {
-    cfg = loadLLMConfigSync();
+    cfg = { ...credentialsSync(), ...settings };
   } catch (err) {
     const message = (err as Error).message;
     if (process.env.MINIZEP_REQUIRE_REAL_PROVIDERS === '1') {
@@ -572,10 +643,60 @@ export function buildLLM(): { llm: LLMProvider; label: string } {
   return { llm: new OpenAICompatLLM(cfg), label: `${cfg.model} @ ${cfg.baseUrl}` };
 }
 
+/**
+ * The request settings from the environment: MINIZEP_LLM_MAX_TOKENS,
+ * MINIZEP_LLM_MAX_TOKENS_CAP, MINIZEP_LLM_TIMEOUT_MS, MINIZEP_LLM_RETRIES and
+ * MINIZEP_LLM_EXTRA_BODY (a JSON object). A value that is set but unusable
+ * throws, so a typo fails the start instead of running with the default.
+ */
+export function llmSettingsFromEnv(): Pick<LLMConfig, 'maxTokens' | 'maxTokensCap' | 'timeoutMs' | 'retries' | 'extraBody'> {
+  // each name spelled out at its read, where deploy/test/install.test.sh looks for them
+  const positive = (name: string, value: string | undefined): number | undefined => {
+    const raw = value?.trim();
+    if (!raw) return undefined;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < 1) throw new Error(`${name} must be a positive integer, got "${raw}"`);
+    return n;
+  };
+  const maxTokens = positive('MINIZEP_LLM_MAX_TOKENS', process.env.MINIZEP_LLM_MAX_TOKENS);
+  const maxTokensCap = positive('MINIZEP_LLM_MAX_TOKENS_CAP', process.env.MINIZEP_LLM_MAX_TOKENS_CAP);
+  if (maxTokensCap !== undefined && maxTokensCap < (maxTokens ?? DEFAULT_MAX_TOKENS)) {
+    throw new Error(
+      `MINIZEP_LLM_MAX_TOKENS_CAP (${maxTokensCap}) is below MINIZEP_LLM_MAX_TOKENS (${maxTokens ?? DEFAULT_MAX_TOKENS})`,
+    );
+  }
+  let extraBody: Record<string, unknown> | undefined;
+  const raw = process.env.MINIZEP_LLM_EXTRA_BODY?.trim();
+  if (raw) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      throw new Error(`MINIZEP_LLM_EXTRA_BODY is not valid JSON: ${(err as Error).message}`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('MINIZEP_LLM_EXTRA_BODY must be a JSON object');
+    }
+    extraBody = parsed as Record<string, unknown>;
+  }
+  return {
+    maxTokens,
+    maxTokensCap,
+    timeoutMs: positive('MINIZEP_LLM_TIMEOUT_MS', process.env.MINIZEP_LLM_TIMEOUT_MS),
+    retries: positive('MINIZEP_LLM_RETRIES', process.env.MINIZEP_LLM_RETRIES),
+    extraBody,
+  };
+}
+
 /** Env-only config, so it works where the developer's dotfiles do not exist. */
 export function loadLLMConfigSync(
   model = process.env.MINIZEP_LLM_MODEL ?? 'deepseek-flash',
 ): LLMConfig {
+  return { ...credentialsSync(model), ...llmSettingsFromEnv() };
+}
+
+/** The endpoint, key and model: explicit env vars, else the machine's provider credentials. */
+function credentialsSync(model = process.env.MINIZEP_LLM_MODEL ?? 'deepseek-flash'): LLMConfig {
   const apiKey = process.env.MINIZEP_LLM_API_KEY;
   const baseUrl = process.env.MINIZEP_LLM_BASE_URL;
   if (apiKey && baseUrl) return { baseUrl, apiKey, model };
@@ -600,9 +721,10 @@ export async function loadLLMConfig(
   provider = process.env.MINIZEP_LLM_PROVIDER ?? 'deepseek',
   model = process.env.MINIZEP_LLM_MODEL ?? 'deepseek-flash',
 ): Promise<LLMConfig> {
+  const settings = llmSettingsFromEnv();
   const envKey = process.env.MINIZEP_LLM_API_KEY;
   const envBase = process.env.MINIZEP_LLM_BASE_URL;
-  if (envKey && envBase) return { baseUrl: envBase, apiKey: envKey, model };
+  if (envKey && envBase) return { baseUrl: envBase, apiKey: envKey, model, ...settings };
 
   const { readFile } = await import('node:fs/promises');
   const { homedir } = await import('node:os');
@@ -614,7 +736,7 @@ export async function loadLLMConfig(
   if (!cfg?.apiKey || !cfg?.baseUrl) {
     throw new Error(`provider "${provider}" not found in ~/.openclaw/openclaw.json`);
   }
-  return { baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model };
+  return { baseUrl: cfg.baseUrl, apiKey: cfg.apiKey, model, ...settings };
 }
 
 // re-exported for symmetry with the embedders
