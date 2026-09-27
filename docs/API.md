@@ -57,9 +57,9 @@ every request needs a token.
 Every operation works inside exactly one memory group, chosen by the optional `group_id`
 parameter (in the JSON body for `POST`, in the query string for `GET`):
 
-1. absent or empty: the token's default group (an env token's first group; a user's token: its
-   own default group, else its user's); when the caller cannot read it, **403**
-   `{"error":"no default group: pass group_id"}`;
+1. absent or empty: the group the connection is bound to (below), else the token's default group
+   (an env token's first group; a user's token: its own default group, else its user's); when the
+   caller cannot read it, **403** `{"error":"no default group: pass group_id"}`;
 2. a group the caller may read: that group;
 3. anything else: **403** `{"error":"group not permitted for this token"}` (an MCP tool returns
    the same message as a tool error, `isError: true`). Nothing is read or written.
@@ -73,6 +73,15 @@ Names match exactly (case and whitespace included); a user's grant may also cove
 starting with a prefix (`bob/*`). Records are addressed inside the resolved
 group: an episode, fact or job id that belongs to another group answers **404**, exactly like an
 id that does not exist, so a token cannot probe other tenants.
+
+A connection can be bound to one group, e.g. the project an agent works on: `/mcp?group=<g>`, or
+the header `X-Minizep-Group: <g>` on `/mcp` and `/v1` (the query wins when both are given). That
+group becomes the default of the request, and so of an MCP session, whose requests all carry the
+same URL; `group_id` still names any other group the caller may use. A name the caller cannot read
+(or empty, over 256 characters, or with `*`) is refused at once with **403**
+`group "<g>" not permitted for this token` (on `/mcp` as a JSON-RPC error body, so at
+`initialize`), never ignored. See [ACCESS.md](ACCESS.md#binding-a-connection-to-a-group) for
+client configs.
 
 The stdio server (`minizep-mcp`) serves one local user and accepts any `group_id`
 (default: `MINIZEP_GROUP`, else `default`).
@@ -100,7 +109,7 @@ Every error is `{"error": "<message>"}`:
 |--------|---------|
 | 400 | invalid JSON, body not an object, a missing/invalid field, bad timestamp, id prefix too short or ambiguous; a new token that would reach none of its user's groups, or whose `default_group` it cannot read; a workspace default group over 254 characters ([ACCESS.md](ACCESS.md)) |
 | 401 | missing bearer token; (UI) `login required` |
-| 403 | invalid token; group not permitted for this token; no default group; read-only access to the group; not an owner of the group or not an admin ([ACCESS.md](ACCESS.md)) |
+| 403 | invalid token; group not permitted for this token (also a bound group, `?group=` or `X-Minizep-Group`); no default group; read-only access to the group; not an owner of the group or not an admin ([ACCESS.md](ACCESS.md)) |
 | 404 | unknown route, or no such record in the resolved group |
 | 405 | route exists with another method (`Allow` header lists it) |
 | 409 | the request conflicts with the record's current state (fact already ended, already retracted, end before start, nothing to reopen; episode already forgotten; user name taken; a new user's workspace group already has members) |
@@ -400,13 +409,14 @@ The groups the caller may open, most recent episode first, with its role in each
 `writer` or `owner`):
 
 ```json
-{ "default_group": "teamA",
+{ "default_group": "teamA", "bound_group": null,
   "groups": [ { "group_id": "teamA", "role": "writer", "entities": 4, "facts": 2, "active_facts": 1,
                 "episodes": 3, "failed_episodes": 0, "last_episode_at": "2026-09-25T06:14:54.414Z" } ] }
 ```
 
-A token lists the groups it holds by name (empty ones included), every group holding data that a
-pattern it holds matches (`bob/*`), and its default group when it may read it. A caller allowed
+`bound_group` is the group of the `X-Minizep-Group` header (then also `default_group`), else
+`null`. A token lists the groups it holds by name (empty ones included), every group holding data
+that a pattern it holds matches (`bob/*`), and its default group when it may read it. A caller allowed
 any group (anonymous mode, an admin's unrestricted token, or the UI with `MINIZEP_UI_GROUPS=*`)
 lists every group that holds an episode or an entity.
 
@@ -659,7 +669,8 @@ A model that connects needs no client-side instructions:
 - The instructions end with the groups the connection may use and its role in each (its token's
   groups, or "any group" for stdio and anonymous mode), name the read-only ones, and tell the model to
   pass `group_id` for a project's own group and to call `list_groups` before concluding the default
-  group has nothing.
+  group has nothing. On a [bound](#groups) connection they begin with
+  `This connection is bound to group "<g>"`.
 - A connection that may write nowhere (every group read-only) is not offered the write tools
   (`add_memory`, `invalidate_fact`, `reopen_fact`, `forget_episode`, `retry_failed`). A session
   follows grant and token changes at its next request: a revoked token gets 403, a group that became
@@ -709,7 +720,8 @@ prefix is what `invalidate_fact` and `reopen_fact` take. `ep` lists the first th
 (8-character prefixes, oldest first, `+N` for the rest): what `get_episode` and `forget_episode`
 take, and the only way to them for a client that shows the model the text alone.
 
-`minizep-proxy` forwards the instructions, the tool list and its annotations as they are.
+`minizep-proxy` forwards the instructions, the tool list and its annotations as they are, and binds
+a group when `MINIZEP_HTTP_URL` ends in `?group=<g>`.
 
 ### stdio clients
 

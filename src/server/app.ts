@@ -18,7 +18,7 @@ import type { Minizep } from '../index.js';
 import { JobQueue } from '../jobs/queue.js';
 import { MemoryAccessStore, type AccessStore } from '../store/access-store.js';
 import { AccessControl, accessShapes } from './access.js';
-import { isAnonymous, type Principal } from './auth.js';
+import { bindGroup, isAnonymous, type Principal } from './auth.js';
 import { bindOnce, listenWithRetry, parseHosts, type RetryOptions, type RetryingListen } from './listen.js';
 import { createRestHandler, parse, readJsonBody, sendJson } from './rest.js';
 import { MemoryService, type SnapshotWriter } from './service.js';
@@ -177,7 +177,7 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
       const found = sessions.acquire(sessionId, principal.id, req.method !== 'GET');
       // 404 tells a client to start a new session; 403: someone else's session
       if (!found.ok) return sendJson(res, found.status, rpcError(found.error, found.status === 404 ? -32001 : -32000));
-      // the same token, but its grants may have changed since the session began
+      // the same token (and URL, so the same bound group), but its grants may have changed since the session began
       found.handle.principal = principal;
       res.on('close', found.release);
       await found.handle.transport.handleRequest(req, res, body);
@@ -225,8 +225,20 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
       return sendJson(res, auth.status, { error: auth.error }, auth.status === 401 ? { 'www-authenticate': 'Bearer' } : {});
     }
     if (closing) return sendJson(res, 503, { error: 'server is shutting down' });
-    if (isRest) return rest(req, res, url, auth.principal);
-    return handleMcp(req, res, auth.principal);
+    // bind the connection to a project's group (auth.bindGroup): /mcp?group=, else the
+    // X-Minizep-Group header (clients that cannot change the URL, and REST); every
+    // request of an MCP session carries the same URL, so the binding holds for it
+    const header = req.headers['x-minizep-group'];
+    const group = (isMcp ? url.searchParams.get('group') : null) ?? (typeof header === 'string' ? header : null);
+    let principal = auth.principal;
+    if (group !== null) {
+      const bound = bindGroup(principal, group);
+      const error = `group "${group}" not permitted for this token`;
+      if (!bound) return sendJson(res, 403, isMcp ? rpcError(error) : { error });
+      principal = bound;
+    }
+    if (isRest) return rest(req, res, url, principal);
+    return handleMcp(req, res, principal);
   }
 
   /**

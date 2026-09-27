@@ -38,33 +38,42 @@ export const SERVER_OPTIONS = { instructions: INSTRUCTIONS };
  * The instructions for one connection: the shared text plus the groups this
  * caller may use and its role in each, so a model working on some project
  * finds that project's memory instead of searching only the default group,
- * and does not try to write where it may only read.
+ * and does not try to write where it may only read. A connection bound to a
+ * project's group (auth.bindGroup) says so first.
  */
 export function instructionsFor(p: Principal): string {
   const grants = effectiveGrants(p);
+  const bound = p.boundGroup;
   let groups: string;
   if (unrestricted(p)) {
     const readOnly = p.restriction?.role === 'reader' ? ' (read-only)' : '';
-    groups = `Groups: this connection may use any group${readOnly}; the default is "${p.defaultGroup}". Call list_groups to see them.`;
+    const fallback = bound ? '' : `; the default is "${p.defaultGroup}"`;
+    groups = `Groups: this connection may use any group${readOnly}${fallback}. Call list_groups to see them.`;
   } else if (grants.length === 0) {
     groups = 'This connection may use no group yet: ask the user to be given access to one.';
   } else {
-    const named = grants.map((g) => `${g.pattern} (${g.role}${g.pattern === p.defaultGroup ? ', default' : ''})`);
+    const named = grants.map((g) => `${g.pattern} (${g.role}${usedMark(g.pattern, p.defaultGroup, bound)})`);
     groups = `Groups this connection may use: ${named.join(', ')}.`;
     if (grants.some((g) => g.pattern.endsWith('*'))) groups += ' A name ending in * stands for every group starting with it.';
     if (!permits(p, p.defaultGroup)) groups += ' There is no default group: pass group_id on every call.';
-    else if (!grants.some((g) => g.pattern === p.defaultGroup)) groups += ` The default is "${p.defaultGroup}".`;
+    else if (!bound && !grants.some((g) => g.pattern === p.defaultGroup)) groups += ` The default is "${p.defaultGroup}".`;
     const readOnly = grants.filter((g) => g.role === 'reader').map((g) => g.pattern);
     if (readOnly.length === grants.length) groups += ' All of them are read-only: search, never write.';
     else if (readOnly.length) groups += ` Read-only (search them, never write there): ${readOnly.join(', ')}.`;
   }
-  return [
-    INSTRUCTIONS,
-    '',
-    `${groups} Without group_id every tool uses the default group. When you work on a project or topic that has ` +
-      'its own group, pass that group_id on every call; if the default group has nothing about it, call ' +
-      'list_groups and search the matching group before concluding the memory is empty.',
-  ].join('\n');
+  const usage = bound
+    ? `This connection is bound to group "${bound}": without group_id every tool uses it. ${groups} Pass ` +
+      `group_id only to reach another group; if "${bound}" has nothing about what you look for, call ` +
+      'list_groups and search the matching group before concluding the memory is empty.'
+    : `${groups} Without group_id every tool uses the default group. When you work on a project or topic that ` +
+      'has its own group, pass that group_id on every call; if the default group has nothing about it, call ' +
+      'list_groups and search the matching group before concluding the memory is empty.';
+  return [INSTRUCTIONS, '', usage].join('\n');
+}
+
+/** How a list of groups marks the one used without group_id: its default, or the bound group. */
+function usedMark(group: string, defaultGroup: string, bound: string | null | undefined): string {
+  return group !== defaultGroup ? '' : bound ? ', bound' : ', default';
 }
 
 /** McpServer options for one caller. */
@@ -259,11 +268,12 @@ function withGroupHints(server: McpServer, principal: () => Principal): McpServe
             .filter((g) => g !== p.defaultGroup)
             .join(', ');
       if (!others) return result;
+      const which = `the ${p.boundGroup ? 'bound' : 'default'} group "${p.defaultGroup}"`;
       const hint =
         name === 'add_memory'
-          ? `(no group_id: stored in the default group "${p.defaultGroup}". This connection also has ${others}; ` +
+          ? `(no group_id: stored in ${which}. This connection also has ${others}; ` +
             'if this belongs to one of them, call forget_episode on this episode and add it again with that group_id.)'
-          : `(no group_id: this used the default group "${p.defaultGroup}". This connection can also use ${others}; ` +
+          : `(no group_id: this used ${which}. This connection can also use ${others}; ` +
             'pass group_id to look there, or call list_groups.)';
       return { ...result, content: [{ ...first, text: `${first.text ?? ''}\n${hint}` }, ...result.content!.slice(1)] };
     });
@@ -534,7 +544,7 @@ export function registerTools(target: McpServer, ctx: ToolContext): void {
         if (!r.groups.length) return ok('no groups hold data yet', r);
         const lines = r.groups.map(
           (g) =>
-            `${g.group_id} (${g.role}${g.group_id === r.default_group ? ', default' : ''}): ${g.active_facts} current facts, ` +
+            `${g.group_id} (${g.role}${usedMark(g.group_id, r.default_group, r.bound_group)}): ${g.active_facts} current facts, ` +
             `${g.facts} in all, ${g.episodes} episodes${g.last_episode_at ? `, last ${g.last_episode_at.slice(0, 10)}` : ''}`,
         );
         return ok(lines.join('\n'), r);

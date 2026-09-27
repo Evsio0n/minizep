@@ -99,11 +99,13 @@ export async function startServer(
   };
 }
 
+/** An MCP client of `base`; `path` may bind a group (`/mcp?group=g`). */
 export async function connect(
   base: string,
   token?: string,
+  path = '/mcp',
 ): Promise<{ client: Client; transport: StreamableHTTPClientTransport }> {
-  const transport = new StreamableHTTPClientTransport(new URL(`${base}/mcp`), {
+  const transport = new StreamableHTTPClientTransport(new URL(`${base}${path}`), {
     requestInit: token ? { headers: { authorization: `Bearer ${token}` } } : {},
   });
   const client = new Client({ name: 'minizep-test', version: '1.0.0' });

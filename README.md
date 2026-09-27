@@ -127,6 +127,12 @@ curl localhost:8787/health                              # 只返回 {"ok":true}
 每个 group 可以只读、可写或可管理成员；
 MCP 会话绑定创建它的 token，别的 token 拿着这个会话 id 会得到 403。
 
+一个项目有自己的 group 时，把连接绑定到它：`/mcp?group=hanja-asr`（改不了 URL 的客户端用请求头
+`X-Minizep-Group`，两者都给时以 URL 为准；REST 也接受这个请求头）。绑定只改默认 group，`group_id` 照样能用
+token 允许的其他 group；token 读不了的 group 连接时直接 403 `group "<g>" not permitted for this token`，
+不会悄悄退回 token 的默认 group。Claude Code 的 `.mcp.json`、Codex 的 `.codex/config.toml` 写法见
+[docs/ACCESS.md](docs/ACCESS.md#binding-a-connection-to-a-group)。
+
 **stdio 桥接 （客户端只支持 stdio，但要共享同一份图谱）**：
 
 ```json
@@ -138,7 +144,7 @@ MCP 会话绑定创建它的 token，别的 token 拿着这个会话 id 会得�
 ```
 
 代理把请求原样转发给 HTTP 服务，所以所有客户端看到的是同一份记忆，token 决定能用哪些 group；
-新增工具时这个桥不需要跟着改。
+新增工具时这个桥不需要跟着改。要绑定 group，就把 `?group=<g>` 加在 `MINIZEP_HTTP_URL` 上。
 
 ### 异步摄取
 
@@ -252,7 +258,7 @@ npm run build
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `MINIZEP_DB` | `~/.minizep/graph.json` | 快照路径 |
-| `MINIZEP_GROUP` | `default` | stdio 模式的默认 group（HTTP 模式由 token 决定） |
+| `MINIZEP_GROUP` | `default` | stdio 模式的默认 group（HTTP 模式由 token 或连接绑定的 group 决定） |
 | `MINIZEP_TOKENS` | — | HTTP 模式的环境变量 token：`token:groupA\|groupB,...`，对列出的 group 可读写；用户和他们的 token 在数据库里（[docs/ACCESS.md](docs/ACCESS.md)） |
 | `MINIZEP_UI` | — | `1` = 在 `/ui` 提供 Web UI，用 token 登录（HttpOnly 会话 cookie） |
 | `MINIZEP_UI_SESSION_DAYS` | `30` | UI 登录的有效天数 |

@@ -38,7 +38,8 @@ use). A server without a database keeps them in memory only: they are gone when 
   the first exact group name (no `*`) of its `groups` that it can read as its `default_group`, or
   none when there is no such name. This is checked when the token is made, not after later grant
   changes. The first token of a new user is not narrowed.
-- **Default group** (used when a request names none): the token's, else its user's. When the
+- **Default group** (used when a request names none): the group the connection is bound to
+  ([below](#binding-a-connection-to-a-group)), else the token's, else its user's. When the
   caller cannot read it, a request without `group_id` fails with 403
   `no default group: pass group_id`.
 - **Env tokens** (`MINIZEP_TOKENS`): writer on exactly the groups they list, the first being the
@@ -86,6 +87,52 @@ curl -X POST -H "Authorization: Bearer $BOB" -H 'Content-Type: application/json'
 ```
 
 Group names in a path are URL-encoded (`/` is `%2F`).
+
+## Binding a connection to a group
+
+A token has one default group, but an agent often works on a project that has its own
+(`hanja-asr`). Without `group_id` it then searches the token's default, finds nothing and
+concludes the memory is empty. Binding the connection sets the default per project, without a
+token per project:
+
+- `/mcp?group=<g>` (URL-encoded), or the header `X-Minizep-Group: <g>` for clients that cannot
+  change the URL (a header carries ASCII only); when both are given the query wins. `/v1` takes
+  the header.
+- `<g>` must be a group the token can at least read. Otherwise the request is refused with 403
+  `group "<g>" not permitted for this token` (at `initialize` for MCP), never served from the
+  token's default instead.
+- Only the default changes: `group_id` still reaches every other group the token may use, and
+  its rights stay the same. The MCP instructions begin the groups part with
+  `This connection is bound to group "<g>"`, a call without `group_id` says it used the bound
+  group, and `list_groups` marks the group `bound`.
+
+Put it in the project's own client config, with the token in an environment variable (never in
+the repository). Claude Code, `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "minizep": {
+      "type": "http",
+      "url": "http://127.0.0.1:8787/mcp?group=hanja-asr",
+      "headers": { "Authorization": "Bearer ${MINIZEP_TOKEN}" }
+    }
+  }
+}
+```
+
+Codex, the project's `.codex/config.toml` (the whole table, rather than relying on how it merges
+with `~/.codex/config.toml`):
+
+```toml
+[mcp_servers.minizep]
+url = "http://127.0.0.1:8787/mcp?group=hanja-asr"
+bearer_token_env_var = "MINIZEP_TOKEN"
+```
+
+The stdio proxy sends the query along: `MINIZEP_HTTP_URL=http://127.0.0.1:8787/mcp?group=hanja-asr`.
+A binding is a default, not a limit: to confine an agent to one group, give it a narrowed token
+(`token create <user> --groups hanja-asr --default-group hanja-asr`).
 
 ## CLI: minizep-admin
 

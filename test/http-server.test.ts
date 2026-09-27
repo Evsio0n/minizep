@@ -110,7 +110,7 @@ test('security: every tool that takes group_id refuses a group the token does no
   }
 });
 
-test('security: a token with several groups defaults to the first and may name the others', async () => {
+test('security: a token with several groups defaults to the first, may name the others or be bound to one', async () => {
   const srv = await startServer();
   try {
     const c = await connect(srv.base, 'tokC');
@@ -127,7 +127,21 @@ test('security: a token with several groups defaults to the first and may name t
     const a = await connect(srv.base, 'tokA');
     assert.doesNotMatch((await call(a.client, 'add_memory', { content: 'Ann works at Amber.' })).text, /no group_id/);
     assert.equal((await call(c.client, 'list_episodes', { group_id: 'teamA' })).isError, true);
-    assert.equal((await srv.zep.store.getEpisodes('shared')).length, 1);
+    // a connection bound to the project's group (/mcp?group=) uses it without group_id, and says so
+    const bound = await connect(srv.base, 'tokC', '/mcp?group=shared');
+    assert.match(bound.client.getInstructions() ?? '', /^This connection is bound to group "shared"/m);
+    const there = await call(bound.client, 'add_memory', { content: 'Eve works at Ember.' });
+    assert.equal(there.structured.group_id, 'shared');
+    assert.match(there.text, /stored in the bound group "shared"\. This connection also has teamC;/);
+    assert.match((await call(bound.client, 'list_groups')).text, /^shared \(writer, bound\)/m);
+    const rest = await rawRequest(srv.base, 'GET', '/v1/groups', { authorization: 'Bearer tokC', 'x-minizep-group': 'shared' });
+    assert.deepEqual([rest.status, rest.body.default_group, rest.body.bound_group], [200, 'shared', 'shared']);
+    // a group the token does not hold is refused at initialize, never ignored
+    await assert.rejects(
+      connect(srv.base, 'tokC', '/mcp?group=teamA'),
+      (err: unknown) => (err as StreamableHTTPError).code === 403 && /group \\"teamA\\" not permitted for this token/.test(String(err)),
+    );
+    assert.equal((await srv.zep.store.getEpisodes('shared')).length, 2);
   } finally {
     await srv.close();
   }

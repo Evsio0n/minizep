@@ -911,7 +911,7 @@ export class MemoryService {
       (a, b) =>
         cmp(b.last_episode_at ?? '', a.last_episode_at ?? '') || cmp(a.group_id, b.group_id),
     );
-    return { default_group: p.defaultGroup, groups: rows };
+    return { default_group: p.defaultGroup, bound_group: p.boundGroup ?? null, groups: rows };
   }
 
   /** Server details for an authenticated caller (what /health used to expose). */

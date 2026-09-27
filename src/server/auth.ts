@@ -55,6 +55,8 @@ export interface Principal {
   /** the access-store token (tk_...) the request came with */
   tokenId?: string;
   restriction?: Restriction;
+  /** the group the connection was bound to (see bindGroup); then also its defaultGroup */
+  boundGroup?: string;
 }
 
 export type AuthResult =
@@ -209,6 +211,19 @@ export function roleIn(p: Principal, group: string): Role | undefined {
   const r = p.restriction;
   if (r?.groups && !r.groups.some((pattern) => matchesPattern(pattern, group))) return undefined;
   return lower(role, r?.role);
+}
+
+/**
+ * The caller bound to `group` for one connection (`/mcp?group=`, the
+ * X-Minizep-Group header): an agent working on a project whose token defaults
+ * elsewhere otherwise searches the wrong group and finds "no memory". Only the
+ * default changes; the id stays (sessions keep working) and so does what it
+ * may name with group_id. Undefined for a name that is not a group, or one it
+ * cannot read: the caller refuses the request rather than fall back silently.
+ */
+export function bindGroup(p: Principal, group: string): Principal | undefined {
+  if (!group || group.length > 256 || group.includes('*') || !roleIn(p, group)) return undefined;
+  return { ...p, defaultGroup: group, boundGroup: group };
 }
 
 export function permits(p: Principal, group: string, need: Need = 'read'): boolean {

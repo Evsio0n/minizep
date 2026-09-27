@@ -245,7 +245,9 @@ claude mcp add --transport http minizep http://100.64.0.10:8787/mcp \
 }
 ```
 
-两种方式看到的是同一份图谱，能用哪些 group 由 token 决定。
+两种方式看到的是同一份图谱，能用哪些 group 由 token 决定。项目有自己的 group 时，在地址后加
+`?group=<group>`（代理加在 `MINIZEP_HTTP_URL` 上），不传 `group_id` 的调用就用它，见
+[ACCESS.md](ACCESS.md#binding-a-connection-to-a-group)。
 
 客户端里不用另写使用说明：服务在 `initialize` 时返回 `instructions`（先查再答、一件事一次
 `add_memory`、用户纠正时当场修），模型可以调用 `memory_guide` 读完整方法，即
