@@ -77,6 +77,14 @@ export interface ExtractOptions {
    * summaries, so the LLM can return an updated summary that keeps them.
    */
   knownEntities?: KnownEntity[];
+  /** the episode the call is for, for the provider's log */
+  context?: LLMCallContext;
+}
+
+/** The episode and group an LLM call works for; only used to label log lines. */
+export interface LLMCallContext {
+  episodeId?: string;
+  groupId?: string;
 }
 
 export interface ExtractionResult {
@@ -138,6 +146,7 @@ export interface LLMProvider {
   detectContradiction(
     candidate: ContradictionCandidate,
     existing: ContradictionExisting[],
+    context?: LLMCallContext,
   ): Promise<number[] | ContradictionVerdict>;
 }
 

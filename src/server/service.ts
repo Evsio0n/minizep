@@ -455,13 +455,24 @@ export class MemoryService {
    * One pass of the background retry, over every group: the oldest failed
    * episodes tried fewer than `retryMax` times, at most `batch` of them, each
    * through the group's lock like any processing. A pass while another is
-   * still running does nothing.
+   * still running does nothing. A group with a user's write queued or running
+   * is left for a later pass: a retry holds the group's lock for as long as its
+   * LLM calls take, and the write would wait behind it.
    */
   async retrySweep(batch = RETRY_BATCH): Promise<{ retried: number; succeeded: number; still_failing: number }> {
     if (this.sweeping) return { retried: 0, succeeded: 0, still_failing: 0 };
     this.sweeping = true;
     try {
-      const r = await this.track(this.zep.ingest.retryFailed(undefined, { maxAttempts: this.retryMax, limit: batch }));
+      const r = await this.track(
+        this.zep.ingest.retryFailed(undefined, {
+          maxAttempts: this.retryMax,
+          limit: batch,
+          skipGroup: (group) => {
+            const { queued, running } = this.jobs.statsFor((j) => j.group === group);
+            return queued + running > 0;
+          },
+        }),
+      );
       if (r.retried) this.persistence?.schedule(this.zep);
       return { retried: r.retried, succeeded: r.succeeded, still_failing: r.stillFailing };
     } finally {

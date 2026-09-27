@@ -4,12 +4,13 @@ import { Minizep, OpenAICompatLLM, FallbackEmbedder, MockLLMProvider } from '../
 import { buildExtractionPrompt, buildLLM, formatReferenceTime, parseContradiction } from '../src/provider/openai-llm.js';
 import { HashEmbedder, type Embedder } from '../src/provider/interfaces.js';
 
-type ChatBody = { messages: { role: string; content: string }[]; response_format?: unknown };
+type ChatBody = { messages: { role: string; content: string }[]; response_format?: unknown; max_tokens?: number; thinking?: unknown };
 
 /**
  * Replaces global fetch with a chat-completions stub for the duration of `fn`.
  * `reply` sees the parsed request body and returns the assistant's content
- * (a string as it is, anything else as JSON). Nothing leaves the process.
+ * (a string as it is, anything else as JSON) or the whole Response. Nothing
+ * leaves the process.
  */
 async function withChatStub<T>(reply: (body: ChatBody) => unknown, fn: (requests: ChatBody[]) => Promise<T>): Promise<T> {
   const requests: ChatBody[] = [];
@@ -18,6 +19,7 @@ async function withChatStub<T>(reply: (body: ChatBody) => unknown, fn: (requests
     const body = JSON.parse(String(init?.body));
     requests.push(body);
     const answer = reply(body);
+    if (answer instanceof Response) return answer;
     const content = typeof answer === 'string' ? answer : JSON.stringify(answer);
     return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
   }) as typeof fetch;
@@ -139,8 +141,8 @@ test('provider: start dates are shown as calendar days of the configured zone, l
   );
 });
 
-test('provider: buildLLM fails on an invalid MINIZEP_TIMEZONE instead of falling back to the mock extractor', () => {
-  const keys = ['MINIZEP_LLM_API_KEY', 'MINIZEP_LLM_BASE_URL', 'MINIZEP_TIMEZONE', 'MINIZEP_REQUIRE_REAL_PROVIDERS'] as const;
+test('provider: buildLLM fails on an invalid MINIZEP_TIMEZONE or MINIZEP_LLM_EXTRA_BODY instead of falling back to the mock extractor', () => {
+  const keys = ['MINIZEP_LLM_API_KEY', 'MINIZEP_LLM_BASE_URL', 'MINIZEP_TIMEZONE', 'MINIZEP_REQUIRE_REAL_PROVIDERS', 'MINIZEP_LLM_EXTRA_BODY'] as const;
   const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
   try {
     process.env.MINIZEP_LLM_API_KEY = 'test';
@@ -149,6 +151,9 @@ test('provider: buildLLM fails on an invalid MINIZEP_TIMEZONE instead of falling
     process.env.MINIZEP_TIMEZONE = 'Asia/Shanghia';
     assert.throws(() => buildLLM(), /invalid time zone "Asia\/Shanghia"/);
     process.env.MINIZEP_TIMEZONE = 'Asia/Shanghai';
+    process.env.MINIZEP_LLM_EXTRA_BODY = '{thinking: off}';
+    assert.throws(() => buildLLM(), /MINIZEP_LLM_EXTRA_BODY is not valid JSON/);
+    process.env.MINIZEP_LLM_EXTRA_BODY = '{"thinking": {"type": "disabled"}}';
     assert.ok(buildLLM().llm instanceof OpenAICompatLLM);
   } finally {
     for (const k of keys) {
@@ -211,7 +216,7 @@ test('provider: detectContradiction uses its own prompt and returns the indexes 
 });
 
 test('provider: JSON mode is asked for, and a reply that does not parse is sent back once before the call fails', async () => {
-  let replies = ['{"entities": [}', '{"entities":[{"name":"Alice","labels":["Person"],"summary":"Engineer."}]}'];
+  let replies: unknown[] = ['{"entities": [}', '{"entities":[{"name":"Alice","labels":["Person"],"summary":"Engineer."}]}'];
   await withChatStub(
     () => replies.shift() ?? 'unused',
     async (requests) => {
@@ -233,6 +238,25 @@ test('provider: JSON mode is asked for, and a reply that does not parse is sent 
       );
       assert.equal(requests.length, 4);
       assert.match(requests[3].messages[3].content, /not valid JSON: no JSON object\./);
+
+      // a reply cut off by max_tokens (the reasoning took the budget) is no reply to repair:
+      // the same question goes again with the budget doubled, with the extra body fields
+      const cutOff = {
+        choices: [{ message: { content: '{"entities":[{"name":"Al' }, finish_reason: 'length' }],
+        usage: { completion_tokens: 8000, completion_tokens_details: { reasoning_tokens: 7400 } },
+      };
+      replies = [new Response(JSON.stringify(cutOff)), '{"entities":[{"name":"Alice","labels":["Person"],"summary":"Engineer."}]}'];
+      const thinking = { type: 'disabled' };
+      const llm = new OpenAICompatLLM({
+        baseUrl: 'http://llm.invalid', apiKey: 'test', model: 'stub', timeZone: 'UTC', retries: 1,
+        extraBody: { thinking, max_tokens: 1 },
+      });
+      assert.deepEqual((await llm.extract('Alice is an engineer.', [])).entities.map((e) => e.name), ['Alice']);
+      assert.equal(requests.length, 6);
+      const [cut, larger] = requests.slice(4);
+      assert.deepEqual(larger.messages, cut.messages, 'no repair round');
+      assert.deepEqual([cut.max_tokens, larger.max_tokens], [8000, 16000]);
+      assert.deepEqual([cut.thinking, larger.thinking], [thinking, thinking]);
     },
   );
 

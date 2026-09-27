@@ -782,8 +782,9 @@ MINIZEP_UI=1
   10 min) the server re-processes the oldest failed episodes tried fewer than `MINIZEP_RETRY_MAX`
   times (default 3), up to 5 per pass, each under its group's lock like any ingestion. After that
   it is left alone (`given_up` in [stats](#get-v1stats)) until
-  [retry-failed](#post-v1episodesretry-failed) or a resend of the same text. The stdio server does
-  the same.
+  [retry-failed](#post-v1episodesretry-failed) or a resend of the same text. A group with an
+  async write queued or running is skipped for that pass, so no retry starts ahead of the write
+  (one already running still finishes first). The stdio server does the same.
 - On SIGTERM/SIGINT the server stops accepting requests, waits up to `MINIZEP_DRAIN_TIMEOUT_MS`
   (default 120 s) for queued and in-flight ingestion, writes the snapshot and exits. Work not done
   by then stays `pending` and is picked up at the next start. A second signal exits at once.

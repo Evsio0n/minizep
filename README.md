@@ -261,7 +261,12 @@ npm run build
 | `MINIZEP_LLM_MODEL` | `deepseek-flash` | **不要用 `deepseek-v4-pro`**（见下） |
 | `MINIZEP_LLM_API_KEY` / `MINIZEP_LLM_BASE_URL` | — | 显式覆盖，优先于配置文件 |
 | `MINIZEP_LLM_JSON_MODE` | `1` | 请求 `response_format: {"type":"json_object"}`（DeepSeek、OpenAI 支持）；端点不认这个字段时设 `0` |
-| `MINIZEP_RETRY_INTERVAL_MS` | `600000` | 后台重试失败 episode 的间隔，`0` 关闭 |
+| `MINIZEP_LLM_MAX_TOKENS` | `8000` | 每次调用第一个请求的 `max_tokens`；推理模型的推理 token 也算在里面 |
+| `MINIZEP_LLM_MAX_TOKENS_CAP` | 4 × `MINIZEP_LLM_MAX_TOKENS` | 回复被预算截断时，预算翻倍重发，最多到这个值（见下） |
+| `MINIZEP_LLM_TIMEOUT_MS` | `120000` | 单个请求的超时；预算调大时要一起调大（见下） |
+| `MINIZEP_LLM_RETRIES` | `3` | 遇到 429/5xx、网络错误、超时、空内容时，同一请求总共最多发几次 |
+| `MINIZEP_LLM_EXTRA_BODY` | — | JSON 对象，合并进每个请求的 body，用来传各家专有的开关（例如关闭推理）；`model`、`messages`、`max_tokens` 不会被它覆盖。不是合法的 JSON 对象时启动失败 |
+| `MINIZEP_RETRY_INTERVAL_MS` | `600000` | 后台重试失败 episode 的间隔，`0` 关闭；有异步写入在排队或处理中的 group 这一轮跳过 |
 | `MINIZEP_RETRY_MAX` | `3` | 一条 episode 尝试到这个次数后后台不再重试（`retry_failed` 仍可手工重试） |
 | `MINIZEP_EMBED_URL` | `http://127.0.0.1:11435` | llama.cpp / vLLM / 任意 OpenAI 兼容端点 |
 | `MINIZEP_EMBED_MODEL` | `qwen3-embed` | |
@@ -269,7 +274,27 @@ npm run build
 
 ### 关于 LLM 选择
 
-实测 `deepseek-v4-pro` 是推理模型，4000 tokens 的预算**会全部被 `reasoning_content` 吃掉**，`content` 返回空字符串（耗时 50s+）。抽取任务用 `deepseek-flash` 即可：9~17s，合法 JSON。
+`deepseek-flash` 和 `deepseek-v4-pro` 都会先推理再回答，推理的 token 算在 `max_tokens` 里。
+`deepseek-v4-pro` 在 4000 的预算下推理就会用光，`content` 返回空字符串（耗时 50s+）。
+`deepseek-flash` 平时 9~17s 返回合法 JSON，但文本长、数字多时也会把 8000 的预算全用在推理上：
+回复为空，或者 JSON 被截断（每次约 31s）。
+
+处理方式：
+
+- 回复被截断（`finish_reason=length`，或内容为空而推理用掉了几乎整个预算）时，不再原样重发，
+  也不进 JSON 修复轮，而是把 `max_tokens` 翻倍重发：8000 → 16000 → 32000，到
+  `MINIZEP_LLM_MAX_TOKENS_CAP` 为止；到了上限仍被截断，这条 episode 记为失败。
+  JSON 修复轮只处理完整但解析不了的回复。
+- 也可以用 `MINIZEP_LLM_EXTRA_BODY` 关闭或限制推理。字段名因 provider 而异（例如
+  `{"thinking":{"type":"disabled"}}`、`{"reasoning_effort":"low"}`），以其当前文档为准；
+  `deepseek-flash` 用哪个字段尚未验证。关闭推理可能改变抽取质量，先在测试 group 上回归再切换。
+- 每次请求记一行日志：episode、group、耗时、`max_tokens`、`finish_reason`、`completion_tokens`、
+  `reasoning_tokens`，可以看出离预算上限还有多少余量。
+
+**预算调大，超时也要一起调大。** 按约 250 token/s 估算，32000 token 的请求要 130s 以上，
+超过默认 120s 的 `MINIZEP_LLM_TIMEOUT_MS`（这时建议约 `300000`）。一条 episode 的处理时间也随之变长，
+所以 `MINIZEP_DRAIN_TIMEOUT_MS` 和 systemd unit 的 `TimeoutStopSec=`（要始终大于前者）也要相应调大，
+否则重启时正在进行的抽取会被中断：episode 保持 pending，下次启动再处理。
 
 ### 关于 Embedding
 
