@@ -1,5 +1,5 @@
 import { Pool, type PoolClient } from 'pg';
-import { isFactActive, type EntityEdge, type EntityNode, type EpisodicNode, type UUID } from '../model/types.js';
+import { isFactActive, type EntityEdge, type EntityNode, type EpisodicNode, type SourceRef, type UUID } from '../model/types.js';
 import { bm25TermScores, tokenize, type Bm25Corpus } from '../search/retrieval.js';
 import type { FailedEpisodes, GraphStore } from './memory-store.js';
 import { PostgresAccessStore } from './access-store.js';
@@ -91,7 +91,8 @@ export class PostgresStore implements GraphStore {
             status TEXT,
             error TEXT,
             content_hash TEXT,
-            attempts INT NOT NULL DEFAULT 0
+            attempts INT NOT NULL DEFAULT 0,
+            source_ref JSONB
           );
           CREATE INDEX IF NOT EXISTS episodes_group_hash ON episodes (group_id, content_hash);
 
@@ -135,7 +136,8 @@ export class PostgresStore implements GraphStore {
             ON facts USING hnsw (fact_embedding vector_cosine_ops);
         `);
         await this.migrateSearchText();
-        await this.migrateEpisodeAttempts();
+        await this.migrateEpisodeColumn('attempts', 'INT NOT NULL DEFAULT 0');
+        await this.migrateEpisodeColumn('source_ref', 'JSONB');
 
         // CREATE TABLE IF NOT EXISTS silently keeps an existing column's vector
         // dimension, so a model change would otherwise surface as a confusing
@@ -243,18 +245,19 @@ export class PostgresStore implements GraphStore {
   }
 
   /**
-   * episodes.attempts (the retry counter) on a table created before it
-   * existed. The catalog is read first, so a usual start takes no lock; the
-   * ALTER is idempotent, so processes starting together cannot trip on it.
+   * An episodes column added after the table was first created (attempts, the
+   * retry counter; source_ref). The catalog is read first, so a usual start
+   * takes no lock; the ALTER is idempotent, so processes starting together
+   * cannot trip on it. `column` and `type` are constants of this file.
    */
-  private async migrateEpisodeAttempts(): Promise<void> {
+  private async migrateEpisodeColumn(column: string, type: string): Promise<void> {
     const r = await this.pool.query(
       `SELECT 1 FROM pg_attribute
-        WHERE attrelid = to_regclass($1) AND attname = 'attempts' AND NOT attisdropped`,
-      [`${this.schema}.episodes`],
+        WHERE attrelid = to_regclass($1) AND attname = $2 AND NOT attisdropped`,
+      [`${this.schema}.episodes`, column],
     );
     if (r.rows.length > 0) return;
-    await this.pool.query('ALTER TABLE episodes ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0');
+    await this.pool.query(`ALTER TABLE episodes ADD COLUMN IF NOT EXISTS ${column} ${type}`);
   }
 
   /** Whether search_text is complete; `column` says if it exists at all. */
@@ -355,11 +358,11 @@ export class PostgresStore implements GraphStore {
     await this.ensure();
     await this.db.query(
       `INSERT INTO episodes (uuid, group_id, name, source, source_description, content,
-                             valid_at, created_at, status, error, content_hash, attempts)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                             valid_at, created_at, status, error, content_hash, attempts, source_ref)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        ON CONFLICT (uuid) DO UPDATE SET
          name = EXCLUDED.name, status = EXCLUDED.status, error = EXCLUDED.error,
-         content_hash = EXCLUDED.content_hash, attempts = EXCLUDED.attempts`,
+         content_hash = EXCLUDED.content_hash, attempts = EXCLUDED.attempts, source_ref = EXCLUDED.source_ref`,
       [
         ep.uuid,
         ep.groupId,
@@ -373,6 +376,7 @@ export class PostgresStore implements GraphStore {
         ep.error ?? null,
         ep.contentHash ?? null,
         ep.attempts ?? 0,
+        ep.sourceRef ? JSON.stringify(ep.sourceRef) : null,
       ],
     );
   }
@@ -763,6 +767,7 @@ function rowToEpisode(r: Record<string, unknown>): EpisodicNode {
     error: (r.error ?? undefined) as string | undefined,
     contentHash: (r.content_hash ?? undefined) as string | undefined,
     attempts: Number(r.attempts ?? 0),
+    ...(r.source_ref ? { sourceRef: r.source_ref as SourceRef } : {}),
   };
 }
 

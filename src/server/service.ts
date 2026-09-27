@@ -11,7 +11,7 @@
 import { readFile } from 'node:fs/promises';
 import { z } from 'zod';
 import type { Minizep } from '../index.js';
-import type { EntityEdge, EntityNode, EpisodicNode, FactState, FactWithContext } from '../model/types.js';
+import type { EntityEdge, EntityNode, EpisodicNode, FactState, FactWithContext, SourceRef } from '../model/types.js';
 import { factView, isFactActive } from '../model/types.js';
 import { displayTimeZone } from '../util/time.js';
 import { InvalidationError, type EpisodeInput, type IngestResult } from '../pipeline/ingest.js';
@@ -51,6 +51,9 @@ export interface ServiceOptions {
 /** Failed episodes one background retry pass takes at most. */
 const RETRY_BATCH = 5;
 
+/** Up to this many supporting episodes are read one by one for fact sources; more, the group's at once. */
+const SOURCE_LOOKUPS = 20;
+
 /** The methodology the memory_guide tool and GET /v1/guide return; resolves from src/server and dist/server alike. */
 const GUIDE = new URL('../../docs/MEMORY-GUIDE.md', import.meta.url);
 
@@ -74,6 +77,24 @@ export interface FactRow {
   score: number | null;
   /** why the fact was ended or retracted (attributes.invalidatedBy) */
   reason: string | null;
+  /** the supporting episodes that name their authoritative record, oldest first; absent when none does */
+  sources?: FactSource[];
+}
+
+/** Where an episode's authoritative record is (EpisodicNode.sourceRef), as the API spells it. */
+export interface SourceRefRow {
+  path?: string;
+  commit?: string;
+  job_id?: string;
+  url?: string;
+  sha256?: string;
+}
+
+/** A supporting episode of a fact, with the record it points to. */
+export interface FactSource {
+  episode: string;
+  name: string;
+  source_ref: SourceRefRow;
 }
 
 /** A fact as the graph shows it at one (at, as_of) instant. */
@@ -115,6 +136,8 @@ export interface EpisodeRow {
   error: string | null;
   /** processing attempts so far (retries included) */
   attempts: number;
+  /** the authoritative record the note summarises, as the writer gave it */
+  source_ref: SourceRefRow | null;
 }
 
 export interface JobRow {
@@ -151,6 +174,11 @@ export interface AddMemoryOutcome {
   facts: FactRow[];
   reinforced: FactRow[];
   invalidated: FactRow[];
+  /**
+   * known entities a longer mention of the text was filed under ("unified
+   * KEEP" under "KEEP"): they may be different things, worth a check
+   */
+  resolved: { mention: string; entity: string }[];
   /**
    * extracted candidates discarded: entities that are only a literal value with
    * no fact on them, facts and invalidations naming an unresolvable entity
@@ -228,7 +256,18 @@ function episodeRow(e: EpisodicNode): EpisodeRow {
     status: e.status ?? 'processed',
     error: e.error ?? null,
     attempts: e.attempts ?? 0,
+    source_ref: e.sourceRef ? sourceRefRow(e.sourceRef) : null,
   };
+}
+
+function sourceRefRow(r: SourceRef): SourceRefRow {
+  const { jobId, ...rest } = r;
+  return { ...rest, ...(jobId !== undefined ? { job_id: jobId } : {}) };
+}
+
+function sourceRefOf(r: SourceRefRow): SourceRef {
+  const { job_id, ...rest } = r;
+  return { ...rest, ...(job_id !== undefined ? { jobId: job_id } : {}) };
 }
 
 function jobRow(j: Job, stageDetail = j.stageDetail): JobRow {
@@ -266,6 +305,21 @@ function finishedJob(j: Job): string {
 const groupId = z.string().optional().describe("Memory namespace (default: the token's default group)");
 const instant = (what: string) => z.string().optional().describe(`ISO-8601 instant: ${what}`);
 const asOf = instant('what the graph knew at that time (knowledge time, default now)');
+/** Bounded: a source_ref names a record, it does not hold it. */
+const refField = (max: number, what: string) => z.string().trim().min(1).max(max).optional().describe(what);
+const sourceRef = z
+  .strictObject({
+    path: refField(500, 'Path of the file, e.g. docs/results/cp8.md'),
+    commit: refField(100, 'Commit the file is read at'),
+    job_id: refField(100, 'Job, run or array id, e.g. "slurm 866"'),
+    url: refField(2000, 'URL of the record'),
+    sha256: refField(128, 'Checksum of the file'),
+  })
+  .refine((r) => Object.values(r).some((v) => v !== undefined), 'give at least one of path, commit, job_id, url, sha256')
+  .optional()
+  .describe(
+    'The authoritative record this note summarises: shown on its facts, never sent to the extraction LLM',
+  );
 
 export const shapes = {
   addMemory: {
@@ -280,6 +334,7 @@ export const shapes = {
       .max(200)
       .optional()
       .describe('Caller-chosen key: a resend with the same key is a duplicate, whatever its content'),
+    source_ref: sourceRef,
     async: z
       .boolean()
       .optional()
@@ -448,6 +503,7 @@ export class MemoryService {
       name: input.name,
       validAt: parseInstant(input.valid_at, 'valid_at'),
       idempotencyKey: input.idempotency_key,
+      ...(input.source_ref ? { sourceRef: sourceRefOf(input.source_ref) } : {}),
     };
 
     if (!input.async) {
@@ -643,7 +699,7 @@ export class MemoryService {
       asOf: parseInstant(input.as_of, 'as_of'),
       includeHistorical: input.include_historical ?? false,
     });
-    return { group_id: group, degraded, facts: results.map(factRow) };
+    return { group_id: group, degraded, facts: await this.withSources(results.map(factRow), group) };
   }
 
   async factsAbout(p: Principal, input: FactsAboutInput) {
@@ -658,7 +714,7 @@ export class MemoryService {
     return {
       group_id: group,
       entity: r.entity ? entityRow(r.entity) : null,
-      facts: r.facts.map(factRow),
+      facts: await this.withSources(r.facts.map(factRow), group),
       candidates: r.candidates.map(entityRow),
     };
   }
@@ -670,7 +726,7 @@ export class MemoryService {
       asOf: parseInstant(input.as_of, 'as_of'),
       limit: input.limit ?? 100,
     });
-    return { group_id: group, at: at.toISOString(), facts: rows.map(factRow) };
+    return { group_id: group, at: at.toISOString(), facts: await this.withSources(rows.map(factRow), group) };
   }
 
   async entities(p: Principal, input: EntitiesInput) {
@@ -1115,16 +1171,41 @@ export class MemoryService {
       facts,
       reinforced,
       invalidated,
+      resolved: r.resolved.map((x) => ({ mention: x.mention, entity: x.name })),
       dropped: { ...r.dropped },
     };
   }
 
-  /** Fact rows with endpoint names, looking up only the entities not already known. */
+  /** Fact rows with endpoint names (looking up only the entities not already known) and sources. */
   private async withNames(edges: EntityEdge[], known = new Map<string, string>()): Promise<FactRow[]> {
     const names = await this.nameMap(edges, known);
-    return edges.map((f) =>
+    const rows = edges.map((f) =>
       factRow({ fact: f, sourceName: names.get(f.sourceNodeUuid)!, targetName: names.get(f.targetNodeUuid)! }),
     );
+    return edges.length ? this.withSources(rows, edges[0].groupId) : rows;
+  }
+
+  /**
+   * The rows with `sources`: the supporting episodes that name their
+   * authoritative record (source_ref), oldest first. A row none of whose
+   * episodes names one is left as it is.
+   */
+  private async withSources(rows: FactRow[], group: string): Promise<FactRow[]> {
+    const ids = [...new Set(rows.flatMap((r) => r.episodes))];
+    if (ids.length === 0) return rows;
+    const store = this.zep.store;
+    const episodes =
+      ids.length <= SOURCE_LOOKUPS ? await Promise.all(ids.map((id) => store.getEpisode(id))) : await store.getEpisodes(group);
+    const cited = new Map<string, EpisodicNode>();
+    for (const e of episodes) if (e?.sourceRef && e.groupId === group) cited.set(e.uuid, e);
+    if (cited.size === 0) return rows;
+    return rows.map((r) => {
+      const sources = r.episodes.flatMap((id) => {
+        const e = cited.get(id);
+        return e ? [{ episode: e.uuid, name: e.name, source_ref: sourceRefRow(e.sourceRef!) }] : [];
+      });
+      return sources.length ? { ...r, sources } : r;
+    });
   }
 
   /** uuid -> name for every endpoint of `edges` (a missing entity shows its uuid). */
@@ -1153,6 +1234,7 @@ function emptyResult(episode: EpisodicNode): IngestResult {
     facts: [],
     reinforced: [],
     invalidated: [],
+    resolved: [],
     dropped: { entities: 0, facts: 0, invalidations: 0 },
   };
 }

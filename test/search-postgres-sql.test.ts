@@ -49,8 +49,8 @@ class Lock {
 class FakeDatabase {
   rows: Row[] = [];
   hasColumn = true;
-  /** episodes.attempts, the retry counter */
-  hasAttempts = true;
+  /** the episodes columns added after the table (attempts, the retry counter; source_ref) */
+  episodeColumns = new Set(['attempts', 'source_ref']);
   indexes = new Set(['facts_search_text', 'facts_search_text_missing']);
   /** indexes being built and not yet committed, as Postgres' race needs */
   private building = new Set<string>();
@@ -61,7 +61,7 @@ class FakeDatabase {
   static legacy(rows: number): FakeDatabase {
     const db = new FakeDatabase();
     db.hasColumn = false;
-    db.hasAttempts = false;
+    db.episodeColumns = new Set();
     db.indexes = new Set(['facts_fts']);
     for (let i = 0; i < rows; i++) {
       db.rows.push({
@@ -115,9 +115,10 @@ class FakeDatabase {
       this.hasColumn = true;
       return { rows: [] };
     }
-    if (sql.includes("attname = 'attempts'")) return { rows: this.hasAttempts ? [{ '?column?': 1 }] : [] };
-    if (sql.startsWith('ALTER TABLE episodes ADD COLUMN IF NOT EXISTS attempts')) {
-      this.hasAttempts = true;
+    if (sql.includes('attname = $2')) return { rows: this.episodeColumns.has(String(params[1])) ? [{ '?column?': 1 }] : [] };
+    const column = sql.match(/^ALTER TABLE episodes ADD COLUMN IF NOT EXISTS (\w+)/);
+    if (column) {
+      this.episodeColumns.add(column[1]);
       return { rows: [] };
     }
     if (sql.startsWith('SELECT uuid, name, fact FROM facts WHERE search_text IS NULL')) {
@@ -388,9 +389,10 @@ test('pg migration: an old table is upgraded under the advisory lock and backfil
 
   assert.ok(db.hasColumn);
   assert.deepEqual([...db.indexes].sort(), ['facts_search_text', 'facts_search_text_missing']);
-  // the episodes' retry counter is added once, outside the facts migration
+  // the episodes' retry counter and source_ref are added once, outside the facts migration
   assert.equal(db.statements(/^ALTER TABLE episodes ADD COLUMN IF NOT EXISTS attempts INT NOT NULL DEFAULT 0$/).length, 1);
-  assert.ok(db.hasAttempts);
+  assert.equal(db.statements(/^ALTER TABLE episodes ADD COLUMN IF NOT EXISTS source_ref JSONB$/).length, 1);
+  assert.deepEqual([...db.episodeColumns].sort(), ['attempts', 'source_ref']);
 
   // the schema work runs on one connection, between lock and unlock, in order
   const lock = db.statements(/pg_advisory_lock\(/)[0];

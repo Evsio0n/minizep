@@ -150,6 +150,14 @@ search results, `null` elsewhere. `source_uuid`/`target_uuid` are the endpoint e
 [GET /v1/entities/:id](#get-v1entitiesid)); `reason` is why the fact was ended or retracted, when
 that is known (the invalidation reason, or the extractor's), else `null`.
 
+A fact row whose supporting episodes named their authoritative record also has `sources`, one per
+such episode, oldest first (absent when none did; the graph endpoints leave it out):
+
+```json
+"sources": [ { "episode": "6eeafffa-…", "name": "Alice works at Acme.",
+               "source_ref": { "path": "hr/alice.md", "commit": "0123456789abcdef", "job_id": "866" } } ]
+```
+
 **Entity**: `{uuid, name, labels, summary, created_at}`.
 
 **Fact states.** The graph endpoints below also give each fact its state at one (`at`,
@@ -166,11 +174,12 @@ plus `ends_at` (`invalid_at` as it was known at `as_of`: `null` when that end wa
 later) and `revised_later` (`expired_at > as_of`: a later correction exists).
 
 **Episode**: `{uuid, group_id, name, source, source_description, content, valid_at, created_at,
-status, error, attempts}`. `status` is `pending` (saved, not processed yet), `processed`, `failed`
+status, error, attempts, source_ref}`. `status` is `pending` (saved, not processed yet), `processed`, `failed`
 (with `error`) or `forgotten` (see [forget](#post-v1episodesidforget) and
 [cancel](#post-v1memoriesjobsidcancel); `error` holds the reason).
 Records written before statuses were stored report `processed`. `attempts` counts the times
-processing was started, automatic and manual retries included.
+processing was started, automatic and manual retries included. `source_ref` is the record the
+note summarises, as given to [POST /v1/memories](#post-v1memories), else `null`.
 
 ---
 
@@ -190,6 +199,7 @@ Ingest text: extract entities and facts, and close relationships the text says h
 | `source`          | string  | `text` (default), `json` or `markdown` |
 | `name`            | string  | short label (default: start of the content) |
 | `idempotency_key` | string  | 1-200 chars; a resend with the same key in the same group is a duplicate, whatever its content. Without it, the key is the normalised content plus the UTC day of `valid_at` |
+| `source_ref`      | object  | the authoritative record the text summarises: `{path?, commit?, job_id?, url?, sha256?}`, strings (path ≤ 500, commit ≤ 100, job_id ≤ 100, url ≤ 2000, sha256 ≤ 128 chars), at least one, no other keys. Kept on the episode and shown on its facts (`sources`, `src` in tool results); never sent to the extraction LLM. A resend of a failed episode may add or replace it |
 | `async`           | boolean | store and queue instead of waiting (see below) |
 
 ```bash
@@ -211,6 +221,7 @@ curl -s -X POST http://127.0.0.1:8787/v1/memories \
   "facts": [ { "uuid": "160f2ea7-…", "relation": "WORKS_AT", "source": "Alice", "target": "Acme", "…": "…" } ],
   "reinforced": [],
   "invalidated": [],
+  "resolved": [],
   "dropped": { "entities": 0, "facts": 0, "invalidations": 0 }
 }
 ```
@@ -235,6 +246,11 @@ curl -s -X POST http://127.0.0.1:8787/v1/memories \
   that could not be resolved: non-zero means the text said more than the graph recorded. `entities`
   are names that are only a literal value (an IP address, a number, a URL, a version) with no fact
   on them: the extraction noise that is kept out of the graph.
+- `resolved`: `{mention, entity}` for each existing entity the extraction filed a longer mention
+  under that contains its name (`"unified KEEP"` under `"KEEP"`): a qualified name is often another
+  thing. The new facts on it carry `attributes.resolvedFrom` (`{source?, target?}`: the mention),
+  and the tool result says `note: "unified KEEP" was filed under the existing entity "KEEP"; if
+  they differ, correct it`. Only an extractor that reports mentions fills it.
 
 Other outcomes:
 
@@ -251,7 +267,7 @@ Other outcomes:
   "episode_uuid": "b89af07b-51bd-40dc-b4a3-2a6e5e3f06ce",
   "job_id": null,
   "error": "extraction failed: LLM HTTP 500: upstream error (episode stored for retry)",
-  "entities": [], "facts": [], "reinforced": [], "invalidated": [],
+  "entities": [], "facts": [], "reinforced": [], "invalidated": [], "resolved": [],
   "dropped": { "entities": 0, "facts": 0, "invalidations": 0 }
 }
 ```
@@ -738,7 +754,7 @@ rendering and the same JSON as the REST API in `structuredContent`.
 
 | Tool                | Arguments | REST equivalent | Kind |
 |---------------------|-----------|-----------------|------|
-| `add_memory`        | `content`, `group_id?`, `valid_at?`, `source?`, `name?`, `idempotency_key?`, `async?` | `POST /v1/memories` | write |
+| `add_memory`        | `content`, `group_id?`, `valid_at?`, `source?`, `name?`, `idempotency_key?`, `source_ref?`, `async?` | `POST /v1/memories` | write |
 | `memory_job_status` | `job_id?` (omit to list recent jobs), `limit?` | `GET /v1/memories/jobs/:id` | read |
 | `cancel_job`        | `job_id` (uuid or 8+ char prefix) | `POST /v1/memories/jobs/:id/cancel` | write |
 | `search_facts`      | `query`, `group_id?`, `limit?`, `at?`, `as_of?`, `include_historical?` | `POST /v1/search` | read |
@@ -768,7 +784,11 @@ with the validity rendered as `since <start>`, `true <start> → <end>`, `since 
 <future end>`, `from <future start>`, `still true` (start unknown) or `retracted`. The bracketed
 prefix is what `invalidate_fact` and `reopen_fact` take. `ep` lists the first three `episodes`
 (8-character prefixes, oldest first, `+N` for the rest): what `get_episode` and `forget_episode`
-take, and the only way to them for a client that shows the model the text alone.
+take, and the only way to them for a client that shows the model the text alone. A fact with
+`sources` ends in `| src <path>@<commit7> job <id>` for the first two (`; ` between them, `+N` for
+the rest; a URL stands in for a missing path); `get_episode` prints the episode's whole
+`source_ref` on a `src` line. `add_memory` and `memory_job_status` print a `note:` line for each
+`resolved` entry.
 
 `minizep-proxy` forwards the instructions, the tool list and its annotations as they are, and binds
 a group when `MINIZEP_HTTP_URL` ends in `?group=<g>`.

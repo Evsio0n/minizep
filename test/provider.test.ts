@@ -115,6 +115,10 @@ test('provider: the extraction prompt carries the reference time, known summarie
       assert.match(system, /member of several teams, runs several jobs\): a new target there ends nothing/);
       assert.match(system, /A negation \("does not replace", "is not part of", 并不取代\) never sets it/);
       assert.match(system, /A negated relationship \("X does not replace Y", "X is not part of Y"\) is neither a fact nor an\s+invalidation/);
+      // a qualified name is another entity: "unified KEEP" is not the known "KEEP"
+      assert.match(system, /A name with a qualifier \("unified KEEP", "U arm", "seed 2",\s+"job 749", "KEEP 試驗模型"\) is a different entity/);
+      assert.match(system, /-> the result belongs to "unified KEEP" \(or the known entity with that qualifier\), never "KEEP"/);
+      assert.match(user, /Known entities \(reuse a name exactly, and only for the same referent;/);
     },
   );
 });
@@ -183,7 +187,10 @@ test('provider: buildLLM fails on an invalid MINIZEP_TIMEZONE, MINIZEP_LLM_EXTRA
 test('provider: facts may reference known entities that the reply did not list again', async () => {
   await withChatStub(
     () => ({
-      entities: [{ name: 'Globex', labels: ['Organization'], summary: '' }],
+      entities: [
+        { name: 'Globex', labels: ['Organization'], summary: '' },
+        { name: 'Alice Chen', mention: 'She', labels: ['Person'], summary: '' },
+      ],
       facts: [
         { sourceName: 'Alice Chen', targetName: 'Globex', relation: 'WORKS_AT', fact: 'Alice Chen joined Globex', validAt: '2026-02-27T00:00:00+00:00', replacesPrevious: true },
         { sourceName: 'Alice Chen', targetName: 'Globex', relation: 'OWNS_SHARES_IN', fact: 'Alice Chen owns shares in Globex', replacesPrevious: 'yes' },
@@ -195,6 +202,7 @@ test('provider: facts may reference known entities that the reply did not list a
       assert.equal(out.facts.length, 2, 'the pipeline, not the provider, decides whether an endpoint resolves');
       assert.equal(out.facts[0].validAt?.toISOString(), '2026-02-27T00:00:00.000Z');
       assert.deepEqual(out.facts.map((f) => f.replacesPrevious), [true, undefined], 'only an explicit true replaces');
+      assert.deepEqual(out.entities.map((e) => e.mention), [undefined, 'She'], 'the mention is optional');
     },
   );
 });

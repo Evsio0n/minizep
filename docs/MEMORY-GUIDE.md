@@ -12,7 +12,8 @@ The bracketed prefix is the fact's id. Then comes when it held: `since <start>`,
 `true <start> → <end>`, `since <start>, until <end>`, `from <future start>`, `still true` (start
 unknown) or `retracted` (never true). The line ends with `ep` and the ids of the notes (episodes)
 it came from, oldest first, `+N` when there are more: the ids `get_episode` and `forget_episode`
-take.
+take. A note that named its authoritative record adds `| src <path>@<commit> job <id>`: read that
+record before relying on the fact.
 
 ## The rule: a memory, not ground truth
 
@@ -47,9 +48,16 @@ Do not store:
 
 ## How to write an episode
 
-- **One event per call.** Two unrelated things are two `add_memory` calls.
+- **One event per call**: one decision or one result, about 400 characters. Two unrelated things
+  are two `add_memory` calls.
 - **Full sentences, every subject named**: "Dana Wu", not "she"; "the Orion project", not "the
   project". Facts connect named things: a sentence without names adds nothing.
+- **Name every arm, model and run with its job or array id** ("the M-large arm (Slurm array 866)"),
+  and never give two runs one display name. Entities are matched by name: a bare "the model" or
+  "KEEP" merges every run called that.
+- **`source_ref`: the authoritative file, commit or job** (`{"path": "results/dev.md", "commit":
+  "1a2b3c4", "job_id": "866"}`). The memory is an index: raw logs, result tables and checksums stay
+  in those records, the note says what they concluded.
 - **`valid_at` is when it happened** in the world (ISO-8601), not when you write it down. Relative
   dates in the text ("yesterday", "next Friday") are read against it; writing the absolute date
   into the sentence is safer still. Leave it out only for something happening now. A note with no
@@ -62,6 +70,8 @@ Do not store:
 - **`async: true`**: the call answers at once with a job id. Extraction typically takes 1–2 minutes
   with a reasoning model; poll `memory_job_status` every 15 s (it shows the stage and the time
   elapsed). A failed extraction is kept and retried; `graph_stats` shows how many failed.
+- A result line `note: "unified KEEP" was filed under the existing entity "KEEP"`: if the two are
+  different things, `forget_episode` the note and add it again naming the thing in full.
 - Optional: `idempotency_key` makes a resend a no-op, `name` labels the note, `group_id` picks a
   namespace (default: yours).
 
@@ -74,6 +84,8 @@ Good (synthetic examples):
  "valid_at": "2026-04-10T00:00:00Z", "async": true}
 {"content": "On 2026-05-06 Priya Nair decided to postpone the Orion launch from June to September 2026 because the security review is not finished.",
  "valid_at": "2026-05-06T00:00:00Z", "async": true}
+{"content": "On 2026-09-26 the M-large arm (Slurm array 866) reached F1 0.941 on the dev set, 0.3 points above the M-base arm (Slurm array 872).",
+ "valid_at": "2026-09-26T00:00:00Z", "source_ref": {"path": "results/dev.md", "commit": "1a2b3c4", "job_id": "866"}, "async": true}
 ```
 
 Not like this:
@@ -82,6 +94,8 @@ Not like this:
 - "Standup: Dana lead, billing moved, launch later": three events in one call, no sentences, no
   dates.
 - "Sam Lee might leave soon": a guess. Store it when it happens.
+- "The trial model scored 0.94": which run? The next run called "the trial model" becomes the same
+  entity.
 
 ## How to search
 

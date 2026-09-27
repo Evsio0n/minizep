@@ -2,7 +2,14 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { canWrite, effectiveGrants, permits, unrestricted, type Principal } from './auth.js';
 import { calendarDay, displayTimeZone } from '../util/time.js';
-import { shapes, type AddMemoryOutcome, type FactRow, type JobRow, type MemoryService } from './service.js';
+import {
+  shapes,
+  type AddMemoryOutcome,
+  type FactRow,
+  type JobRow,
+  type MemoryService,
+  type SourceRefRow,
+} from './service.js';
 
 /** How the server introduces itself to MCP clients (stdio and HTTP). */
 export const SERVER_INFO = { name: 'minizep', version: '0.2.0' };
@@ -125,19 +132,52 @@ export function validity(r: FactRow, now = Date.now()): string {
 
 /** Episodes shown by id on a fact line; the others are counted. */
 const SHOWN_EPISODES = 3;
+/** Sources shown on a fact line; the others are counted (the row has them all). */
+const SHOWN_SOURCES = 2;
 
 /**
  * One fact as a line: `[id] source --RELATION--> target | "text" | validity`,
  * then `| ep <id>, <id> +N` naming the notes it came from (oldest first), the
  * ids get_episode and forget_episode take: a client that shows the model only
- * this text has no other way to them.
+ * this text has no other way to them. Then `| src <path>@<commit> job <id>`
+ * for the notes that name their authoritative record, the thing to read
+ * before relying on the fact.
  */
 export function formatFact(r: FactRow): string {
   const line = `[${r.uuid.slice(0, 8)}] ${r.source} --${r.relation}--> ${r.target} | "${r.fact}" | ${validity(r)}`;
   if (!r.episodes.length) return line;
-  const more = r.episodes.length - SHOWN_EPISODES;
-  const ids = r.episodes.slice(0, SHOWN_EPISODES).map((e) => e.slice(0, 8)).join(', ');
-  return `${line} | ep ${ids}${more > 0 ? ` +${more}` : ''}`;
+  const counted = <T>(all: T[], shown: number, show: (x: T) => string, sep: string) => {
+    const more = all.length - shown;
+    return all.slice(0, shown).map(show).join(sep) + (more > 0 ? ` +${more}` : '');
+  };
+  const ep = `${line} | ep ${counted(r.episodes, SHOWN_EPISODES, (e) => e.slice(0, 8), ', ')}`;
+  if (!r.sources?.length) return ep;
+  return `${ep} | src ${counted(r.sources, SHOWN_SOURCES, (s) => sourceLabel(s.source_ref), '; ')}`;
+}
+
+/** A source_ref in a few characters: `docs/r.md@1a2b3c4 job 866`, else its URL, commit or checksum. */
+export function sourceLabel(r: SourceRefRow): string {
+  const commit = r.commit?.slice(0, 7);
+  const where = r.path ?? r.url;
+  const parts: string[] = [];
+  if (where) parts.push(commit ? `${where}@${commit}` : where);
+  else if (commit) parts.push(`commit ${commit}`);
+  if (r.job_id) parts.push(`job ${r.job_id}`);
+  if (!parts.length && r.sha256) parts.push(`sha256 ${r.sha256.slice(0, 12)}`);
+  return parts.join(' ');
+}
+
+/**
+ * The writer's notice for a longer mention filed under a known entity (see
+ * AddMemoryOutcome.resolved): a qualified name is often another thing.
+ */
+function resolvedNotes(o: AddMemoryOutcome): string[] {
+  const ep = o.episode_uuid.slice(0, 8);
+  return (o.resolved ?? []).map(
+    (r) =>
+      `note: "${r.mention}" was filed under the existing entity "${r.entity}"; if they differ, correct it ` +
+      `(forget_episode ${ep}, then add it again with the full name)`,
+  );
 }
 
 function ok(text: string, structured?: object) {
@@ -202,6 +242,7 @@ function describeAdd(o: AddMemoryOutcome, ms: number) {
         '(an address, a number, a URL or a version extracted as an entity, used by no fact)',
     );
   }
+  lines.push(...resolvedNotes(o));
   return ok(lines.join('\n'), o);
 }
 
@@ -241,6 +282,7 @@ function describeJob(job: JobRow): string {
         `dropped  : ${r.dropped.entities} entities, ${r.dropped.facts} facts, ${r.dropped.invalidations} invalidations`,
       );
     }
+    lines.push(...resolvedNotes(r));
   }
   return lines.join('\n');
 }
@@ -310,8 +352,8 @@ export function registerTools(target: McpServer, ctx: ToolContext): void {
       description:
         'Use when you learn something durable (a fact, a change, a decision): one event per call, in full ' +
         'sentences with every subject named, valid_at = when it happened; a change closes the old fact by ' +
-        'itself. async=true answers at once with a job id, and a failed extraction is kept and retried. ' +
-        'See memory_guide.',
+        'itself. source_ref names the file, commit or job it comes from. async=true answers at once with a ' +
+        'job id, and a failed extraction is kept and retried. See memory_guide.',
       inputSchema: shapes.addMemory,
       annotations: ADDS,
     },
@@ -450,6 +492,9 @@ export function registerTools(target: McpServer, ctx: ToolContext): void {
           `valid_at : ${e.valid_at}`,
           `created  : ${e.created_at}`,
           `name     : ${e.name}`,
+          ...(e.source_ref
+            ? [`src      : ${Object.entries(e.source_ref).map(([k, v]) => `${k}=${v}`).join(' ')}`]
+            : []),
           '',
           e.content,
           '',

@@ -8,6 +8,12 @@ export interface ExtractedEntity {
   name: string;
   labels: string[];
   summary: string;
+  /**
+   * The text's own words for the entity, when `name` (a known entity's name)
+   * differs from them. Optional: the pipeline uses it only to flag a known
+   * name reused for a longer, qualified mention ("unified KEEP" -> "KEEP").
+   */
+  mention?: string;
 }
 
 export interface ExtractedFact {

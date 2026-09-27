@@ -49,6 +49,21 @@ export interface EpisodicNode {
    * caller's explicit key. Stored in the content_hash column.
    */
   contentHash?: string;
+  /**
+   * The authoritative record this note summarises (a file at a commit, a job,
+   * a URL), as the writer gave it. The memory is an index of such records:
+   * this is how a fact points back to one. Never sent to the LLM.
+   */
+  sourceRef?: SourceRef;
+}
+
+/** Where an episode's authoritative record is; at least one field is set. */
+export interface SourceRef {
+  path?: string;
+  commit?: string;
+  jobId?: string;
+  url?: string;
+  sha256?: string;
 }
 
 export type EpisodeStatus = 'pending' | 'processed' | 'failed' | 'forgotten';

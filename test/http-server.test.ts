@@ -332,12 +332,21 @@ test('add_memory: reports processed with complete fact rows, then duplicate', as
   }
 });
 
-test('add_memory: facts whose entities could not be resolved are counted as dropped', async () => {
-  const llm = new ScriptedLLM(() => ({
-    entities: [entity('Alice'), entity('Acme', ['Organization'])],
-    facts: [fact('Alice', 'Acme', 'WORKS_AT'), fact('Ghost', 'Acme', 'HAUNTS')],
-    invalidations: [],
-  }));
+test('add_memory: dropped facts are counted, a longer mention filed under a known entity is flagged, source_ref shows on facts', async () => {
+  const llm = new ScriptedLLM((content) =>
+    content.startsWith('Alice')
+      ? {
+          entities: [entity('Alice'), entity('Acme', ['Organization'])],
+          facts: [fact('Alice', 'Acme', 'WORKS_AT'), fact('Ghost', 'Acme', 'HAUNTS')],
+          invalidations: [],
+        }
+      : {
+          // "Acme Labs" is filed under the known "Acme": maybe another thing
+          entities: [entity('Bob'), { ...entity('Acme', ['Organization']), mention: 'Acme Labs' }],
+          facts: [fact('Bob', 'Acme', 'WORKS_AT')],
+          invalidations: [],
+        },
+  );
   const zep = new Minizep({ llm, embedder: deterministicEmbedder() });
   const srv = await startServer({ zep });
   try {
@@ -345,6 +354,31 @@ test('add_memory: facts whose entities could not be resolved are counted as drop
     const r = await call(a.client, 'add_memory', { content: 'Alice works at Acme, which Ghost haunts.' });
     assert.deepEqual(r.structured.dropped, { entities: 0, facts: 1, invalidations: 0 });
     assert.match(r.text, /dropped: 1 fact, 0 invalidations/);
+    assert.deepEqual(r.structured.resolved, []);
+    assert.doesNotMatch(r.text, /note:/);
+
+    const bad = await api(srv.base, 'POST', '/v1/memories', { token: 'tokA', body: { content: 'x', source_ref: {} } });
+    assert.equal(bad.status, 400);
+    assert.match(bad.body.error, /source_ref: give at least one of path/);
+
+    const source_ref = { path: 'hr/bob.md', commit: '0123456789abcdef', job_id: '866' };
+    const bob = await call(a.client, 'add_memory', { content: 'Bob joined Acme Labs.', source_ref });
+    assert.deepEqual(bob.structured.resolved, [{ mention: 'Acme Labs', entity: 'Acme' }]);
+    assert.match(bob.text, /note: "Acme Labs" was filed under the existing entity "Acme"; if they differ, correct it/);
+    const [edge] = (await srv.zep.store.getFacts('teamA')).filter((f) => f.name === 'WORKS_AT' && f.fact.startsWith('Bob'));
+    assert.deepEqual(edge.attributes.resolvedFrom, { target: 'Acme Labs' });
+    assert.ok(!JSON.stringify(llm.calls.at(-1)).includes('hr/bob.md'), 'source_ref never reaches the LLM');
+
+    // the record behind a fact: on its row, its line and its episode
+    const ep = bob.structured.episode_uuid as string;
+    assert.deepEqual(bob.structured.facts[0].sources, [{ episode: ep, name: 'Bob joined Acme Labs.', source_ref }]);
+    const about = await call(a.client, 'facts_about', { entity: 'Acme' });
+    assert.match(about.text, /--WORKS_AT--> Acme \| .* \| ep [0-9a-f]{8} \| src hr\/bob\.md@0123456 job 866$/m);
+    assert.match(about.text, /Alice --WORKS_AT--> Acme \| .* \| ep [0-9a-f]{8}$/m, 'no source, no src');
+    const got = await call(a.client, 'get_episode', { id: ep.slice(0, 8) });
+    assert.match(got.text, /^src {6}: path=hr\/bob\.md commit=0123456789abcdef job_id=866$/m);
+    assert.match(got.text, /\| src hr\/bob\.md@0123456 job 866$/m);
+    assert.deepEqual(got.structured.episode.source_ref, source_ref);
   } finally {
     await srv.close();
   }

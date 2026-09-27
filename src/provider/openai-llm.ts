@@ -3,6 +3,7 @@ import type {
   ContradictionExisting,
   ContradictionVerdict,
   Embedder,
+  ExtractedEntity,
   ExtractedFact,
   ExtractedInvalidation,
   ExtractionResult,
@@ -80,7 +81,7 @@ function envFlag(name: string, fallback: boolean): boolean {
 
 const EXTRACTION_SYSTEM = `You extract a temporal knowledge graph from one text.
 Return ONLY a JSON object, no prose, no markdown fences:
-{"entities":[{"name":"string","labels":["Person"|"Organization"|"Product"|"Host"|"Project"|"Job"|"Role"|"Concept"|"Event"|"Location"|"Preference"],"summary":"string"}],
+{"entities":[{"name":"string","mention":"string, optional","labels":["Person"|"Organization"|"Product"|"Host"|"Project"|"Job"|"Role"|"Concept"|"Event"|"Location"|"Preference"],"summary":"string"}],
  "facts":[{"sourceName":"string","targetName":"string","relation":"SCREAMING_SNAKE_CASE","fact":"self-contained sentence","validAt":"ISO-8601 or null","invalidAt":"ISO-8601 or null","replacesPrevious":false}],
  "invalidations":[{"sourceName":"string","targetName":"string","relation":"SCREAMING_SNAKE_CASE or null","invalidAt":"ISO-8601 or null","reason":"short justification"}]}
 
@@ -107,7 +108,14 @@ Entities:
   quantities, bare numbers, dates, weekdays, times and durations. A value stays in the sentence of the
   fact between the named entities it qualifies ("Grafana on web-1 listens on 192.0.2.10:3000" is the fact
   Grafana --RUNS_ON--> web-1), or in the summary of the one entity it describes.
-- Reuse the exact name of a known entity when the text refers to it, also by a shorter or longer form.
+- Reuse the exact name of a known entity only for the same referent: the text uses its name, or an
+  alias, abbreviation or other spelling of it. A name with a qualifier ("unified KEEP", "U arm", "seed 2",
+  "job 749", "KEEP 試驗模型") is a different entity from the bare name ("KEEP") unless the text says
+  they are the same: reuse a known entity with that same qualifier, else create one with the text's name.
+  Example: known "KEEP" (a method); text "unified U (unified KEEP) scored 0.9408 on dev2, Slurm array
+  866" -> the result belongs to "unified KEEP" (or the known entity with that qualifier), never "KEEP".
+- mention: when you reuse a known name for different words in the text, those words ("Alice" for the
+  known "Alice Chen"); omit it otherwise.
 - summary: one or two sentences on who or what the entity is, with the properties the text gives it.
   For a known entity return an UPDATED summary that keeps what its known summary says and adds what
   this text says; if the text adds nothing about it, return "". A summary states current values: when
@@ -400,7 +408,7 @@ export class OpenAICompatLLM implements LLMProvider {
       'extract',
       options.context,
     )) as {
-      entities?: { name: string; labels?: string[]; summary?: string }[];
+      entities?: { name: string; mention?: string | null; labels?: string[]; summary?: string }[];
       facts?: {
         sourceName: string;
         targetName: string;
@@ -419,13 +427,18 @@ export class OpenAICompatLLM implements LLMProvider {
       }[];
     };
 
-    const entities = (parsed.entities ?? [])
+    const entities: ExtractedEntity[] = (parsed.entities ?? [])
       .filter((e) => e && typeof e.name === 'string' && e.name.trim())
-      .map((e) => ({
-        name: e.name.trim(),
-        labels: Array.isArray(e.labels) ? e.labels.filter((l) => typeof l === 'string') : [],
-        summary: typeof e.summary === 'string' ? e.summary.trim() : '',
-      }));
+      .map((e) => {
+        const name = e.name.trim();
+        const mention = typeof e.mention === 'string' ? e.mention.trim() : '';
+        return {
+          name,
+          labels: Array.isArray(e.labels) ? e.labels.filter((l) => typeof l === 'string') : [],
+          summary: typeof e.summary === 'string' ? e.summary.trim() : '',
+          ...(mention && mention !== name ? { mention } : {}),
+        };
+      });
 
     // endpoints may be entities of this text or known ones; the pipeline
     // resolves them against the graph and counts the ones it cannot resolve
@@ -559,7 +572,7 @@ export function buildExtractionPrompt(
   const summaries = new Map((options.knownEntities ?? []).map((e) => [e.name, e.summary]));
   if (knownEntityNames.length) {
     parts.push(
-      'Known entities (reuse these exact names; the summary is what is already known):\n' +
+      'Known entities (reuse a name exactly, and only for the same referent; the summary is what is already known):\n' +
         knownEntityNames.map((n) => `- ${n}: ${summaries.get(n) || '(no summary yet)'}`).join('\n'),
     );
   }

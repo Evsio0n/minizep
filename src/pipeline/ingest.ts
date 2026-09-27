@@ -10,7 +10,7 @@ import type {
   LLMCallContext,
   LLMProvider,
 } from '../provider/interfaces.js';
-import type { EntityEdge, EntityNode, EpisodicNode } from '../model/types.js';
+import type { EntityEdge, EntityNode, EpisodicNode, SourceRef } from '../model/types.js';
 import { isFactActive, uuid } from '../model/types.js';
 import { KeyedMutex } from '../util/mutex.js';
 import { contentHash, idempotencyKey } from '../util/hash.js';
@@ -27,6 +27,11 @@ export interface IngestResult {
   facts: EntityEdge[];
   /** facts refreshed because the same statement was repeated */
   reinforced: EntityEdge[];
+  /**
+   * known entities the extraction filed a longer mention under ("unified
+   * KEEP" under "KEEP"): the writer is told, as they may be different things
+   */
+  resolved: { mention: string; name: string }[];
   /** existing facts closed by this episode (terminations / contradictions) */
   invalidated: EntityEdge[];
   /**
@@ -58,6 +63,8 @@ export interface EpisodeInput {
    * whatever its content or date.
    */
   idempotencyKey?: string;
+  /** the authoritative record the note summarises (kept on the episode, never sent to the LLM) */
+  sourceRef?: SourceRef;
 }
 
 /** What a manual invalidation should do to a fact. */
@@ -724,6 +731,8 @@ export class IngestPipeline {
         if (unfinished.status === 'failed') {
           unfinished.status = 'pending';
           unfinished.error = undefined;
+          // a resend may add the record it comes from
+          if (input.sourceRef) unfinished.sourceRef = input.sourceRef;
           await this.store.addEpisode(unfinished);
         }
         return { episode: unfinished, duplicate: false };
@@ -742,6 +751,7 @@ export class IngestPipeline {
       createdAt: now,
       status: 'pending',
       contentHash: key,
+      ...(input.sourceRef ? { sourceRef: input.sourceRef } : {}),
     };
     await this.store.addEpisode(episode);
     return { episode, duplicate: false };
@@ -814,6 +824,7 @@ function emptyResult(episode: EpisodicNode): Omit<IngestResult, 'status'> {
     entities: [],
     facts: [],
     reinforced: [],
+    resolved: [],
     invalidated: [],
     dropped: { entities: 0, facts: 0, invalidations: 0 },
   };
@@ -869,6 +880,18 @@ const LITERAL_VALUES = [
   /^https?:\/\/\S+$/i, // a URL
   /^v?\d+(?:\.\d+)+(?:-[\w.]+)?$/i, // a version ("v1.2.3", "2.0.1-rc1")
 ];
+
+/**
+ * The extraction's mention of a known entity when it is longer than the
+ * entity's name and contains it ("unified KEEP" for "KEEP"): a qualified name
+ * that may be another thing. A shorter or differently spelled mention (an
+ * abbreviation, an alias) is not flagged.
+ */
+function widerMention(mention: string | undefined, name: string): string | undefined {
+  const m = mention?.trim();
+  if (!m || m.length <= name.length) return undefined;
+  return m.toLowerCase().includes(name.toLowerCase()) ? m : undefined;
+}
 
 /** Is the name only a literal value, which the extraction prompt says is never an entity? */
 function isLiteralValue(name: string): boolean {
@@ -1082,6 +1105,8 @@ class EpisodeRun {
   private created = new Set<EntityEdge>();
   private dirtyFacts = new Set<EntityEdge>();
   private reinforced: EntityEdge[] = [];
+  /** known entities reused for a longer mention that contains their name (see widerMention) */
+  private resolvedFrom = new Map<EntityNode, string>();
   private invalidated: EntityEdge[] = [];
   private dropped = { entities: 0, facts: 0, invalidations: 0 };
   private vectors = new Map<string, number[]>();
@@ -1187,6 +1212,9 @@ class EpisodeRun {
       entities: this.touched,
       facts: [...this.created],
       reinforced: this.reinforced,
+      resolved: [...this.resolvedFrom]
+        .filter(([node]) => this.touched.includes(node))
+        .map(([node, mention]) => ({ mention, name: node.name })),
       invalidated: this.invalidated,
       dropped: this.dropped,
     };
@@ -1284,6 +1312,10 @@ class EpisodeRun {
     // the LLM sometimes echoes every known entity it was shown: one this text
     // neither mentions nor relates is not updated (its summary would drift)
     if (node && !related.has(name.toLowerCase()) && !mentions(this.episode.content, name)) return;
+    // a known name chosen for a longer mention may be a different, qualified
+    // thing ("unified KEEP" is not "KEEP"): kept, and flagged to the writer
+    const wider = node && !this.newEntities.has(node.uuid) ? widerMention(cand.mention, node.name) : undefined;
+    if (node && wider) this.resolvedFrom.set(node, wider);
     if (node) {
       // merge: keep node, extend labels, and only replace the summary with a
       // real one (an empty candidate summary must never erase what we know)
@@ -1603,12 +1635,21 @@ class EpisodeRun {
           // kept so that an older value added later still ends where this one began
           ...(plan.cand.replacesPrevious === true ? { replacesPrevious: true } : {}),
           ...(endedBy ? { invalidatedBy: endedBy } : {}),
+          ...this.resolvedEndpoints(src, tgt),
         },
         startFromEpisode,
       ),
     };
     this.work.set(edge.uuid, edge);
     this.created.add(edge);
+  }
+
+  /** attributes.resolvedFrom of a new fact with an endpoint filed from a longer mention (see widerMention) */
+  private resolvedEndpoints(src: EntityNode, tgt: EntityNode): { resolvedFrom?: { source?: string; target?: string } } {
+    const source = this.resolvedFrom.get(src);
+    const target = this.resolvedFrom.get(tgt);
+    if (!source && !target) return {};
+    return { resolvedFrom: { ...(source ? { source } : {}), ...(target ? { target } : {}) } };
   }
 
   /** Record this episode as evidence; an end stated by the text closes an open edge. */

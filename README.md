@@ -15,7 +15,7 @@ minizep 的做法（对标 Graphiti）：
 | **双时间轴** | `validAt`/`invalidAt` = 现实中何时为真；`createdAt`/`expiredAt` = 系统何时学到、何时不再采信 |
 | **矛盾消解** | 新事实与旧事实冲突时，旧事实被标记 `expiredAt`，**保留在历史中可追溯** |
 | **关系终止** | "Alice 离职了"不是新建一条 `LEFT` 边，而是给原 `WORKS_AT` 打上 `invalidAt` |
-| **完整溯源** | 每个实体和事实都能追溯回产生它的 episode（原始文本） |
+| **完整溯源** | 每个实体和事实都能追溯回产生它的 episode（原始文本）；episode 可带 `source_ref`（文件、commit、作业号）指回权威记录 |
 | **混合检索** | BM25 关键词 + 向量余弦，用 RRF 融合排序；靠近查询所提实体的事实略微加分（图距离），无关结果被截掉；支持时间旅行查询 |
 
 ## 架构
@@ -241,7 +241,7 @@ npm run build
 
 | 工具 | 用途 |
 |---|---|
-| `add_memory` | 摄取文本，返回抽取到的实体/新事实/被失效的事实 |
+| `add_memory` | 摄取文本，返回抽取到的实体/新事实/被失效的事实；可选 `source_ref {path, commit, job_id, url, sha256}` 记下权威记录（存在 episode 上，不发给 LLM，事实行末尾显示 `src`） |
 | `search_facts` | 混合检索（可传 `at` 时间旅行、`include_historical` 查历史） |
 | `facts_about` | 某实体的全部事实及有效期 |
 | `facts_at` | 指定时刻图中为真的事实 |
@@ -329,6 +329,9 @@ llama-server -m qwen3-embed-q8.gguf --embedding --pooling last -ngl 99 --port 11
 
 1. **级联失效只靠 prompt** —— "Alice 离职"时 prompt 要求 LLM 同时失效依附于它的 `HAS_ROLE`/`MEMBER_OF` 等事实，没有结构化的依赖约束；LLM 漏掉时依附事实仍为活跃。
 2. **实体消歧有限** —— 名称相同（大小写无关）才合并，`Alice` 和 `Alice Chen` 仍是两个实体（查询侧 `findEntities` 会按前缀/子串/名称向量给出候选），没有 Graphiti 那样的 LLM dedup。
+   已知实体的名字由抽取 LLM 选择重用：prompt 要求只对同一指称（别名、缩写、另一种写法）重用，带修饰词的名字（`unified KEEP`、`job 749`）是另一个实体；
+   LLM 仍把较长的写法归到较短的已知名字下时（`unified KEEP` → `KEEP`），`add_memory` 结果带 `note:` 提示写入者，新事实记 `attributes.resolvedFrom`。
+   这只在 LLM 回报了 `mention` 时才看得到；已经混在一起的实体要用 `forget_episode` 或撤回再重写来分开。
 3. **快照体积** —— 向量直接存进 JSON，1024 维 × 每条实体/事实。1000 条量级约数十 MB，量大时应把向量拆到独立的二进制/向量库。
 4. **矛盾检测依赖 LLM** —— 抽取给出的 `invalidations` 是主路径，`detectContradiction` 只对同一对实体之间的事实兜底判断；
    同源同关系、换了目标的事实只在一次只有一个值的关系上参与判断：`WORKS_AT`/`HAS_ROLE`/`HAS_TITLE`/`LIVES_IN`/`REPORTS_TO`，

@@ -60,7 +60,8 @@ export function runStoreConformance(name: string, makeStore: () => Promise<Graph
 
   test(`[${name}] episodes round-trip every field, including failure state, which the store counts`, async () => {
     await withStore(async (s) => {
-      const ep = episode({ status: 'failed', error: 'llm down', contentHash: 'abc123', attempts: 2 });
+      const sourceRef = { path: 'docs/results.md', commit: '0123456789abcdef', jobId: '866' };
+      const ep = episode({ status: 'failed', error: 'llm down', contentHash: 'abc123', attempts: 2, sourceRef });
       await s.addEpisode(ep);
       const [got] = await s.getEpisodes('g1');
       assert.ok(got);
@@ -72,6 +73,7 @@ export function runStoreConformance(name: string, makeStore: () => Promise<Graph
       assert.equal(got.error, 'llm down');
       assert.equal(got.contentHash, 'abc123');
       assert.equal(got.attempts, 2);
+      assert.deepEqual(got.sourceRef, sourceRef);
       assert.equal(got.validAt.getTime(), ep.validAt.getTime());
       assert.equal(got.createdAt.getTime(), ep.createdAt.getTime());
 
