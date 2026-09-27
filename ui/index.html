@@ -1938,11 +1938,61 @@ function statCard(title, value, sub, action = null) {
     h('div', { class: 'stat-value' }, value), h('div', { class: 'stat-sub' }, sub));
 }
 
-/* table with a sticky header, client-side sorting and keyboard-activatable rows */
-function dataTable({ columns, rows, onRow, sort, rowClass, label, empty }) {
+/** Makes `els` the children of `parent`, in order, moving as few nodes as it can. */
+function placeChildren(parent, els) {
+  const keep = new Set(els);
+  for (const c of [...parent.children]) if (!keep.has(c)) c.remove();
+  let cur = parent.firstElementChild;
+  for (const el of els) {
+    if (cur === el) cur = cur.nextElementSibling;
+    else parent.insertBefore(el, cur);
+  }
+}
+
+/*
+ * Table with a sticky header, client-side sorting and keyboard-activatable rows.
+ * With `rowKey` and `rowSig` the element's update(rows) keeps the <tr> of
+ * every row whose signature is unchanged: a refresh only builds new and changed rows.
+ */
+function dataTable({ columns, rows, onRow, sort, rowClass, label, empty, rowKey, rowSig }) {
   let sortKey = sort ? sort.key : null;
   let dir = sort ? sort.dir : 'asc';
   const wrap = h('div', { class: 'table-wrap' });
+  const cache = new Map(); // row key -> { sig, tr, used }
+  let table = null;
+  let headSig = '';
+  function buildRow(r) {
+    const tr = h('tr', { tabindex: onRow ? '0' : null, class: rowClass ? rowClass(r) : null },
+      columns.map((c) => h('td', { class: c.cls }, c.render ? c.render(r) : r[c.key])));
+    tr._row = r;
+    if (onRow) {
+      tr.addEventListener('click', (ev) => {
+        if (ev.target instanceof Element && ev.target.closest('button, a, input, select, summary')) return;
+        onRow(tr._row, tr);
+      });
+      tr.addEventListener('keydown', (ev) => {
+        if ((ev.key === 'Enter' || ev.key === ' ') && ev.target === tr) {
+          ev.preventDefault();
+          onRow(tr._row, tr);
+        }
+      });
+    }
+    return tr;
+  }
+  function rowEl(r) {
+    if (!rowKey) return buildRow(r);
+    const key = rowKey(r);
+    const sig = rowSig(r);
+    const c = cache.get(key);
+    if (c && !c.used && c.sig === sig) {
+      c.used = true;
+      c.tr._row = r;
+      return c.tr;
+    }
+    const tr = buildRow(r);
+    if (!c || !c.used) cache.set(key, { sig, tr, used: true });
+    return tr;
+  }
   function draw() {
     const col = columns.find((c) => c.key === sortKey && c.sortValue);
     let list = rows;
@@ -1970,27 +2020,31 @@ function dataTable({ columns, rows, onRow, sort, rowClass, label, empty }) {
         },
       }, c.label, c.key === sortKey ? icon(dir === 'asc' ? 'chevUp' : 'chevDown', 12) : null)
       : c.label))));
-    const body = h('tbody', null, list.map((r) => {
-      const tr = h('tr', { tabindex: onRow ? '0' : null, class: rowClass ? rowClass(r) : null },
-        columns.map((c) => h('td', { class: c.cls }, c.render ? c.render(r) : r[c.key])));
-      if (onRow) {
-        tr.addEventListener('click', (ev) => {
-          if (ev.target instanceof Element && ev.target.closest('button, a, input, select, summary')) return;
-          onRow(r, tr);
-        });
-        tr.addEventListener('keydown', (ev) => {
-          if ((ev.key === 'Enter' || ev.key === ' ') && ev.target === tr) {
-            ev.preventDefault();
-            onRow(r, tr);
-          }
-        });
-      }
-      return tr;
-    }));
-    wrap.replaceChildren(h('table', { class: 'tbl', 'aria-label': label }, head, body));
-    if (!list.length && empty) wrap.append(empty);
+    const trs = list.map(rowEl);
+    for (const [k, c] of cache) {
+      if (c.used) c.used = false;
+      else cache.delete(k);
+    }
+    const hs = `${sortKey}|${dir}`;
+    if (!table || !rowKey) {
+      table = h('table', { class: 'tbl', 'aria-label': label }, head, h('tbody', null, trs));
+      wrap.replaceChildren(table);
+    } else {
+      // keep the rows that stayed, in place: only new, changed and reordered ones touch the DOM
+      if (hs !== headSig) table.tHead.replaceWith(head);
+      placeChildren(table.tBodies[0], trs);
+    }
+    headSig = hs;
+    if (empty) {
+      if (!list.length) wrap.append(empty);
+      else empty.remove();
+    }
   }
   draw();
+  wrap.update = (next) => {
+    rows = next;
+    draw();
+  };
   return wrap;
 }
 
@@ -2017,6 +2071,7 @@ function openDialog({ title, body, actions = [], onSubmit, onClose, wide = false
     dlg.remove();
     if (prevFocus && prevFocus.isConnected && typeof prevFocus.focus === 'function') prevFocus.focus({ preventScroll: true });
     if (onClose) onClose();
+    setTimeout(flushDeferred, 0); // refreshes held back while it was open
   });
   dlg.showModal();
   function close() { if (dlg.open) dlg.close(); }
@@ -2605,25 +2660,34 @@ const G = {
   COLLIDE_PAD: 8, COLLIDE_K: 0.7,
   RADIAL_R: 100, RADIAL_K: 0.1,
   DECAY: 0.4, ALPHA_DECAY: 0.985, ALPHA_MIN: 0.01, WARM_ALPHA: 0.3, DRAG_ALPHA: 0.1,
-  ANCHOR_K: 0.35, // warm restarts hold surviving nodes near where they were
+  REST_MAX_PX: 0.5, REST_MEAN_PX: 0.1, REST_TICKS: 8, // nothing moves visibly any more: the layout stops
   PAIR_GAP: 28,
   OVERLAY_TOP: 44, OVERLAY_BOTTOM: 36, // px of the card covered by the search bar / zoom buttons
   ZOOM_MIN: 0.1, ZOOM_MAX: 4, ZOOM_INIT: 0.8,
   NODE_LABELS_MAX: 150, EDGE_LABELS_MAX: 120, LABEL_ZOOM: 1.2,
-  SYNC_TICKS_ABOVE: 300, SYNC_TICKS: 150, SYNC_BUDGET_MS: 120, // the warm-up never holds the first paint longer
+  // a big first layout warms up out of sight, in slices short enough not to block input
+  SYNC_TICKS_ABOVE: 300, SYNC_TICKS: 150, SYNC_SLICE_MS: 20, SYNC_MAX_MS: 400,
+  FRESH_TICKS: 40, FRESH_BUDGET_MS: 6, // newcomers to a laid-out graph get a head start before they fade in
 };
-const PILL_FONT = () => `600 9px ${getComputedStyle(document.body).fontFamily}`;
-const SUB_FONT = () => `500 8px ${getComputedStyle(document.body).fontFamily}`;
+let bodyFont = '';
+const fontFamily = () => bodyFont || (bodyFont = getComputedStyle(document.body).fontFamily); // read once: it never changes
+const PILL_FONT = () => `600 9px ${fontFamily()}`;
+const SUB_FONT = () => `500 8px ${fontFamily()}`;
 const r1 = (v) => Math.round(v * 10) / 10;
 const nodeRadius = (degree) => Math.min(18, 6 + 2 * Math.sqrt(Math.max(0, degree || 0)));
 
-/** Plain velocity-Verlet force simulation (O(n²) repulsion; fine up to ~600 nodes). */
+/**
+ * Plain velocity-Verlet force simulation (O(n²) repulsion; fine up to ~600 nodes).
+ * Only `free` nodes move (null: all of them), so a data refresh lets newcomers and
+ * nodes whose springs changed find their place while the rest stay where they are.
+ */
 class Sim {
   constructor() {
     this.nodes = [];
     this.links = [];
     this.alpha = 0;
-    this.anchored = false;
+    this.free = null;
+    this.calm = 0;
   }
   set(nodes, links) {
     this.nodes = nodes;
@@ -2634,28 +2698,96 @@ class Sim {
       count.set(l.t, (count.get(l.t) || 0) + 1);
     }
     for (const l of links) l.bias = count.get(l.s) / (count.get(l.s) + count.get(l.t));
+    const alive = new Set(nodes);
+    this.setFree(this.free && this.free.filter((p) => alive.has(p)));
+  }
+  /** The nodes that move from now on (null: every node); the others hold still. */
+  setFree(list) {
+    this.free = list;
+    for (const p of this.nodes) {
+      p.pin = !!list;
+      p.vx = 0;
+      p.vy = 0;
+    }
+    if (list) for (const p of list) p.pin = false;
+    this.calm = 0;
+  }
+  /** Heat up to at least `alpha`, and start counting quiet ticks afresh. */
+  wake(alpha) {
+    this.alpha = Math.max(this.alpha, alpha);
+    this.calm = 0;
   }
   get running() { return this.alpha >= G.ALPHA_MIN; }
-  tick() {
+  /** Nothing has moved more than a fraction of a screen pixel for a few ticks. */
+  get resting() { return this.calm >= G.REST_TICKS; }
+  /** One step; `k` (the zoom) turns world units into screen pixels for the rest test. */
+  tick(k = 1) {
     const a = this.alpha;
     const nodes = this.nodes;
-    const n = nodes.length;
+    const movers = this.free || nodes;
     // link springs
     for (const l of this.links) {
       const s = l.s;
       const t = l.t;
+      if (s.pin && t.pin) continue;
       let dx = t.x + t.vx - s.x - s.vx;
       let dy = t.y + t.vy - s.y - s.vy;
       const d = Math.sqrt(dx * dx + dy * dy) || 1e-6;
-      const k = ((d - G.LINK_DIST) / d) * a * G.LINK_K;
-      dx *= k;
-      dy *= k;
-      t.vx -= dx * l.bias;
-      t.vy -= dy * l.bias;
-      s.vx += dx * (1 - l.bias);
-      s.vy += dy * (1 - l.bias);
+      const f = ((d - G.LINK_DIST) / d) * a * G.LINK_K;
+      dx *= f;
+      dy *= f;
+      if (!t.pin) {
+        t.vx -= dx * l.bias;
+        t.vy -= dy * l.bias;
+      }
+      if (!s.pin) {
+        s.vx += dx * (1 - l.bias);
+        s.vy += dy * (1 - l.bias);
+      }
     }
-    // repulsion between every pair, and collision
+    // repulsion and collision: every pair, or (a few movers) each mover against every node
+    const all = movers.length * 2 > nodes.length;
+    if (all) this.pairs(a);
+    else this.against(movers, a);
+    for (const p of movers) {
+      // gentle pull to the centre
+      p.vx -= p.x * G.CENTER_K * a;
+      p.vy -= p.y * G.CENTER_K * a;
+      // isolated nodes settle on a ring
+      if (p.isolated) {
+        const d = Math.sqrt(p.x * p.x + p.y * p.y) || 1e-6;
+        const f = ((G.RADIAL_R - d) / d) * G.RADIAL_K * a;
+        p.vx += p.x * f;
+        p.vy += p.y * f;
+      }
+    }
+    let sum = 0;
+    let max = 0;
+    for (const p of movers) {
+      if (p.fx !== null) {
+        p.x = p.fx;
+        p.y = p.fy;
+        p.vx = 0;
+        p.vy = 0;
+        continue;
+      }
+      p.vx *= 1 - G.DECAY;
+      p.vy *= 1 - G.DECAY;
+      p.x += p.vx;
+      p.y += p.vy;
+      const m = Math.abs(p.vx) + Math.abs(p.vy);
+      sum += m;
+      if (m > max) max = m;
+    }
+    // nodes that hold still keep no velocity (the springs read it)
+    if (all && this.free) for (const p of nodes) if (p.pin) { p.vx = 0; p.vy = 0; }
+    this.calm = max * k < G.REST_MAX_PX && (sum / Math.max(1, movers.length)) * k < G.REST_MEAN_PX ? this.calm + 1 : 0;
+    this.alpha *= G.ALPHA_DECAY;
+  }
+  /** Every pair once. */
+  pairs(a) {
+    const nodes = this.nodes;
+    const n = nodes.length;
     for (let i = 0; i < n; i++) {
       const p = nodes[i];
       for (let j = i + 1; j < n; j++) {
@@ -2686,36 +2818,35 @@ class Sim {
         }
       }
     }
-    for (const p of nodes) {
-      // gentle pull to the centre
-      p.vx -= p.x * G.CENTER_K * a;
-      p.vy -= p.y * G.CENTER_K * a;
-      // isolated nodes settle on a ring
-      if (p.isolated) {
-        const d = Math.sqrt(p.x * p.x + p.y * p.y) || 1e-6;
-        const k = ((G.RADIAL_R - d) / d) * G.RADIAL_K * a;
-        p.vx += p.x * k;
-        p.vy += p.y * k;
-      }
-      if (this.anchored && p.ax !== null && p.ax !== undefined) {
-        p.vx += (p.ax - p.x) * G.ANCHOR_K;
-        p.vy += (p.ay - p.y) * G.ANCHOR_K;
+  }
+  /** A few movers against every node, exactly; a mover takes the whole push from a node that holds still. */
+  against(movers, a) {
+    const nodes = this.nodes;
+    for (const p of movers) {
+      for (const q of nodes) {
+        if (q === p) continue;
+        let dx = q.x - p.x;
+        let dy = q.y - p.y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 === 0) {
+          dx = (Math.random() - 0.5) * 1e-3;
+          dy = (Math.random() - 0.5) * 1e-3;
+          d2 = dx * dx + dy * dy;
+        }
+        if (d2 < G.MAX_D2) {
+          const w = (G.CHARGE * a) / Math.max(d2, G.MIN_D2);
+          p.vx += dx * w;
+          p.vy += dy * w;
+        }
+        const rr = p.r + q.r + G.COLLIDE_PAD;
+        if (d2 < rr * rr) {
+          const d = Math.sqrt(d2);
+          const l = ((rr - d) / d) * G.COLLIDE_K * (q.pin ? 1 : 0.5);
+          p.vx -= dx * l;
+          p.vy -= dy * l;
+        }
       }
     }
-    for (const p of nodes) {
-      if (p.fx !== null) {
-        p.x = p.fx;
-        p.y = p.fy;
-        p.vx = 0;
-        p.vy = 0;
-        continue;
-      }
-      p.vx *= 1 - G.DECAY;
-      p.vy *= 1 - G.DECAY;
-      p.x += p.vx;
-      p.y += p.vy;
-    }
-    this.alpha *= G.ALPHA_DECAY;
   }
 }
 
@@ -2748,6 +2879,11 @@ class GraphView {
     this.drag = null;
     this.destroyed = false;
     this.history = false;
+    this.warmLeft = 0; // ticks of a first layout still to run out of sight
+    this.warmTimer = 0;
+    this.hitSkips = 0;
+    this.nlAuto = false; // node / edge labels hidden (many of them, zoomed out)
+    this.elAuto = false;
 
     this.svg = sv('svg', { class: 'graph-svg', role: 'img', 'aria-label': S.graphAria });
     const defs = sv('defs');
@@ -2769,6 +2905,7 @@ class GraphView {
     host.append(this.svg, this.tip);
 
     this.measure();
+    fontFamily(); // read while style is clean (measure just flushed it), not amid the first data's new elements
     this.tx = this.w / 2;
     this.ty = this.hgt / 2;
     this.applyTransform();
@@ -2830,21 +2967,26 @@ class GraphView {
         this.edges.delete(id);
       }
     }
+    // a big first layout is built and warmed up off the document, then shown at once
+    const warm = first && incoming.size > G.SYNC_TICKS_ABOVE ? G.SYNC_TICKS : 0;
+    if (warm) this.vp.remove();
     const box = this.bbox([...this.nodes.values()]);
     const fresh = [];
     const entering = [];
+    // a first layout fades in as a whole, later newcomers one by one
+    const enter = first ? '' : ' entering';
     // nodes
     for (const [id, d] of incoming) {
       let n = this.nodes.get(id);
       if (!n) {
-        n = { uuid: id, x: NaN, y: NaN, vx: 0, vy: 0, fx: null, fy: null, ax: null, ay: null };
-        n.g = sv('g', { class: 'gnode gfade entering', 'data-node': id }, n.c = sv('circle'));
-        n.lab = sv('text', { class: 'nlabel gfade entering' });
+        n = { uuid: id, x: NaN, y: NaN, vx: 0, vy: 0, fx: null, fy: null, pin: false };
+        n.g = sv('g', { class: `gnode gfade${enter}`, 'data-node': id }, n.c = sv('circle'));
+        n.lab = sv('text', { class: `nlabel gfade${enter}` });
         this.gNodes.append(n.g);
         this.gLabels.append(n.lab);
         this.nodes.set(id, n);
         fresh.push(n);
-        entering.push(n.g, n.lab);
+        if (!first) entering.push(n.g, n.lab);
       }
       n.data = d;
       n.label = d.label || primaryLabel(d.labels);
@@ -2852,8 +2994,9 @@ class GraphView {
       n.r = nodeRadius(n.degree);
       n.isolated = !deg.get(id);
       n.hollow = this.history && !activeDeg.get(id);
-      n.c.setAttribute('r', n.r);
-      n.g.style.color = labelColor(n.label);
+      if (n.cr !== n.r) { n.cr = n.r; n.c.setAttribute('r', n.r); }
+      const color = labelColor(n.label);
+      if (n.color !== color) { n.color = color; n.g.style.color = color; }
       n.g.classList.toggle('hollow', n.hollow);
       n.lab.classList.toggle('hollow', n.hollow);
       const name = String(d.name ?? shortId(id));
@@ -2864,14 +3007,14 @@ class GraphView {
       let e = this.edges.get(d.uuid);
       if (!e) {
         e = { uuid: d.uuid, pillKey: '' };
-        e.path = sv('path', { class: 'edge gfade entering' });
+        e.path = sv('path', { class: `edge gfade${enter}` });
         e.hit = sv('path', { class: 'edge-hit', 'data-edge': d.uuid });
-        e.pill = sv('g', { class: 'epill gfade entering', 'data-edge': d.uuid });
+        e.pill = sv('g', { class: `epill gfade${enter}`, 'data-edge': d.uuid });
         this.gEdges.append(e.path);
         this.gHits.append(e.hit);
         this.gPills.append(e.pill);
         this.edges.set(d.uuid, e);
-        entering.push(e.path, e.pill);
+        if (!first) entering.push(e.path, e.pill);
       }
       e.data = d;
       e.s = this.nodes.get(d.source_uuid);
@@ -2910,33 +3053,64 @@ class GraphView {
     if (first && !this.nodes.size) {
       this.sim.alpha = 0; // nothing to lay out; the next non-empty data is a first layout again
     } else if (first) {
-      this.sim.alpha = 1;
-      this.sim.anchored = false;
-      if (this.nodes.size > G.SYNC_TICKS_ABOVE) {
-        const t0 = performance.now();
-        for (let i = 0; i < G.SYNC_TICKS && performance.now() - t0 < G.SYNC_BUDGET_MS; i++) this.sim.tick();
-      }
+      this.sim.setFree(null);
+      this.sim.wake(1);
     } else if (moved.size) {
-      // warm restart: every node keeps x/y/vx/vy. Nodes whose springs changed
-      // (and new ones) move to their partners; the rest are held near their
-      // spot, unless the first layout is still running or they were still
-      // on their way from the previous restart
-      const settling = this.sim.running;
-      const hold = this.sim.anchored || !settling;
-      for (const n of this.nodes.values()) {
-        const free = !hold || moved.has(n) || (settling && n.ax === null);
-        if (free) { n.ax = null; n.ay = null; } else { n.ax = n.x; n.ay = n.y; }
+      if (this.sim.running && !this.sim.free) {
+        this.sim.wake(G.WARM_ALPHA); // the first layout (or a drag) is still going: newcomers join it
+      } else {
+        // warm restart: everything stays where it is except newcomers and nodes whose
+        // springs changed (and those still on their way from the previous restart).
+        // Newcomers first get a head start while they are invisible, the rest holding still
+        const free = new Set(moved);
+        if (this.sim.running && this.sim.free) for (const n of this.sim.free) if (this.nodes.get(n.uuid) === n) free.add(n);
+        if (fresh.length) {
+          this.sim.setFree(fresh);
+          this.sim.wake(G.WARM_ALPHA);
+          const t0 = performance.now();
+          for (let i = 0; i < G.FRESH_TICKS && !this.sim.resting && performance.now() - t0 < G.FRESH_BUDGET_MS; i++) this.sim.tick(this.k);
+        }
+        this.sim.setFree([...free]);
+        this.sim.wake(G.WARM_ALPHA);
       }
-      this.sim.anchored = hold;
-      this.sim.alpha = Math.max(this.sim.alpha, G.WARM_ALPHA);
     }
     this.applyFocus();
     this.applyTransform();
-    this.render();
-    if (entering.length) {
-      void this.svg.getBoundingClientRect(); // commit opacity 0 so the fade-in transitions
-      requestAnimationFrame(() => { for (const el of entering) el.classList.remove('entering'); });
+    if (warm) {
+      // its first ticks run in short slices, before anything is drawn
+      this.warmLeft = warm;
+      this.warmStart = performance.now();
+      clearTimeout(this.warmTimer);
+      this.warmTimer = setTimeout(() => this.warmStep(), 0);
+    } else this.render(true);
+    if (first && this.nodes.size) {
+      this.svg.classList.add('gfade', 'entering');
+      if (!warm) this.reveal([this.svg]);
     }
+    if (entering.length) this.reveal(entering);
+    this.start();
+  }
+  /** Fades elements in: they are drawn once transparent, then lose `entering`. */
+  reveal(els) {
+    requestAnimationFrame(() => requestAnimationFrame(() => { for (const el of els) el.classList.remove('entering'); }));
+  }
+  /** The first ticks of a big first layout, in slices that leave the main thread free in between. */
+  warmStep() {
+    this.warmTimer = 0;
+    if (this.destroyed || !this.warmLeft) return;
+    const t0 = performance.now();
+    while (this.warmLeft > 0 && performance.now() - t0 < G.SYNC_SLICE_MS) {
+      this.sim.tick(this.k);
+      this.warmLeft--;
+    }
+    if (this.warmLeft > 0 && !this.sim.resting && performance.now() - this.warmStart < G.SYNC_MAX_MS) {
+      this.warmTimer = setTimeout(() => this.warmStep(), 0);
+      return;
+    }
+    this.warmLeft = 0;
+    this.render(true);
+    this.svg.append(this.vp);
+    this.reveal([this.svg]);
     this.start();
   }
   /** New nodes: at the mean of placed neighbours plus jitter, else inside the current bounding box. */
@@ -3106,31 +3280,74 @@ class GraphView {
       ly: my + ny * e.off,
     };
   }
-  render() {
+  /**
+   * Writes positions into the SVG: only what moved since the last write (to 0.1
+   * units), labels hidden at this zoom only once they show, and the invisible
+   * edge hit areas every 20th frame of a whole-graph layout and when it stops.
+   * `all` also recomputes edges whose ends did not move (radii or offsets changed).
+   */
+  render(all = false) {
+    const showNL = !this.nlAuto;
+    const showEL = !this.elAuto;
+    const hits = !this.sim.running || !!this.sim.free || ++this.hitSkips % 20 === 0;
     for (const n of this.nodes.values()) {
-      n.g.setAttribute('transform', `translate(${r1(n.x)},${r1(n.y)})`);
-      n.lab.setAttribute('x', r1(n.x + n.r + 5));
-      n.lab.setAttribute('y', r1(n.y + 4));
+      const x = r1(n.x);
+      const y = r1(n.y);
+      n.moved = x !== n.wx || y !== n.wy;
+      if (n.moved) {
+        n.wx = x;
+        n.wy = y;
+        n.g.setAttribute('transform', `translate(${x},${y})`);
+      }
+      if (n.moved || all) n.labStale = true;
+      if (n.labStale && (showNL || n.labHl)) this.placeLabel(n);
     }
     for (const e of this.edges.values()) {
-      const g = this.geom(e);
-      e.path.setAttribute('d', g.d);
-      e.hit.setAttribute('d', g.d);
-      e.pill.setAttribute('transform', `translate(${r1(g.lx)},${r1(g.ly)})`);
+      if (all || e.s.moved || e.t.moved) {
+        const g = this.geom(e);
+        if (g.d !== e.wd) {
+          e.wd = g.d;
+          e.path.setAttribute('d', g.d);
+        }
+        e.pt = `translate(${r1(g.lx)},${r1(g.ly)})`;
+      }
+      if (e.pt !== e.wpt && (showEL || e.pillHl)) this.placePill(e);
+      if (hits && e.hd !== e.wd) {
+        e.hd = e.wd;
+        e.hit.setAttribute('d', e.wd);
+      }
     }
+  }
+  placeLabel(n) {
+    n.labStale = false;
+    const x = r1(n.x + n.r + 5);
+    const y = r1(n.y + 4);
+    if (x !== n.lx) { n.lx = x; n.lab.setAttribute('x', x); }
+    if (y !== n.ly) { n.ly = y; n.lab.setAttribute('y', y); }
+  }
+  placePill(e) {
+    e.wpt = e.pt;
+    e.pill.setAttribute('transform', e.pt);
+  }
+  /** Labels that moved while hidden, now that they show (zoomed in, highlighted). */
+  showLabels() {
+    const showNL = !this.nlAuto;
+    const showEL = !this.elAuto;
+    for (const n of this.nodes.values()) if (n.labStale && (showNL || n.labHl)) this.placeLabel(n);
+    for (const e of this.edges.values()) if (e.pt && e.pt !== e.wpt && (showEL || e.pillHl)) this.placePill(e);
   }
   start() {
     if (!this.raf && !this.destroyed) this.raf = requestAnimationFrame(this.frame);
   }
   frame() {
     this.raf = 0;
-    if (this.destroyed) return;
+    if (this.destroyed || this.warmLeft) return;
     const dragging = !!(this.drag && this.drag.kind === 'node' && this.drag.moved);
     if (!this.sim.running && !dragging) return;
-    this.sim.tick();
-    this.render();
+    this.sim.tick(this.k);
+    if (this.sim.resting && !dragging) this.sim.alpha = 0; // nothing moves visibly any more
+    this.render(!this.sim.running); // the last frame also puts edges whose ends crept < 0.1 exactly in place
     if (!this.fitted && (this.sim.alpha < 0.05 || !this.sim.running) && !this.drag) this.settleView();
-    if (!this.sim.running) this.sim.anchored = false;
     this.start();
   }
   /** Once the first layout has settled: frame the restored selection, or fit everything. */
@@ -3235,34 +3452,44 @@ class GraphView {
     }
     for (const n of this.nodes.values()) {
       const inF = !fn || fn.has(n.uuid);
+      n.labHl = !!fn && inF;
       n.g.classList.toggle('dim', !inF);
       n.lab.classList.toggle('dim', !inF);
-      n.lab.classList.toggle('hl', !!fn && inF);
+      n.lab.classList.toggle('hl', n.labHl);
       n.g.classList.toggle('sel', selNodes.has(n.uuid));
     }
     for (const e of this.edges.values()) {
       const inF = !fe || fe.has(e.uuid);
+      e.pillHl = !!fe && inF;
       e.path.classList.toggle('dim', !inF);
       e.pill.classList.toggle('dim', !inF);
-      e.pill.classList.toggle('hl', !!fe && inF);
+      e.pill.classList.toggle('hl', e.pillHl);
       const isSel = e === selEdge;
       e.path.classList.toggle('selected', isSel);
       e.pill.classList.toggle('selected', isSel);
-      e.path.setAttribute('marker-end', `url(#${this.markerId(isSel ? 'sel' : e.state)})`);
+      const marker = `url(#${this.markerId(isSel ? 'sel' : e.state)})`;
+      if (e.marker !== marker) { e.marker = marker; e.path.setAttribute('marker-end', marker); }
     }
     if (selEdge) {
       // draw the selected edge above its neighbours
       this.gEdges.append(selEdge.path);
       this.gPills.append(selEdge.pill);
     }
+    this.showLabels();
   }
 
   /* ---- view transform ---- */
   applyTransform() {
     this.vp.setAttribute('transform', `translate(${r1(this.tx)},${r1(this.ty)}) scale(${Math.round(this.k * 1000) / 1000})`);
     const zoomed = this.k >= G.LABEL_ZOOM;
-    this.svg.classList.toggle('nl-auto', this.nodes.size > G.NODE_LABELS_MAX && !zoomed);
-    this.svg.classList.toggle('el-auto', this.edges.size > G.EDGE_LABELS_MAX && !zoomed);
+    const nl = this.nodes.size > G.NODE_LABELS_MAX && !zoomed;
+    const el = this.edges.size > G.EDGE_LABELS_MAX && !zoomed;
+    const shown = (this.nlAuto && !nl) || (this.elAuto && !el);
+    this.nlAuto = nl;
+    this.elAuto = el;
+    this.svg.classList.toggle('nl-auto', nl);
+    this.svg.classList.toggle('el-auto', el);
+    if (shown) this.showLabels();
   }
   /** Width of the graph hidden behind the open detail panel. */
   rightInset() {
@@ -3402,11 +3629,9 @@ class GraphView {
     if (!d.moved) {
       if (Math.abs(dx) + Math.abs(dy) < 4) return;
       d.moved = true;
+      pointerBusy = true;
       this.svg.classList.add('dragging');
-      if (d.kind === 'node') {
-        this.sim.anchored = false;
-        for (const n of this.nodes.values()) { n.ax = null; n.ay = null; }
-      }
+      if (d.kind === 'node') this.sim.setFree(null); // the whole graph follows a dragged node
     }
     if (d.kind === 'pan') {
       this.userMoved();
@@ -3419,7 +3644,7 @@ class GraphView {
       d.n.fy = p.y;
       d.n.x = p.x;
       d.n.y = p.y;
-      if (this.sim.alpha < G.DRAG_ALPHA) this.sim.alpha = G.DRAG_ALPHA;
+      this.sim.wake(G.DRAG_ALPHA);
       this.start();
     }
   }
@@ -3429,11 +3654,15 @@ class GraphView {
     this.svg.classList.remove('dragging');
     try { this.svg.releasePointerCapture(ev.pointerId); } catch { /* ignore */ }
     if (!d) return;
+    if (d.moved) {
+      pointerBusy = false;
+      setTimeout(flushDeferred, 0); // a data refresh that waited for the drag
+    }
     if (d.kind === 'node') {
       d.n.fx = null;
       d.n.fy = null;
       if (d.moved) {
-        this.sim.alpha = Math.max(this.sim.alpha, G.DRAG_ALPHA);
+        this.sim.wake(G.DRAG_ALPHA);
         this.start();
       } else if (ev.type === 'pointerup' && this.on.node) this.on.node(d.n.uuid);
       return;
@@ -3469,6 +3698,8 @@ class GraphView {
   hideTip() { this.tip.hidden = true; }
   destroy() {
     this.destroyed = true;
+    if (this.drag && this.drag.moved) pointerBusy = false;
+    clearTimeout(this.warmTimer);
     cancelAnimationFrame(this.raf);
     cancelAnimationFrame(this.anim);
     if (this.ro) this.ro.disconnect();
@@ -3484,15 +3715,55 @@ class GraphView {
  * onHighlight, onData (default reload), fit, focusSearch, focusNode.
  */
 
+/*
+ * Background refreshes (a job finished, another client wrote) wait while the user
+ * is busy: a dialog is open, a drag is going on, or they are typing. The last one
+ * per key runs once they are done.
+ */
+let pointerBusy = false;
+let lastInputAt = -Infinity;
+document.addEventListener('input', () => { lastInputAt = performance.now(); }, true);
+const deferred = new Map();
+let deferTimer = 0;
+function userBusy() {
+  if (pointerBusy || document.querySelector('dialog[open]')) return true;
+  return isTyping(document.activeElement) && performance.now() - lastInputAt < 1500;
+}
+function whenIdle(key, fn) {
+  if (!userBusy()) {
+    deferred.delete(key);
+    fn();
+    return;
+  }
+  deferred.set(key, fn);
+  if (!deferTimer) deferTimer = setTimeout(flushDeferred, 500);
+}
+function flushDeferred() {
+  clearTimeout(deferTimer);
+  deferTimer = 0;
+  if (!deferred.size) return;
+  if (userBusy()) {
+    deferTimer = setTimeout(flushDeferred, 500);
+    return;
+  }
+  const fns = [...deferred.values()];
+  deferred.clear();
+  for (const fn of fns) {
+    try { fn(); } catch (e) { console.error(e); }
+  }
+}
+
 /** After a memory was processed or a fact corrected: refresh what is on screen. */
 function emitData(group) {
-  const a = mounted && mounted.api;
-  if (a && (group === undefined || group === state.group || state.view === 'groups')) {
-    if (a.onData) a.onData();
-    else if (a.reload) a.reload();
-  }
-  if (panelCur && (group === undefined || group === state.group)) syncPanel(true);
   if (group !== undefined && group !== state.group) state.groupsList = null;
+  whenIdle(`data:${group}`, () => {
+    const a = mounted && mounted.api;
+    if (a && (group === undefined || group === state.group || state.view === 'groups')) {
+      if (a.onData) a.onData();
+      else if (a.reload) a.reload();
+    }
+    if (panelCur && (group === undefined || group === state.group)) syncPanel(true);
+  });
   refreshStatus();
 }
 async function retryFailed(btn) {
@@ -3570,6 +3841,8 @@ function GraphPage(root) {
   let loadCtl = null;
   let statsTimer = 0;
   let statsSig = '';
+  let statsShown = '';
+  let dataSig = '';
   let firstData = true;
   const stats = h('section', { class: 'stats', 'aria-label': S.statFacts });
   const card = h('section', { class: 'graph-card', 'aria-label': S.graphLabel });
@@ -3798,6 +4071,10 @@ function GraphPage(root) {
         query: { at: iso(state.at), as_of: iso(state.asOf), history: state.history ? 'true' : undefined, isolated: 'true', limit: 500 },
         signal, quiet: true,
       });
+      // the same answer as last time (a refresh after someone else's write, a job that changed nothing here)
+      const sig = `${key}|${state.history}|${JSON.stringify({ ...r, at: null, as_of: null })}`; // at / as_of: the server's now
+      if (data && sig === dataSig) return;
+      dataSig = sig;
       const edges = arr(r.edges);
       tagRows(edges, key);
       cacheFacts(edges);
@@ -3835,7 +4112,8 @@ function GraphPage(root) {
       if (!signal.aborted) card.classList.remove('busy');
     }
   }
-  async function loadStats() {
+  /** `withGraph`: a changed count reloads the graph (someone else wrote); onData already does. */
+  async function loadStats(withGraph = true) {
     clearTimeout(statsTimer);
     let busy = false;
     try {
@@ -3845,19 +4123,24 @@ function GraphPage(root) {
       const f = s.facts || {};
       const j = s.jobs || {};
       busy = (j.queued || 0) + (j.running || 0) > 0 || (ep.pending || 0) > 0;
-      stats.replaceChildren(
-        statCard(S.statEntities, num(s.entities), S.statsNow),
-        statCard(S.statFacts, num(f.total), S.statFactsSub(num(f.active), num(f.historical))),
-        statCard(S.statEpisodes, num(ep.total), h('span', null, S.statEpisodesSub(num(ep.processed), num(ep.pending)),
-          h('span', { class: ep.failed ? 'txt-red' : null }, S.statFailed(num(ep.failed)))),
-        ep.failed && canWrite(state.group) ? h('button', { class: 'link small', type: 'button', onclick: (ev) => retryFailed(ev.currentTarget) }, S.retryFailed) : null),
-        statCard(S.statJobs, num((j.queued || 0) + (j.running || 0)), S.statJobsSub(num(j.queued || 0), num(j.running || 0))));
+      const shown = `${JSON.stringify(s)}|${canWrite(state.group)}`;
+      if (shown !== statsShown) {
+        statsShown = shown;
+        stats.replaceChildren(
+          statCard(S.statEntities, num(s.entities), S.statsNow),
+          statCard(S.statFacts, num(f.total), S.statFactsSub(num(f.active), num(f.historical))),
+          statCard(S.statEpisodes, num(ep.total), h('span', null, S.statEpisodesSub(num(ep.processed), num(ep.pending)),
+            h('span', { class: ep.failed ? 'txt-red' : null }, S.statFailed(num(ep.failed)))),
+          ep.failed && canWrite(state.group) ? h('button', { class: 'link small', type: 'button', onclick: (ev) => retryFailed(ev.currentTarget) }, S.retryFailed) : null),
+          statCard(S.statJobs, num((j.queued || 0) + (j.running || 0)), S.statJobsSub(num(j.queued || 0), num(j.running || 0))));
+      }
       // someone else (an MCP client, a job) changed the graph: refresh it
       const sig = `${s.entities}|${f.total}|${f.active}|${f.historical}`;
-      if (statsSig && sig !== statsSig) loadGraph();
+      if (withGraph && statsSig && sig !== statsSig) whenIdle(`graph:${mounted && mounted.group}`, () => { if (!destroyed) loadGraph(); });
       statsSig = sig;
     } catch (e) {
       if (destroyed) return;
+      statsShown = '';
       stats.replaceChildren(statCard(S.statFacts, '—', e.message));
     }
     if (!destroyed) statsTimer = setTimeout(loadStats, busy ? 3000 : 30000);
@@ -3874,7 +4157,7 @@ function GraphPage(root) {
       gv.destroy();
     },
     reload: loadGraph,
-    onData() { loadGraph(); loadStats(); },
+    onData() { loadGraph(); loadStats(false); },
     onSel() { gv.select(state.sel, { zoom: !!state.sel && state.sel.kind === 'node' }); },
     onHighlight: renderHighlight,
     onMeta: renderLegend,
@@ -3924,7 +4207,8 @@ function FactsView(root) {
   function visible() {
     return kind === 'browse' && relFilter ? rows.filter((r) => r.relation === relFilter) : rows;
   }
-  async function load() {
+  /** `quietly`: a background refresh (a job finished): no busy fade, unchanged rows stay as they are. */
+  async function load(quietly = false) {
     if (ctl) ctl.abort();
     ctl = new AbortController();
     const signal = ctl.signal;
@@ -3936,7 +4220,7 @@ function FactsView(root) {
     input.setAttribute('aria-label', about ? S.modeAbout : S.modeSearch);
     const common = { at: iso(state.at), as_of: iso(state.asOf) };
     if (!body.querySelector('table')) setBody(h('div', { class: 'table-wrap' }, skeletonRows(6)));
-    else body.classList.add('busy');
+    else if (!quietly) body.classList.add('busy');
     try {
       const notes = [];
       if (about) {
@@ -3992,28 +4276,43 @@ function FactsView(root) {
       }
       cacheFacts(rows);
       notesEl.replaceChildren(...notes);
-      draw();
+      draw(quietly);
     } catch (e) {
       if (isAbort(e)) return;
       notesEl.replaceChildren();
       countEl.textContent = '';
-      setBody(h('div', { class: 'table-wrap' }, errorState(e, load)));
+      setBody(h('div', { class: 'table-wrap' }, errorState(e, () => load())));
     } finally {
       if (!signal.aborted) body.classList.remove('busy');
     }
   }
-  function draw() {
+  let table = null;
+  let tableKind = '';
+  let relSig = '';
+  let max = 1;
+  let now = 0;
+  // everything a row's cells show: a background refresh rebuilds only rows whose signature changed
+  const rowSig = (f) => {
+    const v = viewOf(f);
+    return `${timeKey()}|${state.asOf !== null}|${JSON.stringify(v)}|${v.endsAt !== null && v.endsAt > now}|${relTime(ms(f.created_at))}|${kind === 'search' ? (f.score || 0) / max : ''}|${JSON.stringify(f)}`;
+  };
+  function draw(quietly = false) {
     // relation filter (browse mode only)
     relSel.hidden = kind !== 'browse';
     if (kind === 'browse') {
       const rels = [...new Set(rows.map((r) => r.relation).filter(Boolean))].sort();
       if (relFilter && !rels.includes(relFilter)) relFilter = '';
-      relSel.replaceChildren(h('option', { value: '' }, S.allRelations), ...rels.map((r) => h('option', { value: r }, r)));
+      const sig = rels.join('\n');
+      if (sig !== relSig || !quietly) {
+        relSig = sig;
+        relSel.replaceChildren(h('option', { value: '' }, S.allRelations), ...rels.map((r) => h('option', { value: r }, r)));
+      }
       relSel.value = relFilter;
     }
     const list = visible();
     showBtn.disabled = !list.length;
-    const max = Math.max(0, ...list.map((f) => f.score || 0)) || 1;
+    max = Math.max(0, ...list.map((f) => f.score || 0)) || 1;
+    now = atNow();
     const columns = [
       { key: 'fact', label: S.colFact, cls: 'fact-cell', render: (f) => h('span', { class: stateStyle(viewOf(f).state) }, f.fact ?? '') },
       { key: 'relation', label: S.colRelation, sortValue: (f) => f.relation || '', render: (f) => relPill(f.relation) },
@@ -4022,20 +4321,28 @@ function FactsView(root) {
       { key: 'learned', label: S.colLearned, cls: 'nowrap', firstDir: 'desc', sortValue: (f) => ms(f.created_at), render: (f) => h('span', { title: fmtDateTime(ms(f.created_at)) }, relTime(ms(f.created_at))) },
     ];
     if (kind === 'search') columns.push({ key: 'score', label: S.colScore, firstDir: 'desc', sortValue: (f) => f.score ?? 0, render: (f) => scoreBar((f.score || 0) / max) });
-    const table = dataTable({
-      label: S.views.facts,
-      rows: list,
-      columns,
-      onRow: (f) => select('edge', f.uuid, f),
-      empty: kind === 'about' && !state.q ? null : emptyState({ title: S.noFacts, text: state.history ? null : S.noFactsText }),
-    });
-    setBody(table);
+    const tkind = `${kind}|${state.history}|${!!state.q}`;
+    if (quietly && table && body === table && tableKind === tkind) table.update(list); // its columns read `max` when they render
+    else {
+      table = dataTable({
+        label: S.views.facts,
+        rows: list,
+        columns,
+        rowKey: (f) => f.uuid,
+        rowSig,
+        onRow: (f) => select('edge', f.uuid, f),
+        empty: kind === 'about' && !state.q ? null : emptyState({ title: S.noFacts, text: state.history ? null : S.noFactsText }),
+      });
+      tableKind = tkind;
+      setBody(table);
+    }
     countEl.textContent = list.length ? S.factCount(list.length) : '';
   }
   load();
   return {
     destroy() { if (ctl) ctl.abort(); setQ.cancel(); },
-    reload: load,
+    reload: () => load(),
+    onData: () => load(true),
     onQuery() {
       if (input.value.trim() !== state.q) input.value = state.q;
       load();
@@ -4649,21 +4956,50 @@ function finishJob(j) {
   } else toast(j.status === 'cancelled' ? S.jobCancelled : S.jobFailed(j.error), 'error');
   emitData(j.group);
 }
+/**
+ * One card per job, kept across polls: a card is only touched when what it shows
+ * changed, so its entry animation and spinner do not restart on every poll.
+ */
+const jobCards = new Map(); // job id -> { el, lead, leadKind, sig }
 function renderJobs() {
   const host = $('#jobs');
   if (!host) return;
-  host.replaceChildren(...[...jobs.values()].map((j) => {
+  const want = [];
+  for (const j of jobs.values()) {
     const done = j.status === 'succeeded';
     const failed = j.status === 'failed' || j.status === 'cancelled';
-    return h('div', { class: `job j-${j.status}`, role: 'status' },
-      done ? h('span', { class: 'ok' }, icon('check')) : failed ? h('span', { class: 'bad' }, icon('alert')) : h('span', { class: 'spin', 'aria-hidden': 'true' }),
-      h('div', { class: 'job-main' },
-        h('div', { class: 'job-name', title: j.name }, j.name || S.memory),
-        h('div', { class: 'job-sub' }, `${j.group} · ${j.stage || S.jobStatus[j.status] || j.status}`),
-        failed && j.error ? h('div', { class: 'job-err' }, j.error) : null,
-        done && j.episode ? h('button', { class: 'link small', type: 'button', onclick: () => openEpisode(j.group, j.episode) }, S.viewEpisode) : null),
-      j.done ? h('button', { class: 'icon-btn', type: 'button', 'aria-label': S.dismiss, onclick: () => { jobs.delete(j.id); renderJobs(); } }, icon('x', 14)) : null);
-  }));
+    let card = jobCards.get(j.id);
+    if (!card) {
+      card = { el: h('div', { role: 'status' }), lead: null, leadKind: '', sig: '' };
+      jobCards.set(j.id, card);
+    }
+    const sig = `${j.status}|${j.stage || ''}|${j.done}|${j.name}|${j.group}|${j.error || ''}|${j.episode || ''}`;
+    if (sig !== card.sig) {
+      card.sig = sig;
+      card.el.className = `job j-${j.status}`;
+      const leadKind = done ? 'ok' : failed ? 'bad' : 'spin';
+      if (leadKind !== card.leadKind) {
+        const lead = done ? h('span', { class: 'ok' }, icon('check')) : failed ? h('span', { class: 'bad' }, icon('alert')) : h('span', { class: 'spin', 'aria-hidden': 'true' });
+        if (card.lead) card.lead.replaceWith(lead);
+        else card.el.prepend(lead);
+        card.lead = lead;
+        card.leadKind = leadKind;
+      }
+      // the rest of the card after the icon (a spinner that stays keeps turning)
+      while (card.lead.nextSibling) card.lead.nextSibling.remove();
+      card.el.append(...[
+        h('div', { class: 'job-main' },
+          h('div', { class: 'job-name', title: j.name }, j.name || S.memory),
+          h('div', { class: 'job-sub' }, `${j.group} · ${j.stage || S.jobStatus[j.status] || j.status}`),
+          failed && j.error ? h('div', { class: 'job-err' }, j.error) : null,
+          done && j.episode ? h('button', { class: 'link small', type: 'button', onclick: () => openEpisode(j.group, j.episode) }, S.viewEpisode) : null),
+        j.done ? h('button', { class: 'icon-btn', type: 'button', 'aria-label': S.dismiss, onclick: () => { jobs.delete(j.id); renderJobs(); } }, icon('x', 14)) : null,
+      ].filter(Boolean));
+    }
+    want.push(card.el);
+  }
+  for (const id of jobCards.keys()) if (!jobs.has(id)) jobCards.delete(id);
+  placeChildren(host, want);
 }
 
 /* ---- 8.10 access: shared pieces ----------------------------------------- */
