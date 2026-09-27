@@ -981,6 +981,10 @@ test('ui: other sites and foreign host names (DNS rebinding) are refused', async
     const own = await add({ host: self, origin: `http://${self}`, 'sec-fetch-site': 'same-origin' });
     assert.equal(own.status, 201);
     assert.equal(own.body.group_id, 'teamA');
+    // behind a TLS proxy on this host the page's origin is https://<name>; a direct caller cannot claim it
+    const proxied = { host: 'minizep.example', origin: 'https://minizep.example', 'sec-fetch-site': 'same-origin' };
+    assert.equal((await add({ ...proxied, 'x-forwarded-proto': 'https' })).status, 200, 'accepted (a duplicate of the note above)');
+    assert.equal((await add(proxied)).status, 403);
     for (const host of [`localhost:${port}`, `[::1]:${port}`, `minizep.example:${port}`, 'minizep.example']) {
       const r = await rawRequest(srv.base, 'GET', '/ui/api/v1/stats', { host, origin: `http://${host}` });
       assert.equal(r.status, 200, host);
@@ -1164,12 +1168,13 @@ test('ui: MINIZEP_UI=1 logs in with a token into a cookie session; without one t
   const srv = await startServer({ ui: uiFromEnv({ MINIZEP_UI: '1' }) });
   try {
     const { token: bob, record } = await srv.app.access.createUser(ADMIN, { name: 'bob' });
-    const ui = async (method: string, path: string, opts: { cookie?: string; body?: unknown } = {}) => {
+    const ui = async (method: string, path: string, opts: { cookie?: string; body?: unknown; headers?: Record<string, string> } = {}) => {
       const res = await fetch(`${srv.base}/ui/api${path}`, {
         method,
         headers: {
           ...(opts.cookie ? { cookie: opts.cookie } : {}),
           ...(opts.body !== undefined ? { 'content-type': 'application/json' } : {}),
+          ...opts.headers,
         },
         body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
       });
@@ -1210,6 +1215,10 @@ test('ui: MINIZEP_UI=1 logs in with a token into a cookie session; without one t
     // the 10th failure from one address within 5 minutes locks it out, even for a good token
     for (let i = 0; i < 9; i++) await ui('POST', '/login', { body: { token: 'mz_wrong' } });
     assert.equal((await ui('POST', '/login', { body: { token: 'tokA' } })).status, 429);
+    // behind a TLS proxy on this host each client is counted by the address the proxy forwards
+    const proxied = await ui('POST', '/login', { body: { token: 'tokA' }, headers: { 'x-forwarded-for': '100.64.0.9', 'x-forwarded-proto': 'https' } });
+    assert.equal(proxied.status, 200);
+    assert.match(proxied.setCookie, /; Secure$/);
   } finally {
     await srv.close();
   }

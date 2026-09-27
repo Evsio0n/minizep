@@ -123,6 +123,31 @@ systemd-analyze security minizep              # 查看沙箱评分
   sudo ss -ltnp | grep 8787      # 只应看到 127.0.0.1:8787 和 100.64.0.10:8787
   ```
 
+### 加 HTTPS（同机的 TLS 反向代理）
+
+浏览器只在 https（或 localhost）下提供剪贴板等 API，一些 MCP 客户端也只接 https。在同一台机器上放一个
+反向代理终结 TLS，转发到回环的 8787 即可；明文的 8787 可以照旧留给已有的客户端。以 Caddy 为例，证书来自
+内部 step-ca 的 ACME（CA 在 VPN 上能连到本机做 HTTP-01 验证，不用碰 DNS）：
+
+```caddyfile
+minizep.tailnet.example {
+	bind 100.64.0.10                     # 只绑 VPN 地址
+	tls {
+		ca https://ca.tailnet.example/acme/acme/directory
+		ca_root /etc/caddy/internal-root.pem
+	}
+	@minizep path /mcp /mcp/* /v1 /v1/* /ui /ui/* /health
+	handle @minizep {
+		reverse_proxy 127.0.0.1:8787
+	}
+}
+```
+
+- UI 用主机名打开，所以要把它加进 `MINIZEP_UI_HOSTS`。
+- 代理必须和 minizep 在同一台机器上：只有来自回环的请求，`X-Forwarded-Proto: https` 才会让 UI 接受
+  `https://<主机名>` 的 Origin 并给会话 cookie 加 `Secure`，`X-Forwarded-For` 的最后一项才会被当作
+  登录限流的客户端地址。外部请求带这些头一律忽略。
+
 - 用 VPN 的 ACL 再收紧一层：只有需要的设备能连 8787。Tailscale 策略文件示例（给主机打上
   `tag:minizep`，`group:agents` 是允许访问的用户组）：
 

@@ -27,11 +27,13 @@ import { registerTools, SERVER_INFO, serverOptionsFor } from './tools.js';
 import {
   LoginThrottle,
   SESSION_COOKIE,
+  clientAddress,
   readCookie,
   sendUiPage,
   sessionCookie,
   uiPrincipal,
   uiRefusal,
+  viaHttps,
   type UiOptions,
 } from './ui.js';
 
@@ -307,10 +309,10 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
     if (ui.principal) return sendJson(res, 404, { error: 'this UI has no login (MINIZEP_UI_GROUPS)' });
     if (path === '/ui/api/logout') {
       await access.logout(sid);
-      return sendJson(res, 200, { ok: true }, { 'set-cookie': sessionCookie('', 0) });
+      return sendJson(res, 200, { ok: true }, { 'set-cookie': sessionCookie('', 0, viaHttps(req)) });
     }
 
-    const address = req.socket.remoteAddress ?? '';
+    const address = clientAddress(req);
     const wait = ui.throttle.blockedFor(address);
     if (wait > 0) {
       return sendJson(res, 429, { error: 'too many failed logins: try again later' }, { 'retry-after': String(Math.ceil(wait / 1000)) });
@@ -322,7 +324,7 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
       return sendJson(res, 403, { error: 'invalid token' });
     }
     const body = { me: await access.me(login.principal), expires_at: login.expiresAt.toISOString() };
-    return sendJson(res, 200, body, { 'set-cookie': sessionCookie(login.sid, Math.floor(ui.sessionMs / 1000)) });
+    return sendJson(res, 200, body, { 'set-cookie': sessionCookie(login.sid, Math.floor(ui.sessionMs / 1000), viaHttps(req)) });
   }
 
   /** No Origin header (not a browser page) and a loopback Host. */

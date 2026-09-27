@@ -114,8 +114,28 @@ export function readCookie(req: IncomingMessage, name: string): string | undefin
 }
 
 /** Set-Cookie for a login of `maxAgeS` seconds; 0 clears it. */
-export function sessionCookie(sid: string, maxAgeS: number): string {
-  return `${SESSION_COOKIE}=${sid}; HttpOnly; SameSite=Strict; Path=/ui; Max-Age=${maxAgeS}`;
+export function sessionCookie(sid: string, maxAgeS: number, secure = false): string {
+  return `${SESSION_COOKIE}=${sid}; HttpOnly; SameSite=Strict; Path=/ui; Max-Age=${maxAgeS}${secure ? '; Secure' : ''}`;
+}
+
+const fromLoopback = (req: IncomingMessage) => /^(127\.|::1$|::ffff:127\.)/.test(req.socket.remoteAddress ?? '');
+
+/**
+ * The client's address. Behind a proxy on this host (Caddy terminating TLS)
+ * every request comes from loopback, which would make the login throttle
+ * one bucket for everyone: then the last X-Forwarded-For entry, the one the
+ * proxy added, is the client. A remote caller's X-Forwarded-For is ignored.
+ */
+export function clientAddress(req: IncomingMessage): string {
+  const direct = req.socket.remoteAddress ?? '';
+  const forwarded = req.headers['x-forwarded-for'];
+  if (!fromLoopback(req) || typeof forwarded !== 'string') return direct;
+  return forwarded.split(',').pop()?.trim() || direct;
+}
+
+/** The page was reached over https through a proxy on this host: the session cookie gets Secure. */
+export function viaHttps(req: IncomingMessage): boolean {
+  return fromLoopback(req) && req.headers['x-forwarded-proto'] === 'https';
 }
 
 /**
@@ -172,7 +192,9 @@ export function uiRefusal(req: IncomingMessage, allowedHosts: ReadonlySet<string
   const origin = req.headers.origin;
   if (origin !== undefined) {
     const site = req.headers['sec-fetch-site'];
-    if (origin !== `http://${header}` || (site !== undefined && site !== 'same-origin')) {
+    // behind a TLS proxy on this host (Caddy) the page's origin is https://<host>
+    const scheme = viaHttps(req) ? 'https' : 'http';
+    if (origin !== `${scheme}://${header}` || (site !== undefined && site !== 'same-origin')) {
       return 'cross-origin request refused';
     }
   }
