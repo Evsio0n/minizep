@@ -330,6 +330,7 @@ test('temporal: an older statement that contradicts a newer fact is stored alrea
     const [older] = res.facts;
     assert.equal(older.validAt?.getTime(), d('2020-01-01').getTime());
     assert.equal(older.invalidAt?.getTime(), top.validAt?.getTime(), `it ends where the newer fact begins (contradicts: ${contradicts}, dated by ${datedBy})`);
+    assert.equal(older.attributes.invalidatedBy, `runs into ${top.uuid.slice(0, 8)}: Alice is CTO of Acme`, 'and says so');
     assert.deepEqual((await zep.factsAt(new Date(), 'g')).map((r) => r.fact.fact), ['Alice is CTO of Acme']);
     assert.deepEqual((await zep.factsAt(d('2021-01-01'), 'g')).map((r) => r.fact.fact), ['Alice is a junior engineer at Acme']);
   }
@@ -538,6 +539,33 @@ test('temporal: a statement the judge says holds alongside a fact of the same pa
     'Job 11 evaluated model M on benchmark B1 with a score of 0.71',
     'Job 12 evaluated model M on benchmark B1 with a score of 0.74; it does not replace job 11',
   ]);
+});
+
+test('temporal: a result dated only by its day, before that day\'s other record of a relation that holds several, stays open unless the judge ends it there', async () => {
+  const pair = [entity('KEEP', ['Concept']), entity('dev2', ['Concept'])];
+  const RULE = '在最終評測中，KEEP 取 dev2 逐字 F1 最高的 margin。';
+  const RESULT = 'unified U 在 dev2 上 margin -0.50 的逐字 F1 為 0.9403';
+  for (const contradicts of [false, true]) {
+    const { zep } = scripted(
+      {
+        rule: scenario(pair, [says('KEEP', 'dev2', 'EVALUATED_ON', RULE)]),
+        result: scenario(pair, [says('KEEP', 'dev2', 'EVALUATED_ON', RESULT, { validAt: d('2026-09-26T00:00:00+08:00') })]),
+      },
+      contradicts,
+    );
+    const [rule] = (await zep.ingest.addEpisode({ groupId: 'g', content: 'rule', validAt: d('2026-09-26T00:35:15+08:00') })).facts;
+    // written later, its start (midnight) is earlier than the rule's
+    const [result] = (await zep.ingest.addEpisode({ groupId: 'g', content: 'result', validAt: d('2026-09-27T00:07:13+08:00') })).facts;
+
+    const now = (await zep.factsAt(new Date(), 'g')).map((r) => r.fact.fact).sort();
+    if (contradicts) {
+      assert.deepEqual([result.invalidAt, result.attributes.invalidatedBy], [rule.validAt, `runs into ${rule.uuid.slice(0, 8)}: ${RULE}`]);
+      assert.deepEqual(now, [RULE]);
+    } else {
+      assert.deepEqual([result.invalidAt, result.attributes.invalidatedBy], [undefined, undefined], 'not cut off at the rule');
+      assert.deepEqual(now, [RESULT, RULE].sort());
+    }
+  }
 });
 
 test('temporal: regression R1 — a backfilled document worded differently does not resurrect the relation either', async () => {
