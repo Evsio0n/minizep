@@ -560,6 +560,7 @@ const S = {
   copyGroupId: 'Copy group id',
   copied: 'Copied to clipboard',
   copyFailed: 'Could not copy',
+  copyManual: (keys) => `Selected: press ${keys} to copy`,
   themeToLight: 'Switch to light theme',
   themeToDark: 'Switch to dark theme',
   connected: 'Connected',
@@ -1136,17 +1137,37 @@ const ls = {
     } catch { /* storage unavailable: fine */ }
   },
 };
-async function copyText(text) {
+/**
+ * Copies text. navigator.clipboard exists only on https and localhost; over
+ * plain http (a tailnet address) the fallback selects a hidden textarea and
+ * runs execCommand('copy'). The textarea goes into the open modal dialog when
+ * there is one: showModal() makes everything outside it inert, so a textarea
+ * in body cannot be selected and nothing was copied. When even that fails and
+ * a visible `field` holds the text, it is selected for the user to copy.
+ */
+async function copyText(text, field) {
   let ok = false;
-  try { await navigator.clipboard.writeText(text); ok = true; } catch {
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(text); ok = true; } catch { /* fall back below */ }
+  }
+  if (!ok) {
+    const back = document.activeElement;
+    const dialogs = document.querySelectorAll('dialog[open]');
+    const ta = h('textarea', { readonly: true, 'aria-hidden': 'true', style: { position: 'fixed', opacity: '0', top: '0', left: '-1000px' } });
+    ta.value = text;
+    (dialogs[dialogs.length - 1] || document.body).append(ta);
     try {
-      const ta = h('textarea', { style: { position: 'fixed', opacity: '0', left: '-1000px' } });
-      ta.value = text;
-      document.body.append(ta);
       ta.select();
       ok = document.execCommand('copy');
-      ta.remove();
     } catch { ok = false; }
+    ta.remove();
+    if (back && typeof back.focus === 'function') back.focus({ preventScroll: true });
+  }
+  if (!ok && field) {
+    field.focus();
+    field.select();
+    toast(S.copyManual(/Mac|iPhone|iPad/.test(navigator.platform) ? '⌘C' : 'Ctrl+C'));
+    return false;
   }
   toast(ok ? S.copied : S.copyFailed, ok ? 'ok' : 'error');
   return ok;
@@ -2049,7 +2070,7 @@ function showSecretIn(d, title, secret, lead) {
   out.addEventListener('focus', () => out.select());
   const copy = h('button', { class: 'btn', type: 'button' }, icon('copy'), S.copy);
   copy.addEventListener('click', async () => {
-    if (await copyText(secret)) fill(copy, icon('check'), S.copiedShort);
+    if (await copyText(secret, out)) fill(copy, icon('check'), S.copiedShort);
   });
   d.setOnSubmit(null); // Enter in the field must not run the form that made the token again
   d.setTitle(title);
