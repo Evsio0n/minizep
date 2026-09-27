@@ -1,7 +1,7 @@
 import { Pool, type PoolClient } from 'pg';
 import { isFactActive, type EntityEdge, type EntityNode, type EpisodicNode, type SourceRef, type UUID } from '../model/types.js';
 import { bm25TermScores, tokenize, type Bm25Corpus } from '../search/retrieval.js';
-import type { FailedEpisodes, GraphStore } from './memory-store.js';
+import type { EpisodeSource, FailedEpisodes, GraphStore } from './memory-store.js';
 import { PostgresAccessStore } from './access-store.js';
 
 export interface PostgresStoreOptions {
@@ -400,6 +400,18 @@ export class PostgresStore implements GraphStore {
   async removeEpisode(uuid: UUID): Promise<void> {
     await this.ensure();
     await this.db.query('DELETE FROM episodes WHERE uuid=$1', [uuid]);
+  }
+
+  async getEpisodeSources(groupId: string, uuids: UUID[]): Promise<EpisodeSource[]> {
+    // (a string that is not a uuid would be a query error, not a miss)
+    const ids = uuids.filter((id) => UUID_RE.test(id));
+    if (ids.length === 0) return [];
+    await this.ensure();
+    const r = await this.db.query(
+      'SELECT uuid, name, source_ref FROM episodes WHERE group_id=$1 AND uuid = ANY($2::uuid[]) AND source_ref IS NOT NULL',
+      [groupId, ids],
+    );
+    return r.rows.map((row) => ({ uuid: row.uuid as string, name: row.name as string, sourceRef: row.source_ref as SourceRef }));
   }
 
   async countFailedEpisodes(groupIds: string[] | undefined, maxAttempts: number): Promise<FailedEpisodes> {

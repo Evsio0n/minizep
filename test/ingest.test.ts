@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Minizep, FallbackEmbedder } from '../src/index.js';
-import { IngestPipeline, InvalidationError, mentions } from '../src/pipeline/ingest.js';
+import { IngestPipeline, InvalidationError, mentions, widerMention } from '../src/pipeline/ingest.js';
 import { MemoryGraphStore } from '../src/store/memory-store.js';
 import { contentHash } from '../src/util/hash.js';
 import { HashEmbedder } from '../src/provider/interfaces.js';
@@ -698,7 +698,7 @@ test('ingest: Latin names written inside CJK text count as named in it', async (
   assert.ok(knownFacts.some((f) => f.fact === 'Alice --WORKS_AT--> Acme'), 'and their relationship, so it can be ended');
 });
 
-test('ingest: Latin names match whole words only', () => {
+test('ingest: Latin names match whole words only; a known name is flagged only when a mention qualifies it', () => {
   assert.equal(mentions('bob said hi', 'ai'), false, '"AI" is not in "said"');
   assert.equal(mentions('an ai lab', 'ai'), true);
   assert.equal(mentions('alice在acme工作', 'alice'), true);
@@ -706,6 +706,11 @@ test('ingest: Latin names match whole words only', () => {
   assert.equal(mentions('malice inc', 'alice'), false);
   assert.equal(mentions('alice2 called', 'alice'), false, 'digits continue a word');
   assert.equal(mentions('阿里巴巴的张三', '张三'), true, 'CJK names match anywhere');
+  // (widerMention: the note that a qualified mention was filed under a known name)
+  for (const m of ['unified KEEP', 'KEEP 試驗模型', 'KEEP試驗模型', 'KEEP(749)']) assert.equal(widerMention(m, 'KEEP'), m);
+  assert.equal(widerMention('PostgreSQL', 'Postgres'), undefined, 'a longer spelling of the word');
+  assert.equal(widerMention("KEEP's", 'KEEP'), undefined, 'a possessive');
+  assert.equal(widerMention('eval/mechanism_eval_v1.py', 'mechanism_eval_v1'), undefined, 'its file');
 });
 
 test('ingest: a fact can be ended or retracted by hand, only within its own group', async () => {

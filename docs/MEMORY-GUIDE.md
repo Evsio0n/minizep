@@ -71,7 +71,8 @@ Do not store:
   with a reasoning model; poll `memory_job_status` every 15 s (it shows the stage and the time
   elapsed). A failed extraction is kept and retried; `graph_stats` shows how many failed.
 - A result line `note: "unified KEEP" was filed under the existing entity "KEEP"`: if the two are
-  different things, `forget_episode` the note and add it again naming the thing in full.
+  different things, `forget_episode` the note and add it again with a distinct name for the thing
+  (with its job or array id); the same words again would be filed the same way.
 - Optional: `idempotency_key` makes a resend a no-op, `name` labels the note, `group_id` picks a
   namespace (default: yours).
 

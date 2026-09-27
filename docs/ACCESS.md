@@ -101,6 +101,8 @@ token per project:
 - `<g>` must be a group the token can at least read. Otherwise the request is refused with 403
   `group "<g>" not permitted for this token` (at `initialize` for MCP), never served from the
   token's default instead.
+- An MCP session keeps the group of its `initialize` for all its requests, also one sent without
+  the query or header; one naming another group is refused (400): start a new session for it.
 - Only the default changes: `group_id` still reaches every other group the token may use, and
   its rights stay the same. The MCP instructions begin the groups part with
   `This connection is bound to group "<g>"`, a call without `group_id` says it used the bound

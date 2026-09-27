@@ -132,8 +132,11 @@ export function validity(r: FactRow, now = Date.now()): string {
 
 /** Episodes shown by id on a fact line; the others are counted. */
 const SHOWN_EPISODES = 3;
-/** Sources shown on a fact line; the others are counted (the row has them all). */
+/** Distinct sources shown on a fact line; the others are counted (the row has them all). */
 const SHOWN_SOURCES = 2;
+/** A fact line clips a source's path or URL, and its job id, to this many characters (get_episode shows them whole). */
+const SHOWN_WHERE = 60;
+const SHOWN_JOB = 30;
 
 /**
  * One fact as a line: `[id] source --RELATION--> target | "text" | validity`,
@@ -141,7 +144,8 @@ const SHOWN_SOURCES = 2;
  * ids get_episode and forget_episode take: a client that shows the model only
  * this text has no other way to them. Then `| src <path>@<commit> job <id>`
  * for the notes that name their authoritative record, the thing to read
- * before relying on the fact.
+ * before relying on the fact: each record once (several notes often cite the
+ * same one), clipped, so a listing of many facts stays readable.
  */
 export function formatFact(r: FactRow): string {
   const line = `[${r.uuid.slice(0, 8)}] ${r.source} --${r.relation}--> ${r.target} | "${r.fact}" | ${validity(r)}`;
@@ -152,31 +156,42 @@ export function formatFact(r: FactRow): string {
   };
   const ep = `${line} | ep ${counted(r.episodes, SHOWN_EPISODES, (e) => e.slice(0, 8), ', ')}`;
   if (!r.sources?.length) return ep;
-  return `${ep} | src ${counted(r.sources, SHOWN_SOURCES, (s) => sourceLabel(s.source_ref), '; ')}`;
+  const labels = [...new Set(r.sources.map((s) => sourceLabel(s.source_ref)))];
+  return `${ep} | src ${counted(labels, SHOWN_SOURCES, (l) => l, '; ')}`;
 }
 
 /** A source_ref in a few characters: `docs/r.md@1a2b3c4 job 866`, else its URL, commit or checksum. */
 export function sourceLabel(r: SourceRefRow): string {
   const commit = r.commit?.slice(0, 7);
-  const where = r.path ?? r.url;
+  const where = r.path ? clipTail(r.path) : r.url && clipTail(r.url, URL_ORIGIN.exec(r.url)?.[0]);
   const parts: string[] = [];
   if (where) parts.push(commit ? `${where}@${commit}` : where);
   else if (commit) parts.push(`commit ${commit}`);
-  if (r.job_id) parts.push(`job ${r.job_id}`);
+  if (r.job_id) parts.push(`job ${r.job_id.length > SHOWN_JOB ? `${r.job_id.slice(0, SHOWN_JOB - 1)}…` : r.job_id}`);
   if (!parts.length && r.sha256) parts.push(`sha256 ${r.sha256.slice(0, 12)}`);
   return parts.join(' ');
 }
 
+const URL_ORIGIN = /^[a-z][\w+.-]*:\/\/[^/?#]+/i;
+
+/** `s` within SHOWN_WHERE characters: the end of a path (the file), after a URL's `head` (its host) when short. */
+function clipTail(s: string, head?: string): string {
+  if (s.length <= SHOWN_WHERE) return s;
+  const keep = head && head.length <= SHOWN_WHERE / 2 ? `${head}/` : '';
+  return `${keep}…${s.slice(s.length - (SHOWN_WHERE - keep.length - 1))}`;
+}
+
 /**
- * The writer's notice for a longer mention filed under a known entity (see
- * AddMemoryOutcome.resolved): a qualified name is often another thing.
+ * The writer's notice for a qualified mention filed under a known entity (see
+ * AddMemoryOutcome.resolved): often another thing. Resending the same words
+ * would file it the same way, so the fix is a name of its own.
  */
 function resolvedNotes(o: AddMemoryOutcome): string[] {
   const ep = o.episode_uuid.slice(0, 8);
   return (o.resolved ?? []).map(
     (r) =>
       `note: "${r.mention}" was filed under the existing entity "${r.entity}"; if they differ, correct it ` +
-      `(forget_episode ${ep}, then add it again with the full name)`,
+      `(forget_episode ${ep}, then add it again naming the thing distinctly, e.g. with its job or array id)`,
   );
 }
 

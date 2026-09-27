@@ -330,7 +330,7 @@ llama-server -m qwen3-embed-q8.gguf --embedding --pooling last -ngl 99 --port 11
 1. **级联失效只靠 prompt** —— "Alice 离职"时 prompt 要求 LLM 同时失效依附于它的 `HAS_ROLE`/`MEMBER_OF` 等事实，没有结构化的依赖约束；LLM 漏掉时依附事实仍为活跃。
 2. **实体消歧有限** —— 名称相同（大小写无关）才合并，`Alice` 和 `Alice Chen` 仍是两个实体（查询侧 `findEntities` 会按前缀/子串/名称向量给出候选），没有 Graphiti 那样的 LLM dedup。
    已知实体的名字由抽取 LLM 选择重用：prompt 要求只对同一指称（别名、缩写、另一种写法）重用，带修饰词的名字（`unified KEEP`、`job 749`）是另一个实体；
-   LLM 仍把较长的写法归到较短的已知名字下时（`unified KEEP` → `KEEP`），`add_memory` 结果带 `note:` 提示写入者，新事实记 `attributes.resolvedFrom`。
+   LLM 仍把带修饰词的写法归到已知名字下时（`unified KEEP` → `KEEP`；`PostgreSQL` → `Postgres`、`KEEP's` 这类同一个词的写法不算），`add_memory` 结果带 `note:` 提示写入者，新事实记 `attributes.resolvedFrom`。
    这只在 LLM 回报了 `mention` 时才看得到；已经混在一起的实体要用 `forget_episode` 或撤回再重写来分开。
 3. **快照体积** —— 向量直接存进 JSON，1024 维 × 每条实体/事实。1000 条量级约数十 MB，量大时应把向量拆到独立的二进制/向量库。
 4. **矛盾检测依赖 LLM** —— 抽取给出的 `invalidations` 是主路径，`detectContradiction` 只对同一对实体之间的事实兜底判断；

@@ -304,6 +304,13 @@ test('validity: shows when a fact started, ended or is scheduled to end; a fact 
   assert.match(line(['6eeafffa-0000-4000-8000-000000000000']), /→ 2024-06-01 \| ep 6eeafffa$/);
   const five = ['a', 'b', 'c', 'd', 'e'].map((c) => `${c.repeat(8)}-0000-4000-8000-000000000000`);
   assert.match(line(five), /\| ep aaaaaaaa, bbbbbbbb, cccccccc \+2$/);
+  // a record several notes cite is shown once; a long URL keeps its host and its end
+  const ref = { path: 'results/dev.md', commit: '1a2b3c4d5e', job_id: '866' };
+  const url = `https://wandb.ai/team/${'x'.repeat(1900)}/overview`;
+  const sources = [ref, ref, { url }].map((source_ref, i) => ({ episode: five[i], name: 'n', source_ref }));
+  const cited = formatFact({ ...row('2024-03-01T00:00:00.000Z', null), episodes: five, sources });
+  assert.match(cited, /\| src results\/dev\.md@1a2b3c4 job 866; https:\/\/wandb\.ai\/…x+\/overview$/);
+  assert.ok(cited.length < 250, cited);
 });
 
 /* ---------------- snapshot writes ---------------- */

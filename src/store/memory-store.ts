@@ -1,10 +1,17 @@
-import type { EntityEdge, EntityNode, EpisodicNode, UUID } from '../model/types.js';
+import type { EntityEdge, EntityNode, EpisodicNode, SourceRef, UUID } from '../model/types.js';
 import { isFactActive } from '../model/types.js';
 
 /** Failed episodes, and those tried at least a given number of times (see countFailedEpisodes). */
 export interface FailedEpisodes {
   failed: number;
   givenUp: number;
+}
+
+/** What a fact row shows of an episode that names its authoritative record (see getEpisodeSources). */
+export interface EpisodeSource {
+  uuid: UUID;
+  name: string;
+  sourceRef: SourceRef;
 }
 
 /**
@@ -24,6 +31,12 @@ export interface GraphStore {
   getEpisodes(groupId?: string): Promise<EpisodicNode[]>;
   /** remove an episode record (used when a failed episode is reprocessed) */
   removeEpisode(uuid: UUID): Promise<void>;
+  /**
+   * Those of `uuids` in the group that name their authoritative record
+   * (source_ref), without their text: one read for the facts of a listing,
+   * however many episodes they cite.
+   */
+  getEpisodeSources(groupId: string, uuids: UUID[]): Promise<EpisodeSource[]>;
   /**
    * The failed episodes of these groups (every group when undefined), and
    * how many of them were tried at least `maxAttempts` times, counted where
@@ -115,6 +128,12 @@ export class MemoryGraphStore implements GraphStore, Snapshotable {
   }
   async removeEpisode(uuid: UUID): Promise<void> {
     this.episodes.delete(uuid);
+  }
+  async getEpisodeSources(groupId: string, uuids: UUID[]): Promise<EpisodeSource[]> {
+    return uuids.flatMap((id) => {
+      const e = this.episodes.get(id);
+      return e?.sourceRef && e.groupId === groupId ? [{ uuid: e.uuid, name: e.name, sourceRef: e.sourceRef }] : [];
+    });
   }
   async countFailedEpisodes(groupIds: string[] | undefined, maxAttempts: number): Promise<FailedEpisodes> {
     let failed = 0;

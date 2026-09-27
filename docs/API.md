@@ -76,8 +76,10 @@ id that does not exist, so a token cannot probe other tenants.
 
 A connection can be bound to one group, e.g. the project an agent works on: `/mcp?group=<g>`, or
 the header `X-Minizep-Group: <g>` on `/mcp` and `/v1` (the query wins when both are given). That
-group becomes the default of the request, and so of an MCP session, whose requests all carry the
-same URL; `group_id` still names any other group the caller may use. A name the caller cannot read
+group becomes the default of the request; an MCP session keeps the one of its `initialize` (its
+instructions name it) for every later request, with or without the query or header, and refuses
+one naming another group with **400** `this session is bound to group "<g>": start a new session
+…`. `group_id` still names any other group the caller may use. A name the caller cannot read
 (or empty, over 256 characters, or with `*`) is refused at once with **403**
 `group "<g>" not permitted for this token` (on `/mcp` as a JSON-RPC error body, so at
 `initialize`), never ignored. See [ACCESS.md](ACCESS.md#binding-a-connection-to-a-group) for
@@ -107,7 +109,7 @@ Every error is `{"error": "<message>"}`:
 
 | Status | Meaning |
 |--------|---------|
-| 400 | invalid JSON, body not an object, a missing/invalid field, bad timestamp, id prefix too short or ambiguous; a new token that would reach none of its user's groups, or whose `default_group` it cannot read; a workspace default group over 254 characters ([ACCESS.md](ACCESS.md)) |
+| 400 | invalid JSON, body not an object, a missing/invalid field, bad timestamp, id prefix too short or ambiguous; an MCP request binding another group than its session; a new token that would reach none of its user's groups, or whose `default_group` it cannot read; a workspace default group over 254 characters ([ACCESS.md](ACCESS.md)) |
 | 401 | missing bearer token; (UI) `login required` |
 | 403 | invalid token; group not permitted for this token (also a bound group, `?group=` or `X-Minizep-Group`); no default group; read-only access to the group; not an owner of the group or not an admin ([ACCESS.md](ACCESS.md)) |
 | 404 | unknown route, or no such record in the resolved group |
@@ -199,7 +201,7 @@ Ingest text: extract entities and facts, and close relationships the text says h
 | `source`          | string  | `text` (default), `json` or `markdown` |
 | `name`            | string  | short label (default: start of the content) |
 | `idempotency_key` | string  | 1-200 chars; a resend with the same key in the same group is a duplicate, whatever its content. Without it, the key is the normalised content plus the UTC day of `valid_at` |
-| `source_ref`      | object  | the authoritative record the text summarises: `{path?, commit?, job_id?, url?, sha256?}`, strings (path ≤ 500, commit ≤ 100, job_id ≤ 100, url ≤ 2000, sha256 ≤ 128 chars), at least one, no other keys. Kept on the episode and shown on its facts (`sources`, `src` in tool results); never sent to the extraction LLM. A resend of a failed episode may add or replace it |
+| `source_ref`      | object  | the authoritative record the text summarises: `{path?, commit?, job_id?, url?, sha256?}`, strings (path ≤ 500, commit ≤ 100, job_id ≤ 100, url ≤ 2000, sha256 ≤ 128 chars) of one line each (no line breaks or control characters), at least one, no other keys. Kept on the episode and shown on its facts (`sources`, `src` in tool results); never sent to the extraction LLM. A resend of a failed episode may add or replace it |
 | `async`           | boolean | store and queue instead of waiting (see below) |
 
 ```bash
@@ -246,11 +248,13 @@ curl -s -X POST http://127.0.0.1:8787/v1/memories \
   that could not be resolved: non-zero means the text said more than the graph recorded. `entities`
   are names that are only a literal value (an IP address, a number, a URL, a version) with no fact
   on them: the extraction noise that is kept out of the graph.
-- `resolved`: `{mention, entity}` for each existing entity the extraction filed a longer mention
-  under that contains its name (`"unified KEEP"` under `"KEEP"`): a qualified name is often another
-  thing. The new facts on it carry `attributes.resolvedFrom` (`{source?, target?}`: the mention),
-  and the tool result says `note: "unified KEEP" was filed under the existing entity "KEEP"; if
-  they differ, correct it`. Only an extractor that reports mentions fills it.
+- `resolved`: `{mention, entity}` for each existing entity the extraction filed a qualified mention
+  under: its name plus a word of its own (`"unified KEEP"`, `"KEEP 試驗模型"`, `"KEEP(749)"` under
+  `"KEEP"`, but not `"PostgreSQL"` under `"Postgres"` or `"KEEP's"`), often another thing. The new
+  facts on it carry `attributes.resolvedFrom` (`{source?, target?}`: the mention), and the tool
+  result says `note: "unified KEEP" was filed under the existing entity "KEEP"; if they differ,
+  correct it` (forget the episode, then write it again with a distinct name, e.g. with the job id).
+  Only an extractor that reports mentions fills it.
 
 Other outcomes:
 
@@ -310,7 +314,7 @@ only, for display):
 | `waiting_for_group_lock` | what holds the group: `held by job 1a2b3c4d`, `held by the background retry of episode e3c08882`, a synchronous write or a correction |
 | `extracting` | the extraction call: `LLM attempt 2, max_tokens=16000` (retries, raised budgets and a repair round count) |
 | `embedding` | |
-| `judging` | each new fact resolved against the graph, with the contradiction judge where needed: `3/7 facts` (plus the LLM attempt from the second) |
+| `judging` | each new fact resolved against the graph, with the contradiction judge where needed: `3/7 facts`, plus the judge's LLM attempt while it runs (`3/7 facts, LLM attempt 1, max_tokens=8000`) |
 | `writing` | |
 | `done`, `failed`, `cancelled` | |
 
@@ -712,7 +716,8 @@ Streamable HTTP transport, stateful sessions. Clients send `initialize` without 
 use the returned `Mcp-Session-Id` afterwards.
 
 - A session is **bound to the token that created it**: a request with another token and that
-  session id is refused with 403 (`session belongs to another token`).
+  session id is refused with 403 (`session belongs to another token`). It also keeps the group
+  bound at `initialize` ([groups](#groups)): another binding on a later request is a 400.
 - Unknown or expired session id: 404 (`Session not found`); per the MCP specification the client
   starts a new session. `minizep-proxy` does this transparently.
 - Sessions expire after `MINIZEP_SESSION_TTL_MS` (default 30 min) without requests. A client's open
@@ -785,10 +790,11 @@ with the validity rendered as `since <start>`, `true <start> → <end>`, `since 
 prefix is what `invalidate_fact` and `reopen_fact` take. `ep` lists the first three `episodes`
 (8-character prefixes, oldest first, `+N` for the rest): what `get_episode` and `forget_episode`
 take, and the only way to them for a client that shows the model the text alone. A fact with
-`sources` ends in `| src <path>@<commit7> job <id>` for the first two (`; ` between them, `+N` for
-the rest; a URL stands in for a missing path); `get_episode` prints the episode's whole
-`source_ref` on a `src` line. `add_memory` and `memory_job_status` print a `note:` line for each
-`resolved` entry.
+`sources` ends in `| src <path>@<commit7> job <id>` for the first two distinct records (`; `
+between them, `+N` for the rest; a URL stands in for a missing path; a path or URL over 60
+characters keeps its end, after a URL's host, and a job id over 30 its start); `get_episode`
+prints the episode's whole `source_ref` on a `src` line. `add_memory` and `memory_job_status`
+print a `note:` line for each `resolved` entry.
 
 `minizep-proxy` forwards the instructions, the tool list and its annotations as they are, and binds
 a group when `MINIZEP_HTTP_URL` ends in `?group=<g>`.

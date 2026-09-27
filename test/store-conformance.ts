@@ -74,6 +74,9 @@ export function runStoreConformance(name: string, makeStore: () => Promise<Graph
       assert.equal(got.contentHash, 'abc123');
       assert.equal(got.attempts, 2);
       assert.deepEqual(got.sourceRef, sourceRef);
+      // what a fact row shows of it, read with the others a listing cites
+      assert.deepEqual(await s.getEpisodeSources('g1', [ep.uuid, 'not-a-uuid']), [{ uuid: ep.uuid, name: 'ep', sourceRef }]);
+      assert.deepEqual(await s.getEpisodeSources('g2', [ep.uuid]), [], 'only in its group');
       assert.equal(got.validAt.getTime(), ep.validAt.getTime());
       assert.equal(got.createdAt.getTime(), ep.createdAt.getTime());
 

@@ -69,6 +69,8 @@ interface McpSession {
   transport: StreamableHTTPServerTransport;
   /** who the tools act for: refreshed from every request's authentication */
   principal: Principal;
+  /** the group bound at initialize, which the instructions name: kept for every later request (see inSession) */
+  boundGroup?: string;
   close(): Promise<void>;
 }
 
@@ -150,7 +152,13 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
         onReady();
       },
     });
-    const session: McpSession = { server, transport, principal, close: () => server.close() };
+    const session: McpSession = {
+      server,
+      transport,
+      principal,
+      ...(principal.boundGroup !== undefined ? { boundGroup: principal.boundGroup } : {}),
+      close: () => server.close(),
+    };
     registerTools(server, { service, principal: () => session.principal });
     transport.onclose = () => {
       if (transport.sessionId) sessions.delete(transport.sessionId);
@@ -177,8 +185,13 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
       const found = sessions.acquire(sessionId, principal.id, req.method !== 'GET');
       // 404 tells a client to start a new session; 403: someone else's session
       if (!found.ok) return sendJson(res, found.status, rpcError(found.error, found.status === 404 ? -32001 : -32000));
-      // the same token (and URL, so the same bound group), but its grants may have changed since the session began
-      found.handle.principal = principal;
+      // the same token, but its grants may have changed since the session began
+      const caller = inSession(principal, found.handle.boundGroup);
+      if (!caller.ok) {
+        found.release();
+        return sendJson(res, caller.status, rpcError(caller.error));
+      }
+      found.handle.principal = caller.principal;
       res.on('close', found.release);
       await found.handle.transport.handleRequest(req, res, body);
       return;
@@ -226,8 +239,8 @@ export function createHttpApp(opts: HttpAppOptions): HttpApp {
     }
     if (closing) return sendJson(res, 503, { error: 'server is shutting down' });
     // bind the connection to a project's group (auth.bindGroup): /mcp?group=, else the
-    // X-Minizep-Group header (clients that cannot change the URL, and REST); every
-    // request of an MCP session carries the same URL, so the binding holds for it
+    // X-Minizep-Group header (clients that cannot change the URL, and REST); an MCP
+    // session keeps the binding of its initialize (see inSession)
     const header = req.headers['x-minizep-group'];
     const group = (isMcp ? url.searchParams.get('group') : null) ?? (typeof header === 'string' ? header : null);
     let principal = auth.principal;
@@ -391,6 +404,26 @@ interface UiState {
   hosts: ReadonlySet<string>;
   sessionMs: number;
   throttle: LoginThrottle;
+}
+
+/**
+ * The caller of a request in an MCP session bound (or not) at initialize. The
+ * binding is the session's, as its instructions say: a request without one
+ * keeps it (403 once the token may no longer read the group), and one naming
+ * another group is refused, never switched to silently.
+ */
+function inSession(
+  p: Principal,
+  bound: string | undefined,
+): { ok: true; principal: Principal } | { ok: false; status: number; error: string } {
+  if (p.boundGroup === bound) return { ok: true, principal: p };
+  if (p.boundGroup === undefined) {
+    const kept = bindGroup(p, bound!);
+    if (kept) return { ok: true, principal: kept };
+    return { ok: false, status: 403, error: `group "${bound}" not permitted for this token` };
+  }
+  const session = bound === undefined ? 'is not bound to a group' : `is bound to group "${bound}"`;
+  return { ok: false, status: 400, error: `this session ${session}: start a new session to bind group "${p.boundGroup}"` };
 }
 
 function describe(a: AddressInfo, ui: boolean): string {

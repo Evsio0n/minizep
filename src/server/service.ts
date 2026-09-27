@@ -51,9 +51,6 @@ export interface ServiceOptions {
 /** Failed episodes one background retry pass takes at most. */
 const RETRY_BATCH = 5;
 
-/** Up to this many supporting episodes are read one by one for fact sources; more, the group's at once. */
-const SOURCE_LOOKUPS = 20;
-
 /** The methodology the memory_guide tool and GET /v1/guide return; resolves from src/server and dist/server alike. */
 const GUIDE = new URL('../../docs/MEMORY-GUIDE.md', import.meta.url);
 
@@ -305,8 +302,20 @@ function finishedJob(j: Job): string {
 const groupId = z.string().optional().describe("Memory namespace (default: the token's default group)");
 const instant = (what: string) => z.string().optional().describe(`ISO-8601 instant: ${what}`);
 const asOf = instant('what the graph knew at that time (knowledge time, default now)');
-/** Bounded: a source_ref names a record, it does not hold it. */
-const refField = (max: number, what: string) => z.string().trim().min(1).max(max).optional().describe(what);
+/**
+ * Bounded: a source_ref names a record, it does not hold it. One line: it is
+ * printed into the fact lines every reader of the group gets, where a line
+ * break would let a writer add a fact line of its own.
+ */
+const refField = (max: number, what: string) =>
+  z
+    .string()
+    .trim()
+    .min(1)
+    .max(max)
+    .regex(/^[^\p{Cc}\p{Zl}\p{Zp}]*$/u, 'no line breaks or control characters')
+    .optional()
+    .describe(what);
 const sourceRef = z
   .strictObject({
     path: refField(500, 'Path of the file, e.g. docs/results/cp8.md'),
@@ -1193,16 +1202,12 @@ export class MemoryService {
   private async withSources(rows: FactRow[], group: string): Promise<FactRow[]> {
     const ids = [...new Set(rows.flatMap((r) => r.episodes))];
     if (ids.length === 0) return rows;
-    const store = this.zep.store;
-    const episodes =
-      ids.length <= SOURCE_LOOKUPS ? await Promise.all(ids.map((id) => store.getEpisode(id))) : await store.getEpisodes(group);
-    const cited = new Map<string, EpisodicNode>();
-    for (const e of episodes) if (e?.sourceRef && e.groupId === group) cited.set(e.uuid, e);
+    const cited = new Map((await this.zep.store.getEpisodeSources(group, ids)).map((e) => [e.uuid, e]));
     if (cited.size === 0) return rows;
     return rows.map((r) => {
       const sources = r.episodes.flatMap((id) => {
         const e = cited.get(id);
-        return e ? [{ episode: e.uuid, name: e.name, source_ref: sourceRefRow(e.sourceRef!) }] : [];
+        return e ? [{ episode: e.uuid, name: e.name, source_ref: sourceRefRow(e.sourceRef) }] : [];
       });
       return sources.length ? { ...r, sources } : r;
     });

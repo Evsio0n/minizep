@@ -133,15 +133,16 @@ export async function call(client: Client, name: string, args: Record<string, un
   };
 }
 
-/** One raw JSON-RPC request to /mcp, for checks the SDK client would hide. */
+/** One raw JSON-RPC request to /mcp (or `path`), for checks the SDK client would hide. */
 export async function rawMcp(
   base: string,
   token: string,
   sessionId: string,
   method: string,
   params: Record<string, unknown>,
+  path = '/mcp',
 ): Promise<Response> {
-  return fetch(`${base}/mcp`, {
+  return fetch(`${base}${path}`, {
     method: 'POST',
     headers: {
       authorization: `Bearer ${token}`,

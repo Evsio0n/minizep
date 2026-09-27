@@ -254,7 +254,10 @@ export class IngestPipeline {
   private readonly yielding = new Map<string, AbortController>();
   /** per group, what holds its lock now (see lockHolder) */
   private readonly holders = new Map<string, string>();
-  /** episodes being processed right now (see cancelEpisode) */
+  /**
+   * episodes being processed right now (see cancelEpisode): claimed under the
+   * save lock, together with the read the processing starts from
+   */
   private readonly processing = new Set<string>();
 
   constructor(
@@ -266,8 +269,17 @@ export class IngestPipeline {
   /** Save + process, as one serialised step for the group. */
   async addEpisode(input: EpisodeInput, options: IngestOptions = {}): Promise<IngestResult> {
     return this.exclusive(input.groupId, 'a synchronous add_memory', async () => {
-      const { episode, duplicate } = await this.saveLocks.run(input.groupId, () => this.saveLocked(input, options));
-      return duplicate ? duplicateResult(episode) : this.processLocked(episode);
+      const { episode, duplicate } = await this.saveLocks.run(input.groupId, async () => {
+        const saved = await this.saveLocked(input, options);
+        if (!saved.duplicate) this.processing.add(saved.episode.uuid);
+        return saved;
+      });
+      if (duplicate) return duplicateResult(episode);
+      try {
+        return await this.processLocked(episode);
+      } finally {
+        this.processing.delete(episode.uuid);
+      }
     });
   }
 
@@ -303,11 +315,20 @@ export class IngestPipeline {
     signal?: AbortSignal,
     onProgress?: ProcessOptions['onProgress'],
   ): Promise<IngestResult> {
-    // re-read under the lock: another caller may have processed it meanwhile
-    const episode = (await this.store.getEpisode(saved.uuid)) ?? saved;
-    return isProcessed(episode) || episode.status === 'forgotten'
-      ? duplicateResult(episode)
-      : this.processLocked(episode, signal, onProgress);
+    try {
+      // re-read under the lock: another caller may have processed it meanwhile.
+      // Claimed in the same save-lock turn, so a cancel (cancelEpisode) either
+      // forgets it before this read or finds it claimed, never in between
+      const episode = await this.saveLocks.run(saved.groupId, async () => {
+        this.processing.add(saved.uuid);
+        return (await this.store.getEpisode(saved.uuid)) ?? saved;
+      });
+      return isProcessed(episode) || episode.status === 'forgotten'
+        ? duplicateResult(episode)
+        : await this.processLocked(episode, signal, onProgress);
+    } finally {
+      this.processing.delete(saved.uuid);
+    }
   }
 
   /**
@@ -758,10 +779,10 @@ export class IngestPipeline {
   }
 
   /**
-   * Only ever executed while holding the group's lock. A cancelled run
-   * (`signal`: a background retry giving way, see RetryOptions.background,
-   * or a cancelled job) throws the signal's reason and leaves the episode as
-   * it was.
+   * Only ever executed while holding the group's lock, on an episode the
+   * caller claimed (see processing). A cancelled run (`signal`: a background
+   * retry giving way, see RetryOptions.background, or a cancelled job) throws
+   * the signal's reason and leaves the episode as it was.
    */
   private async processLocked(
     episode: EpisodicNode,
@@ -771,7 +792,6 @@ export class IngestPipeline {
     const attempts = episode.attempts;
     // counted when the attempt starts, stored with its outcome below
     episode.attempts = (attempts ?? 0) + 1;
-    this.processing.add(episode.uuid);
     try {
       signal?.throwIfAborted();
       // the 'processed' mark commits with the graph writes: a retry must never
@@ -795,8 +815,6 @@ export class IngestPipeline {
       episode.error = ((err as Error)?.message ?? String(err)).slice(0, 500);
       await this.store.addEpisode(episode);
       return { ...emptyResult(episode), status: 'failed', failed: true, error: episode.error };
-    } finally {
-      this.processing.delete(episode.uuid);
     }
   }
 }
@@ -882,16 +900,40 @@ const LITERAL_VALUES = [
 ];
 
 /**
- * The extraction's mention of a known entity when it is longer than the
- * entity's name and contains it ("unified KEEP" for "KEEP"): a qualified name
- * that may be another thing. A shorter or differently spelled mention (an
- * abbreviation, an alias) is not flagged.
+ * The extraction's mention of a known entity when it is the entity's name
+ * plus a word of its own ("unified KEEP", "KEEP 試驗模型", "KEEP(749)" for
+ * "KEEP"): a qualified name that may be another thing. The name must stand
+ * apart in it (see standsApart), so a longer spelling ("PostgreSQL" for
+ * "Postgres"), a possessive ("KEEP's") or a file path of it
+ * ("eval/mechanism_eval_v1.py") is not flagged, nor is a shorter or
+ * differently spelled mention (an abbreviation, an alias).
  */
-function widerMention(mention: string | undefined, name: string): string | undefined {
+export function widerMention(mention: string | undefined, name: string): string | undefined {
   const m = mention?.trim();
-  if (!m || m.length <= name.length) return undefined;
-  return m.toLowerCase().includes(name.toLowerCase()) ? m : undefined;
+  const n = name.trim().toLowerCase();
+  if (!m || !n || m.length <= n.length) return undefined;
+  const lower = m.toLowerCase();
+  for (let i = lower.indexOf(n); i !== -1; i = lower.indexOf(n, i + 1)) {
+    const end = i + n.length;
+    const rest = (lower.slice(0, i) + lower.slice(end)).replace(/['’]s\b/u, '');
+    if (/[\p{L}\p{N}]/u.test(rest) && standsApart(lower[i - 1], lower[i]) && standsApart(lower[end], lower[end - 1])) {
+      return m;
+    }
+  }
+  return undefined;
 }
+
+/**
+ * Does the name end where `c` sits next to `edge`, its own first or last
+ * character: nothing, a space, dash or bracket, or a change between CJK and
+ * other scripts. An apostrophe, dot, slash or letter continues it.
+ */
+function standsApart(c: string | undefined, edge: string | undefined): boolean {
+  return !c || /[\s\p{Pd}\p{Ps}\p{Pe}]/u.test(c) || isCjk(c) !== isCjk(edge);
+}
+
+const isCjk = (c: string | undefined) =>
+  !!c && /[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]/u.test(c);
 
 /** Is the name only a literal value, which the extraction prompt says is never an entity? */
 function isLiteralValue(name: string): boolean {
