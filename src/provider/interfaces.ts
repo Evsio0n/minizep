@@ -77,14 +77,19 @@ export interface ExtractOptions {
    * summaries, so the LLM can return an updated summary that keeps them.
    */
   knownEntities?: KnownEntity[];
-  /** the episode the call is for, for the provider's log */
+  /** the episode the call is for, for the provider's log, and what cancels it */
   context?: LLMCallContext;
 }
 
-/** The episode and group an LLM call works for; only used to label log lines. */
+/** The episode and group an LLM call works for (to label log lines), and what cancels it. */
 export interface LLMCallContext {
   episodeId?: string;
   groupId?: string;
+  /**
+   * Aborted when the call is no longer wanted (a background retry giving way
+   * to a write): a provider stops its request and throws the signal's reason.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ExtractionResult {

@@ -24,7 +24,8 @@ export const TOKENS = 'tokA:teamA,tokB:teamB,tokC:teamC|shared';
 /**
  * The rule-based mock extractor ("Alice works at Acme"), plus switches a test
  * can flip: fail like an LLM answering HTTP 500, or hold every call until
- * released (to observe queued and in-flight work).
+ * released (to observe queued and in-flight work). A held call that is
+ * cancelled (its context's signal) stops, as a real request does.
  */
 export class ControlledLLM implements LLMProvider {
   private readonly inner = new MockLLMProvider();
@@ -52,7 +53,13 @@ export class ControlledLLM implements LLMProvider {
     options?: ExtractOptions,
   ): Promise<ExtractionResult> {
     this.calls++;
-    if (this.gate) await this.gate;
+    const signal = options?.context?.signal;
+    if (this.gate) {
+      await Promise.race([
+        this.gate,
+        new Promise((_, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })),
+      ]);
+    }
     await new Promise((r) => setTimeout(r, 1));
     if (this.failWith) throw new Error(this.failWith);
     return this.inner.extract(content, known, knownFacts, options);

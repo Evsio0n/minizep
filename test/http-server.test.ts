@@ -637,7 +637,7 @@ test('shutdown: a drain that times out reports it and leaves the episode pending
  * New and extended tools (C4)
  * ================================================================ */
 
-test('retry: failed episodes are retried in the background until they succeed or reach the limit; retry_failed still takes those', async () => {
+test('retry: failed episodes are retried in the background until they succeed or reach the limit, giving way to writes; retry_failed still takes those', async () => {
   const srv = await startServer({ retryIntervalMs: 20, retryMax: 2, jobs: new JobQueue({ concurrency: 1 }) });
   try {
     const a = await connect(srv.base, 'tokA');
@@ -671,6 +671,21 @@ test('retry: failed episodes are retried in the background until they succeed or
     srv.llm.release();
     await waitFor(async () => (await srv.zep.store.getEpisode(earlier.uuid))?.status === 'processed');
     assert.equal((await stored())?.status, 'failed', 'the given-up one is not');
+
+    // a retry under way gives way to a write that comes in for its group: its LLM call is
+    // cancelled, the write goes first, and a later pass retries it without counting that attempt
+    srv.llm.hold();
+    const before = srv.llm.calls;
+    const next = pendingEpisode('teamA', 'Eve works at Initech.', 'failed');
+    await srv.zep.store.addEpisode(next);
+    await waitFor(() => srv.llm.calls === before + 1);
+    const write = call(a.client, 'add_memory', { content: 'Frank works at Hooli.' });
+    await waitFor(() => srv.llm.calls === before + 2);
+    assert.deepEqual([(await srv.zep.store.getEpisode(next.uuid))?.status, (await srv.zep.store.getEpisode(next.uuid))?.attempts], ['failed', undefined]);
+    srv.llm.release();
+    assert.equal((await write).structured.status, 'processed');
+    await waitFor(async () => (await srv.zep.store.getEpisode(next.uuid))?.status === 'processed');
+    assert.equal((await srv.zep.store.getEpisode(next.uuid))?.attempts, 1);
 
     // by hand it is retried whatever its count, and that attempt counts too
     const retry = await call(a.client, 'retry_failed');

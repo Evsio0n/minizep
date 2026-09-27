@@ -396,6 +396,8 @@ export class MemoryService {
   private readonly inflight = new Set<Promise<unknown>>();
   /** a background retry pass is running (the next tick skips instead of piling up) */
   private sweeping = false;
+  /** the background retry was stopped (shutdown): a pass under way takes no further episode */
+  private retryStopped = false;
 
   constructor(opts: ServiceOptions) {
     this.zep = opts.zep;
@@ -455,9 +457,12 @@ export class MemoryService {
    * One pass of the background retry, over every group: the oldest failed
    * episodes tried fewer than `retryMax` times, at most `batch` of them, each
    * through the group's lock like any processing. A pass while another is
-   * still running does nothing. A group with a user's write queued or running
-   * is left for a later pass: a retry holds the group's lock for as long as its
-   * LLM calls take, and the write would wait behind it.
+   * still running does nothing. A retry holds the group's lock for as long as
+   * its LLM calls take, so it stays out of the way of a user's write: a group
+   * with an async write queued or running is left for a later pass, and a
+   * retry under way gives way to any write that comes in for its group (its
+   * LLM calls are aborted, and the episode stays failed without counting the
+   * attempt, for a later pass).
    */
   async retrySweep(batch = RETRY_BATCH): Promise<{ retried: number; succeeded: number; still_failing: number }> {
     if (this.sweeping) return { retried: 0, succeeded: 0, still_failing: 0 };
@@ -467,9 +472,10 @@ export class MemoryService {
         this.zep.ingest.retryFailed(undefined, {
           maxAttempts: this.retryMax,
           limit: batch,
+          background: true,
           skipGroup: (group) => {
             const { queued, running } = this.jobs.statsFor((j) => j.group === group);
-            return queued + running > 0;
+            return this.retryStopped || queued + running > 0;
           },
         }),
       );
@@ -482,8 +488,10 @@ export class MemoryService {
 
   /**
    * Run retrySweep every `everyMs` (0: never) until the returned function is
-   * called. The timer does not keep the process alive; a pass in progress is
-   * waited for by drain() like any ingestion.
+   * called, which also cancels the retry under way and ends its pass (the
+   * episodes stay failed, for the next start). The timer does not keep the
+   * process alive; a pass in progress is waited for by drain() like any
+   * ingestion.
    */
   retryEvery(everyMs: number, log: (msg: string) => void = () => undefined): () => void {
     if (everyMs <= 0) return () => undefined;
@@ -498,7 +506,11 @@ export class MemoryService {
       );
     }, everyMs);
     timer.unref();
-    return () => clearInterval(timer);
+    return () => {
+      clearInterval(timer);
+      this.retryStopped = true;
+      this.zep.ingest.cancelBackground();
+    };
   }
 
   /** A job processing a saved episode; a failed extraction fails the job. */
