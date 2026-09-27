@@ -1223,8 +1223,27 @@ class EpisodeRun {
       }
     }
 
-    // a new edge; an earlier stint must not overlap the later record
-    let end = earliest(invalidAt, later?.validAt);
+    // a new edge. It ends where the text says, or earlier where another record
+    // says it cannot go on: an end the text did not state carries its reason
+    // (invalidatedBy, which reopen_fact keeps as closedBy)
+    let end = invalidAt;
+    let endedBy: string | undefined;
+    const capAt = (at: Date | undefined, f: EntityEdge, how: string) => {
+      if (!at || (end && end <= at)) return;
+      end = at;
+      endedBy = `${how} ${f.uuid.slice(0, 8)}: ${f.fact}`.slice(0, 120);
+    };
+    // an earlier stint must not overlap the later record, in a slot that holds
+    // one value at a time (the rule of otherValues). Other relations hold
+    // several records of the same target at once (a result dated only by its
+    // day sorts before that day's other records on the same dataset): a later
+    // record ends this one only when the judge says so (`ended` below)
+    if (
+      later &&
+      (plan.cand.replacesPrevious === true || SINGLE_VALUED.has(relation) || later.attributes?.replacesPrevious === true)
+    ) {
+      capAt(later.validAt, later, 'runs into');
+    }
 
     // records of this relationship over t that say something else ("Bob is a
     // senior developer at Initech" vs "Bob works at Initech"). They are
@@ -1280,7 +1299,7 @@ class EpisodeRun {
     const alongside = restates ? kept.filter((f) => shown.includes(f) && !restates.includes(f)) : [];
     const same = kept.find((f) => !alongside.includes(f));
     if (same) return this.reinforce(same, invalidAt, text);
-    for (const f of alongside) end = earliest(end, f.invalidAt);
+    for (const f of alongside) capAt(f.invalidAt, f, 'ends with');
 
     // (`ended` is only filled when validAt is known)
     for (const old of ended) {
@@ -1290,14 +1309,14 @@ class EpisodeRun {
         // too: a value that conflicts with it may come from a document added
         // late as well as from a correction learned late, and only a text that
         // dates the end of the note's value tells them apart (see applyInvalidation)
-        end = earliest(end, old.validAt);
+        capAt(old.validAt, old, 'runs into');
         continue;
       }
       const at = this.endFor(old, validAt!);
       if (!at) continue;
       // the new fact takes over from the old one, so it cannot outlive the
       // old one's known end either
-      end = earliest(end, old.invalidAt);
+      capAt(old.invalidAt, old, 'ends with');
       this.close(old, at, `superseded by: ${text}`);
     }
 
@@ -1315,8 +1334,11 @@ class EpisodeRun {
       invalidAt: end,
       createdAt: this.now,
       attributes: withStart(
-        // kept so that an older value added later still ends where this one began
-        plan.cand.replacesPrevious === true ? { replacesPrevious: true } : {},
+        {
+          // kept so that an older value added later still ends where this one began
+          ...(plan.cand.replacesPrevious === true ? { replacesPrevious: true } : {}),
+          ...(endedBy ? { invalidatedBy: endedBy } : {}),
+        },
         startFromEpisode,
       ),
     };
@@ -1365,7 +1387,12 @@ class EpisodeRun {
     // the end the fact had before this episode, for forgetEpisode to restore
     const before = this.invalidated.includes(f) ? f.attributes.previousEnd : f.invalidAt?.toISOString();
     f.invalidAt = at;
-    if (this.created.has(f)) return;
+    if (this.created.has(f)) {
+      // the text states this end: a cap's reason (see resolveFact) no longer applies
+      const { invalidatedBy: _cap, ...rest } = f.attributes;
+      f.attributes = rest;
+      return;
+    }
     f.expiredAt = this.now;
     f.attributes = {
       ...withoutEpisodeClosure(f.attributes),
