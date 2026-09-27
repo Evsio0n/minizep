@@ -81,15 +81,22 @@ export interface ExtractOptions {
   context?: LLMCallContext;
 }
 
-/** The episode and group an LLM call works for (to label log lines), and what cancels it. */
+/** The episode and group an LLM call works for (to label log lines), what cancels it, and who watches it. */
 export interface LLMCallContext {
   episodeId?: string;
   groupId?: string;
   /**
    * Aborted when the call is no longer wanted (a background retry giving way
-   * to a write): a provider stops its request and throws the signal's reason.
+   * to a write, a cancelled job): a provider stops its request and throws the
+   * signal's reason.
    */
   signal?: AbortSignal;
+  /**
+   * Told before each request a provider sends for the call (retries, raised
+   * budgets and a repair round included), with its max_tokens, so a job's
+   * status can say which attempt it is on.
+   */
+  onRequest?: (maxTokens: number) => void;
 }
 
 export interface ExtractionResult {

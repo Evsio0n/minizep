@@ -59,8 +59,9 @@ Do not store:
 - **State a change as a change**: "moved from X to Y", "no longer", "left", "was cancelled", "now
   listens on". The fact it replaces closes by itself; do not invalidate it first.
 - **Keep the details** in the sentence: versions, ports, amounts, dates, reasons.
-- **`async: true`**: extraction takes seconds, the call answers at once with a job id. A failed
-  extraction is kept and retried; `graph_stats` shows how many failed.
+- **`async: true`**: the call answers at once with a job id. Extraction typically takes 1–2 minutes
+  with a reasoning model; poll `memory_job_status` every 15 s (it shows the stage and the time
+  elapsed). A failed extraction is kept and retried; `graph_stats` shows how many failed.
 - Optional: `idempotency_key` makes a resend a no-op, `name` labels the note, `group_id` picks a
   namespace (default: yours).
 
@@ -107,7 +108,8 @@ use and your role in each: reader (read-only), writer or owner.
 - The default group has nothing about what you are working on: call `list_groups` and search the group that
   matches before concluding the memory is empty.
 - A result that ends with "(no group_id: …)" came from the default (or bound) group; the note lists your other groups.
-  If you just stored something that belongs to one of them, `forget_episode` it and add it there.
+  If you just stored something that belongs to one of them: `cancel_job` if it has not finished, else
+  `forget_episode`; then add it there.
 - A read-only group (reader) is there to be searched: do not try to add, correct or forget anything in it.
   When something there is wrong or missing, tell the user, and ask them which group a new note should go to.
 - Never copy facts from one group into another to "share" them; ask the user which group a new topic belongs to.
@@ -121,6 +123,7 @@ use and your role in each: reader (read-only), writer or owner.
 | A stored fact was never true | `invalidate_fact` with `retract: true` |
 | A fact was closed by mistake | `reopen_fact` |
 | A whole note was wrong or not wanted | `forget_episode` with the `ep` id (read it with `get_episode` first) |
+| Wrote to the wrong group | `cancel_job` if it has not finished, else `forget_episode`; then add it to the right group |
 | Writes failed | `memory_job_status` / `graph_stats` (failed count), then `retry_failed` once the cause is fixed |
 
 - News (a new value, a new event): `add_memory`. Something simply ended and you have the fact's

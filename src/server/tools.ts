@@ -90,6 +90,8 @@ const READ_ONLY = { readOnlyHint: true, openWorldHint: false };
 const ADDS = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
 /** retry_failed: re-processes what is already stored */
 const REPAIRS = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
+/** cancel_job: an unfinished write never reaches the memory (its note is kept as forgotten) */
+const CANCELS = { readOnlyHint: false, destructiveHint: false, openWorldHint: false };
 /** invalidate_fact, reopen_fact, forget_episode: change what the memory holds true (history is kept) */
 const CORRECTS = { readOnlyHint: false, destructiveHint: true, openWorldHint: false };
 
@@ -166,7 +168,9 @@ function describeAdd(o: AddMemoryOutcome, ms: number) {
     case 'queued':
       return ok(
         `queued job ${o.job_id} for episode ${ep} (stored as pending in group "${o.group_id}")\n` +
-          'status: queued\npoll memory_job_status with this id',
+          'status: queued\n' +
+          'this typically takes 1-2 minutes: poll memory_job_status with this id every 15 s; ' +
+          'cancel_job with it stops the write if it should not happen (e.g. the wrong group)',
         o,
       );
     case 'duplicate':
@@ -201,14 +205,26 @@ function describeAdd(o: AddMemoryOutcome, ms: number) {
   return ok(lines.join('\n'), o);
 }
 
+/** A duration as "47s" or "1m32s". */
+function seconds(ms: number): string {
+  const s = Math.round(ms / 1000);
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`;
+}
+
+/** The stage with its detail, e.g. "extracting (LLM attempt 2, max_tokens=16000)". */
+const stageOf = (job: JobRow) => (job.stage_detail ? `${job.stage} (${job.stage_detail})` : job.stage);
+
 function describeJob(job: JobRow): string {
   const lines = [
     `job      : ${job.id}`,
     `status   : ${job.status}`,
+    `stage    : ${stageOf(job)}`,
     `label    : ${job.label}`,
     job.episode_uuid ? `episode  : ${job.episode_uuid.slice(0, 8)}` : '',
     `created  : ${job.created_at}`,
+    job.started_at ? `started  : ${job.started_at}` : '',
     job.finished_at ? `finished : ${job.finished_at}` : '',
+    `elapsed  : ${seconds(job.elapsed_ms)}`,
   ].filter(Boolean);
   if (job.error) lines.push(`error    : ${job.error}`);
   const r = job.result as AddMemoryOutcome | null;
@@ -272,7 +288,8 @@ function withGroupHints(server: McpServer, principal: () => Principal): McpServe
       const hint =
         name === 'add_memory'
           ? `(no group_id: stored in ${which}. This connection also has ${others}; ` +
-            'if this belongs to one of them, call forget_episode on this episode and add it again with that group_id.)'
+            'if this belongs to one of them, take it back (cancel_job while its job has not finished, else ' +
+            'forget_episode on this episode) and add it again with that group_id.)'
           : `(no group_id: this used ${which}. This connection can also use ${others}; ` +
             'pass group_id to look there, or call list_groups.)';
       return { ...result, content: [{ ...first, text: `${first.text ?? ''}\n${hint}` }, ...result.content!.slice(1)] };
@@ -507,8 +524,8 @@ export function registerTools(target: McpServer, ctx: ToolContext): void {
     {
       title: 'Ingestion job status',
       description:
-        'Use to check an add_memory made with async=true: pass its job_id, or omit it to list recent jobs. ' +
-        'See memory_guide.',
+        'Use to check an add_memory made with async=true (typically 1-2 minutes; poll every 15 s): pass its ' +
+        'job_id for its stage and elapsed time, or omit it to list recent jobs. See memory_guide.',
       annotations: READ_ONLY,
       inputSchema: {
         job_id: z.string().optional(),
@@ -523,7 +540,35 @@ export function registerTools(target: McpServer, ctx: ToolContext): void {
         }
         const jobs = service.listJobs(p(), limit ?? 20);
         if (jobs.length === 0) return ok('no jobs', { jobs });
-        return ok(jobs.map((j) => `${j.id.slice(0, 8)} ${j.status.padEnd(9)} ${j.label}`).join('\n'), { jobs });
+        return ok(
+          jobs
+            .map((j) => `${j.id.slice(0, 8)} ${j.status.padEnd(9)} ${seconds(j.elapsed_ms).padStart(6)} ${j.label} ${stageOf(j)}`)
+            .join('\n'),
+          { jobs },
+        );
+      }),
+  );
+
+  server.registerTool(
+    'cancel_job',
+    {
+      title: 'Cancel job',
+      description:
+        'Use when an async add_memory should not happen after all (e.g. it went to the wrong group) and ' +
+        'memory_job_status shows it queued or running: it is stopped before it writes anything and its ' +
+        'note is kept as "forgotten". A finished job cannot be cancelled: forget_episode takes it back. ' +
+        'See memory_guide.',
+      inputSchema: shapes.cancelJob,
+      annotations: CANCELS,
+    },
+    (args) =>
+      guard(async () => {
+        const r = await service.cancelJob(p(), args);
+        return ok(
+          `cancelled job ${r.job.id} (${r.job.error}): nothing was written\n` +
+            `episode ${r.episode.uuid.slice(0, 8)} is kept as ${r.episode.status} in group "${r.group_id}"`,
+          r,
+        );
       }),
   );
 

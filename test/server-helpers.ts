@@ -54,6 +54,7 @@ export class ControlledLLM implements LLMProvider {
   ): Promise<ExtractionResult> {
     this.calls++;
     const signal = options?.context?.signal;
+    signal?.throwIfAborted();
     if (this.gate) {
       await Promise.race([
         this.gate,

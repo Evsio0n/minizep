@@ -415,7 +415,7 @@ const pendingEpisode = (groupId: string, content: string, status?: EpisodicNode[
 });
 
 for (const backend of backends) {
-  test(`[${backend.name}] async add_memory stores the episode as pending before answering`, async () => {
+  test(`[${backend.name}] async add_memory stores the episode as pending before answering, shows its stage and can be cancelled`, async () => {
     const store = await backend.make();
     const srv = await startServer({ store });
     try {
@@ -425,15 +425,41 @@ for (const backend of backends) {
       assert.equal(r.structured.status, 'queued');
       assert.ok(r.structured.job_id);
       assert.match(r.text, /queued job [0-9a-f-]{36}/);
+      assert.match(r.text, /1-2 minutes: poll memory_job_status .*; cancel_job/);
       const saved = await store.getEpisode(r.structured.episode_uuid);
       assert.equal(saved?.status, 'pending', 'the episode is durable before the job id is returned');
 
+      // a poll says where the write is and for how long
+      const poll = (job_id: string) => call(a.client, 'memory_job_status', { job_id });
+      await waitFor(async () => (await poll(r.structured.job_id)).structured.stage === 'extracting');
+      const running = await poll(r.structured.job_id);
+      assert.match(running.text, /status\s+: running\nstage\s+: extracting\n/);
+      assert.match(running.text, /started\s+: \d{4}-.*\nelapsed\s+: \d+s/s);
+      assert.equal(typeof running.structured.elapsed_ms, 'number');
+
       srv.llm.release();
       await srv.app.jobs.drain();
-      const status = await call(a.client, 'memory_job_status', { job_id: r.structured.job_id });
-      assert.match(status.text, /status\s+: succeeded/);
+      const status = await poll(r.structured.job_id);
+      assert.match(status.text, /status\s+: succeeded\nstage\s+: done/);
       assert.equal(status.structured.result.status, 'processed');
       assert.equal((await store.getEpisode(r.structured.episode_uuid))?.status, 'processed');
+      const late = await api(srv.base, 'POST', `/v1/memories/jobs/${r.structured.job_id}/cancel`, { token: 'tokA' });
+      assert.equal(late.status, 409, 'a finished job cannot be cancelled');
+      assert.match(late.body.error, /already succeeded.*forget_episode/);
+
+      // cancelled while held at extraction: nothing is written, the note is kept as forgotten
+      const [facts, calls] = [(await store.getFacts('teamA')).length, srv.llm.calls];
+      srv.llm.hold();
+      const bob = await call(a.client, 'add_memory', { content: 'Bob works at Borealis.', async: true });
+      await waitFor(() => srv.llm.calls > calls);
+      const cancelled = await call(a.client, 'cancel_job', { job_id: bob.structured.job_id });
+      assert.equal(cancelled.isError, false, cancelled.text);
+      const { job, episode } = cancelled.structured;
+      assert.deepEqual([job.status, job.stage, episode.status, episode.error], ['cancelled', 'cancelled', 'forgotten', 'cancelled while processing']);
+      srv.llm.release();
+      await srv.app.jobs.drain();
+      assert.equal((await store.getFacts('teamA')).length, facts);
+      assert.equal((await store.getEpisode(bob.structured.episode_uuid))?.status, 'forgotten');
     } finally {
       await srv.close();
       await backend.dispose(store);

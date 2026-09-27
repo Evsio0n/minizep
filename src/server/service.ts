@@ -120,12 +120,22 @@ export interface EpisodeRow {
 export interface JobRow {
   id: string;
   status: Job['status'];
+  /**
+   * queued, waiting_for_group_lock, extracting, embedding, judging, writing
+   * (see IngestStage), then done, failed or cancelled
+   */
+  stage: string;
+  /** e.g. "held by job 1a2b3c4d", "LLM attempt 2, max_tokens=16000", "3/7 facts" */
+  stage_detail: string | null;
   label: string;
   group_id: string | null;
   episode_uuid: string | null;
   created_at: string;
+  /** when it left the queue (it may still wait for the group's lock) */
   started_at: string | null;
   finished_at: string | null;
+  /** since it was queued, until it finished or now */
+  elapsed_ms: number;
   error: string | null;
   result: unknown;
 }
@@ -221,19 +231,34 @@ function episodeRow(e: EpisodicNode): EpisodeRow {
   };
 }
 
-function jobRow(j: Job): JobRow {
+function jobRow(j: Job, stageDetail = j.stageDetail): JobRow {
   return {
     id: j.id,
     status: j.status,
+    stage: j.stage,
+    stage_detail: stageDetail ?? null,
     label: j.label,
     group_id: j.group ?? null,
     episode_uuid: j.ref ?? null,
     created_at: j.createdAt.toISOString(),
     started_at: iso(j.startedAt),
     finished_at: iso(j.finishedAt),
+    elapsed_ms: (j.finishedAt ?? new Date()).getTime() - j.createdAt.getTime(),
     error: j.error ?? null,
     result: j.result ?? null,
   };
+}
+
+/** How a job's processing names itself to a job waiting behind it for the group's lock. */
+const jobHolder = (j: Job) => `job ${j.id.slice(0, 8)}`;
+
+/** Why a finished job cannot be cancelled, and what to do instead. */
+function finishedJob(j: Job): string {
+  const ep = j.ref ? ` ${j.ref.slice(0, 8)}` : '';
+  const why = `job ${j.id.slice(0, 8)} already ${j.status}: a finished job cannot be cancelled`;
+  if (j.status === 'succeeded') return `${why}; forget_episode${ep} takes back what it wrote`;
+  if (j.status === 'failed') return `${why}; its episode${ep} is kept as failed for a retry: forget_episode it if it is not wanted`;
+  return why;
 }
 
 /* ---------------- input shapes (shared by MCP tools and REST) ---------------- */
@@ -260,9 +285,12 @@ export const shapes = {
       .optional()
       .describe(
         'Store the episode and return a job id immediately instead of waiting. ' +
-          'Extraction takes seconds; use this for long documents or bulk ingestion, ' +
-          'then poll memory_job_status.',
+          'Extraction typically takes 1-2 minutes with a reasoning model; poll memory_job_status ' +
+          '(cancel_job stops it).',
       ),
+  },
+  cancelJob: {
+    job_id: z.string().min(1).describe('The job id add_memory returned, or a prefix of at least 8 characters'),
   },
   search: {
     query: z.string().min(1),
@@ -350,6 +378,7 @@ export type EpisodeInputShape = Input<typeof shapes.episode>;
 export type InvalidateFactInputShape = Input<typeof shapes.invalidateFact>;
 export type ReopenFactInputShape = Input<typeof shapes.reopenFact>;
 export type ForgetEpisodeInputShape = Input<typeof shapes.forgetEpisode>;
+export type CancelJobInput = Input<typeof shapes.cancelJob>;
 export type GroupInput = Input<typeof shapes.group>;
 export type GraphInput = Input<typeof shapes.graph>;
 export type EntityInput = Input<typeof shapes.entity>;
@@ -513,14 +542,24 @@ export class MemoryService {
     };
   }
 
-  /** A job processing a saved episode; a failed extraction fails the job. */
+  /**
+   * A job processing a saved episode; a failed extraction fails the job. The
+   * job shows the stage the pipeline reports, and cancelJob aborts it.
+   */
   private enqueue(episode: EpisodicNode, label: string): Job {
     const group = episode.groupId;
     return this.jobs.submit(
       `${label}:${group}`,
-      async () => {
+      async (job, signal) => {
         try {
-          const r = await this.zep.ingest.processEpisode(episode.uuid);
+          const r = await this.zep.ingest.processEpisode(episode.uuid, {
+            signal,
+            holder: jobHolder(job),
+            onProgress: ({ stage, detail }) => {
+              job.stage = stage;
+              job.stageDetail = detail;
+            },
+          });
           if (r.status === 'failed') {
             throw new Error(`extraction failed: ${r.error ?? 'unknown error'} (episode stored for retry)`);
           }
@@ -535,19 +574,58 @@ export class MemoryService {
   }
 
   job(p: Principal, rawId: string): JobRow {
+    return this.jobRow(this.findJob(p, rawId));
+  }
+
+  listJobs(p: Principal, limit = 20): JobRow[] {
+    return this.jobs.list(limit, (j) => this.canSee(p, j)).map((j) => this.jobRow(j));
+  }
+
+  /**
+   * Stop an async write that has not finished, for a caller that may write to
+   * its group. A queued job never runs; a running one is aborted, and its
+   * pipeline writes nothing after that (its writes are atomic). Its episode
+   * is then kept as 'forgotten', "cancelled before processing" (no LLM call
+   * had started) or "cancelled while processing". A finished job is a 409,
+   * and so is one whose writes were under way: forget_episode takes those
+   * back.
+   */
+  async cancelJob(p: Principal, input: CancelJobInput) {
+    const job = this.findJob(p, input.job_id);
+    if (job.group === undefined || job.ref === undefined) throw new ServiceError(409, 'only a memory write can be cancelled');
+    const group = resolveGroup(p, job.group, 'write');
+    if (job.status !== 'queued' && job.status !== 'running') throw new ServiceError(409, finishedJob(job));
+    // read in the same tick as the abort below: the stage cannot move in between
+    const started = job.stage !== 'queued' && job.stage !== 'waiting_for_group_lock';
+    const settled = await this.jobs.cancel(job.id, new Error(`cancelled ${started ? 'while' : 'before'} processing`));
+    if (settled?.status !== 'cancelled') throw new ServiceError(409, finishedJob(job));
+    try {
+      const episode = await this.zep.ingest.cancelEpisode(job.ref, { groupId: group, reason: job.error ?? 'cancelled' });
+      this.persistence?.schedule(this.zep);
+      return { group_id: group, job: this.jobRow(job), episode: episodeRow(episode) };
+    } catch (err) {
+      throw asServiceError(err);
+    }
+  }
+
+  /** The job the caller may see whose id is `rawId` or starts with it (at least 8 characters). */
+  private findJob(p: Principal, rawId: string): Job {
     const id = rawId.trim().toLowerCase();
     const exact = this.jobs.get(id);
-    if (exact && this.canSee(p, exact)) return jobRow(exact);
+    if (exact && this.canSee(p, exact)) return exact;
     if (id.length >= MIN_PREFIX) {
       const matches = this.jobs.list(Infinity, (j) => j.id.startsWith(id) && this.canSee(p, j));
-      if (matches.length === 1) return jobRow(matches[0]);
+      if (matches.length === 1) return matches[0];
     }
     // someone else's job is indistinguishable from a missing one
     throw new ServiceError(404, 'job not found');
   }
 
-  listJobs(p: Principal, limit = 20): JobRow[] {
-    return this.jobs.list(limit, (j) => this.canSee(p, j)).map(jobRow);
+  /** The job's row; one waiting for its group's lock says what holds it now. */
+  private jobRow(j: Job): JobRow {
+    const holder = j.stage === 'waiting_for_group_lock' && j.group ? this.zep.ingest.lockHolder(j.group) : undefined;
+    // (for a moment after it enters, the job holds the lock itself)
+    return jobRow(j, holder && holder !== jobHolder(j) ? `held by ${holder}` : j.stageDetail);
   }
 
   private canSee(p: Principal, job: Job): boolean {

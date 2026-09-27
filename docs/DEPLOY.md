@@ -271,9 +271,10 @@ curl -sS "${auth[@]}" "$MINIZEP_URL/v1/memories" -d '{
   "content": "Alice Chen joined Globex as a Staff Engineer on 2026-03-02.",
   "group_id": "teamA", "source": "text", "valid_at": "2026-03-02T09:00:00+08:00"}'
 
-# 异步写入：episode 落盘后立即返回 job id
+# 异步写入：episode 落盘后立即返回 job id；推理模型下通常 1~2 分钟，stage 显示做到哪一步
 curl -sS "${auth[@]}" "$MINIZEP_URL/v1/memories" -d '{"content": "...", "async": true}'
 curl -sS "${auth[@]}" "$MINIZEP_URL/v1/memories/jobs/<job-id>"
+curl -sS "${auth[@]}" -X POST "$MINIZEP_URL/v1/memories/jobs/<job-id>/cancel"   # 未完成的写入不再写，episode 记为 forgotten
 
 # 检索；加 at / as_of / include_historical 做时间旅行
 curl -sS "${auth[@]}" "$MINIZEP_URL/v1/search" -d '{"query": "Where does Alice work?", "limit": 5}'

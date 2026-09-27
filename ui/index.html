@@ -790,9 +790,10 @@ const S = {
   addAnother: 'Add another',
   done: 'Done',
   // jobs
-  jobStatus: { queued: 'queued', running: 'running', succeeded: 'succeeded', failed: 'failed' },
+  jobStatus: { queued: 'queued', running: 'running', succeeded: 'succeeded', failed: 'failed', cancelled: 'cancelled' },
   processedToast: (n, inv) => `Processed: ${n} new fact${n === 1 ? '' : 's'}, ${inv} invalidated`,
   jobFailed: (e) => `Processing failed${e ? `: ${e}` : ''}`,
+  jobCancelled: 'Cancelled: nothing was written',
   view: 'View',
   memory: 'Memory',
   // invalidate
@@ -4593,9 +4594,10 @@ async function pollJob(id) {
     const r = await api('GET', `/memories/jobs/${encodeURIComponent(id)}`, { group: j.group, quiet: true });
     if (!jobs.has(id) || j.seq !== seq) return;
     j.status = r.status || j.status;
+    j.stage = r.status === 'running' && r.stage ? r.stage.replace(/_/g, ' ') : null;
     j.error = r.error || null;
     j.episode = r.episode_uuid || j.episode;
-    if (r.status === 'succeeded' || r.status === 'failed') {
+    if (r.status === 'succeeded' || r.status === 'failed' || r.status === 'cancelled') {
       j.done = true;
       j.result = r.result;
       saveJobs();
@@ -4623,7 +4625,7 @@ function finishJob(j) {
     const action = j.episode ? { label: S.view, fn: () => openEpisode(j.group, j.episode) } : null;
     toast(S.processedToast(arr(res.facts).length, arr(res.invalidated).length), 'ok', action);
     setTimeout(() => { jobs.delete(j.id); renderJobs(); }, 6000);
-  } else toast(S.jobFailed(j.error), 'error');
+  } else toast(j.status === 'cancelled' ? S.jobCancelled : S.jobFailed(j.error), 'error');
   emitData(j.group);
 }
 function renderJobs() {
@@ -4631,12 +4633,12 @@ function renderJobs() {
   if (!host) return;
   host.replaceChildren(...[...jobs.values()].map((j) => {
     const done = j.status === 'succeeded';
-    const failed = j.status === 'failed';
+    const failed = j.status === 'failed' || j.status === 'cancelled';
     return h('div', { class: `job j-${j.status}`, role: 'status' },
       done ? h('span', { class: 'ok' }, icon('check')) : failed ? h('span', { class: 'bad' }, icon('alert')) : h('span', { class: 'spin', 'aria-hidden': 'true' }),
       h('div', { class: 'job-main' },
         h('div', { class: 'job-name', title: j.name }, j.name || S.memory),
-        h('div', { class: 'job-sub' }, `${j.group} · ${S.jobStatus[j.status] || j.status}`),
+        h('div', { class: 'job-sub' }, `${j.group} · ${j.stage || S.jobStatus[j.status] || j.status}`),
         failed && j.error ? h('div', { class: 'job-err' }, j.error) : null,
         done && j.episode ? h('button', { class: 'link small', type: 'button', onclick: () => openEpisode(j.group, j.episode) }, S.viewEpisode) : null),
       j.done ? h('button', { class: 'icon-btn', type: 'button', 'aria-label': S.dismiss, onclick: () => { jobs.delete(j.id); renderJobs(); } }, icon('x', 14)) : null);

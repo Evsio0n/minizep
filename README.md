@@ -80,7 +80,7 @@ sudo deploy/install.sh --user minizep     # 启用、重启、等 /health 就绪
 | 检索下推数据库 | ✅ pgvector 向量 + Postgres 全文检索，与内存路径结果一致 |
 | HTTP 服务 + token 鉴权 | ✅ token → 允许的 group 列表（第一个为默认），越权 `group_id` 被拒绝；会话绑定创建它的 token |
 | 用户、角色与按 group 授权 | ✅ 每个用户有自己的 workspace（`bob`、`bob/*`），可按 reader / writer / owner 共享；token 可再收窄；见 [docs/ACCESS.md](docs/ACCESS.md) |
-| 异步摄取 + 任务队列 | ✅ 有界并发、任务状态可查；返回 job id 前 episode 已落盘，重启不丢 |
+| 异步摄取 + 任务队列 | ✅ 有界并发、任务状态（阶段、耗时）可查、未完成可取消；返回 job id 前 episode 已落盘，重启不丢 |
 | stdio ↔ HTTP 桥接 | ✅ 只支持 stdio 的客户端也能共享同一份图谱 |
 | embedding 常驻 | ✅ 到时限前滚动换班（新作业健康后才切换），作业消失时自动重投 |
 
@@ -148,12 +148,19 @@ token 允许的其他 group；token 读不了的 group 连接时直接 403 `grou
 
 ### 异步摄取
 
-抽取要调用 LLM（数秒），长文档不该让客户端干等：
+抽取要调用 LLM（推理模型下通常 1~2 分钟），客户端不该干等：
 
 ```
 add_memory { content: "...", async: true }  →  { job_id }
-memory_job_status { job_id }                →  running / succeeded / failed
+memory_job_status { job_id }                →  queued / running / succeeded / failed / cancelled，
+                                               以及 stage、started、elapsed
+cancel_job { job_id }                       →  未完成的写入不再写，episode 记为 forgotten
 ```
+
+`stage` 依次是 `queued` → `waiting_for_group_lock`（写明谁占着这个 group：另一个 job，或后台重试的
+某条 episode）→ `extracting`（第几次 LLM 请求、当前 `max_tokens`）→ `embedding` → `judging`（第几条事实）
+→ `writing` → `done` / `failed` / `cancelled`，只存在内存里，供轮询显示。已完成的 job 不能取消（409），
+要撤回用 `forget_episode`。
 
 ### Embedding 服务位置
 
@@ -239,7 +246,8 @@ npm run build
 | `facts_about` | 某实体的全部事实及有效期 |
 | `facts_at` | 指定时刻图中为真的事实 |
 | `list_entities` / `list_episodes` | 实体列表 / 原始 episode（溯源） |
-| `get_episode` / `memory_job_status` | 一条 episode 的全文及其产生的事实 / 异步摄取任务的状态 |
+| `get_episode` / `memory_job_status` | 一条 episode 的全文及其产生的事实 / 异步摄取任务的状态（阶段、已耗时间） |
+| `cancel_job` | 取消排队中或执行中的异步写入（例如写错了 group）：不写入任何事实，episode 记为 `forgotten` |
 | `invalidate_fact` | 手工结束或撤回一条事实（历史保留，`as_of` 仍能看到修正前的认知） |
 | `reopen_fact` | 撤销一次错误的结束或撤回：旧记录撤回并留在历史里，插入一份从原起点起有效的更正副本 |
 | `forget_episode` | 整条笔记是错的或不该记：只由它支撑的事实撤回，其他事实去掉这条证据，被它关闭的事实重新打开，它最后写的实体摘要改回；原文保留，状态为 `forgotten`。事实行末尾的 `ep` 就是笔记的 id |

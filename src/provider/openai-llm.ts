@@ -236,18 +236,21 @@ export class OpenAICompatLLM implements LLMProvider {
    * A request has time in proportion to its budget (see timeoutFor); one with
    * a raised budget that times out all the same is not sent again, as another
    * try would take as long. A call the caller aborts (`signal`) stops at once
-   * with the signal's reason. Returns the reply and the budget it took.
+   * with the signal's reason; `onRequest` is told of every request sent.
+   * Returns the reply and the budget it took.
    */
   private async chat(
     messages: ChatMessage[],
     maxTokens: number,
     label: string,
-    signal?: AbortSignal,
+    context?: LLMCallContext,
   ): Promise<{ content: string; maxTokens: number }> {
+    const signal = context?.signal;
     const attempts = this.cfg.retries ?? 3;
     let failures = 0;
     for (;;) {
       signal?.throwIfAborted();
+      context?.onRequest?.(maxTokens);
       try {
         return { content: await this.chatOnce(messages, maxTokens, label, signal), maxTokens };
       } catch (err) {
@@ -302,8 +305,7 @@ export class OpenAICompatLLM implements LLMProvider {
       { role: 'user', content: userPrompt },
     ];
     const label = callLabel(kind, context);
-    const signal = context?.signal;
-    const first = await this.chat(messages, this.maxTokens, label, signal);
+    const first = await this.chat(messages, this.maxTokens, label, context);
     try {
       return parseJsonObject(first.content);
     } catch (err) {
@@ -322,7 +324,7 @@ export class OpenAICompatLLM implements LLMProvider {
         ],
         first.maxTokens,
         `${label} (repair)`,
-        signal,
+        context,
       );
       return parseJsonObject(again.content);
     }

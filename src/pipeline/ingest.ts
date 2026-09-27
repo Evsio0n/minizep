@@ -145,6 +145,36 @@ export interface RetryOptions {
 /** Why a background retry stopped: other work wanted its group (see RetryOptions.background). */
 class CancelledError extends Error {}
 
+/**
+ * Where the processing of an episode is, in the order the stages come:
+ * waiting for the group's lock, the extraction call, embedding the new names
+ * and facts, resolving each fact against the graph (the contradiction judge),
+ * the writes.
+ */
+export type IngestStage = 'waiting_for_group_lock' | 'extracting' | 'embedding' | 'judging' | 'writing';
+
+export interface IngestProgress {
+  stage: IngestStage;
+  /** e.g. "LLM attempt 2, max_tokens=16000" while extracting, "3/7 facts" while judging */
+  detail?: string;
+}
+
+/** How processEpisode runs for a job (see MemoryService.enqueue). */
+export interface ProcessOptions {
+  /**
+   * Cancels the processing: while it waits for the group's lock it gives up
+   * its place at once; once it runs, its LLM request is aborted and it starts
+   * no other call and no write (writes already under way finish: they are
+   * one transaction). Either way it throws the signal's reason and leaves the
+   * episode as it was.
+   */
+  signal?: AbortSignal;
+  /** told each stage as it begins, and each LLM request (in memory only, for display) */
+  onProgress?: (p: IngestProgress) => void;
+  /** what work waiting for the group's lock is told holds it meanwhile (see lockHolder), e.g. "job 1a2b3c4d" */
+  holder?: string;
+}
+
 /** A manual invalidation, reopen or forget that cannot be applied, with why. */
 export class InvalidationError extends Error {
   constructor(
@@ -215,6 +245,10 @@ export class IngestPipeline {
   private readonly saveLocks = new KeyedMutex();
   /** per group, the background retry holding or waiting for its lock (see RetryOptions.background) */
   private readonly yielding = new Map<string, AbortController>();
+  /** per group, what holds its lock now (see lockHolder) */
+  private readonly holders = new Map<string, string>();
+  /** episodes being processed right now (see cancelEpisode) */
+  private readonly processing = new Set<string>();
 
   constructor(
     private store: GraphStore,
@@ -224,7 +258,7 @@ export class IngestPipeline {
 
   /** Save + process, as one serialised step for the group. */
   async addEpisode(input: EpisodeInput, options: IngestOptions = {}): Promise<IngestResult> {
-    return this.exclusive(input.groupId, async () => {
+    return this.exclusive(input.groupId, 'a synchronous add_memory', async () => {
       const { episode, duplicate } = await this.saveLocks.run(input.groupId, () => this.saveLocked(input, options));
       return duplicate ? duplicateResult(episode) : this.processLocked(episode);
     });
@@ -247,19 +281,35 @@ export class IngestPipeline {
    * Process a saved episode (a no-op 'duplicate' when it is already processed,
    * or was forgotten before it was: the result's episode says which).
    */
-  async processEpisode(episodeUuid: string): Promise<IngestResult> {
+  async processEpisode(episodeUuid: string, options: ProcessOptions = {}): Promise<IngestResult> {
+    const { signal, onProgress } = options;
     const saved = await this.store.getEpisode(episodeUuid);
     if (!saved) throw new Error(`episode ${episodeUuid} not found`);
-    return this.exclusive(saved.groupId, () => this.processSaved(saved));
+    onProgress?.({ stage: 'waiting_for_group_lock' });
+    const holder = options.holder ?? `the processing of episode ${episodeUuid.slice(0, 8)}`;
+    return this.exclusive(saved.groupId, holder, () => this.processSaved(saved, signal, onProgress), signal);
   }
 
   /** Only ever executed while holding the group's lock. */
-  private async processSaved(saved: EpisodicNode, signal?: AbortSignal): Promise<IngestResult> {
+  private async processSaved(
+    saved: EpisodicNode,
+    signal?: AbortSignal,
+    onProgress?: ProcessOptions['onProgress'],
+  ): Promise<IngestResult> {
     // re-read under the lock: another caller may have processed it meanwhile
     const episode = (await this.store.getEpisode(saved.uuid)) ?? saved;
     return isProcessed(episode) || episode.status === 'forgotten'
       ? duplicateResult(episode)
-      : this.processLocked(episode, signal);
+      : this.processLocked(episode, signal, onProgress);
+  }
+
+  /**
+   * What holds the group's lock now, as its caller named it (a job, the
+   * background retry of an episode, a correction), for a job waiting on it;
+   * undefined when nothing does.
+   */
+  lockHolder(groupId: string): string | undefined {
+    return this.holders.get(groupId);
   }
 
   /**
@@ -267,9 +317,37 @@ export class IngestPipeline {
    * that one is cancelled (see RetryOptions.background), also while it still
    * waits for the lock, so a write never waits for its LLM calls.
    */
-  private exclusive<T>(groupId: string, fn: () => Promise<T>): Promise<T> {
+  private exclusive<T>(groupId: string, holder: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     this.yielding.get(groupId)?.abort(new CancelledError(`gave way to other work on group ${groupId}`));
-    return this.locks.run(groupId, fn);
+    return this.locked(groupId, holder, fn, signal);
+  }
+
+  /**
+   * Run `fn` under the group's lock, which `holder` then holds (see
+   * lockHolder). `signal` aborted while `fn` still waits for the lock gives
+   * up its place at once with the signal's reason, and `fn` never runs.
+   */
+  private locked<T>(groupId: string, holder: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) return Promise.reject(signal.reason);
+    let entered = false;
+    const run = this.locks.run(groupId, async () => {
+      signal?.throwIfAborted();
+      entered = true;
+      this.holders.set(groupId, holder);
+      try {
+        return await fn();
+      } finally {
+        this.holders.delete(groupId);
+      }
+    });
+    if (!signal) return run;
+    return new Promise<T>((resolve, reject) => {
+      const giveUp = () => {
+        if (!entered) reject(signal.reason);
+      };
+      signal.addEventListener('abort', giveUp, { once: true });
+      run.then(resolve, reject).finally(() => signal.removeEventListener('abort', giveUp));
+    });
   }
 
   /**
@@ -280,7 +358,8 @@ export class IngestPipeline {
     const ctl = new AbortController();
     this.yielding.set(ep.groupId, ctl);
     try {
-      return await this.locks.run(ep.groupId, () => this.processSaved(ep, ctl.signal));
+      const holder = `the background retry of episode ${ep.uuid.slice(0, 8)}`;
+      return await this.locked(ep.groupId, holder, () => this.processSaved(ep, ctl.signal), ctl.signal);
     } catch (err) {
       if (err === ctl.signal.reason) return 'cancelled';
       throw err;
@@ -321,7 +400,9 @@ export class IngestPipeline {
     const yielded = new Set<string>();
     for (const ep of failed) {
       if (skip(ep) || yielded.has(ep.groupId)) continue;
-      const res = options.background ? await this.retryInBackground(ep) : await this.processEpisode(ep.uuid);
+      const res = options.background
+        ? await this.retryInBackground(ep)
+        : await this.processEpisode(ep.uuid, { holder: `retry_failed of episode ${ep.uuid.slice(0, 8)}` });
       if (res === 'cancelled') {
         yielded.add(ep.groupId);
         continue;
@@ -354,7 +435,7 @@ export class IngestPipeline {
    * what was believed before.
    */
   async invalidateFact(factUuid: string, input: InvalidateFactInput): Promise<EntityEdge> {
-    return this.exclusive(input.groupId, async () => {
+    return this.exclusive(input.groupId, `invalidate_fact of fact ${factUuid.slice(0, 8)}`, async () => {
       const found = await this.store.getFact(factUuid);
       if (!found || found.groupId !== input.groupId) throw new InvalidationError('fact not found', 'not_found');
       if (isRetracted(found)) throw new InvalidationError('fact is already retracted', 'conflict');
@@ -405,7 +486,7 @@ export class IngestPipeline {
    * attributes (closedAt, closedBy).
    */
   async reopenFact(factUuid: string, input: ReopenFactInput): Promise<{ fact: EntityEdge; previous: EntityEdge }> {
-    return this.exclusive(input.groupId, async () => {
+    return this.exclusive(input.groupId, `reopen_fact of fact ${factUuid.slice(0, 8)}`, async () => {
       const found = await this.store.getFact(factUuid);
       if (!found || found.groupId !== input.groupId) throw new InvalidationError('fact not found', 'not_found');
       const reopenedAs = found.attributes?.reopenedAs;
@@ -463,7 +544,7 @@ export class IngestPipeline {
    * then never processed.
    */
   async forgetEpisode(episodeUuid: string, input: ForgetEpisodeInput): Promise<ForgetResult> {
-    return this.exclusive(input.groupId, () =>
+    return this.exclusive(input.groupId, `forget_episode of episode ${episodeUuid.slice(0, 8)}`, () =>
       this.saveLocks.run(input.groupId, async () => {
         const found = await this.store.getEpisode(episodeUuid);
         if (!found || found.groupId !== input.groupId) throw new InvalidationError('episode not found', 'not_found');
@@ -591,6 +672,33 @@ export class IngestPipeline {
     );
   }
 
+  /**
+   * Mark an episode whose processing was cancelled before it wrote anything
+   * (cancel_job) 'forgotten' with `reason`, so it is never processed. Under
+   * the save lock only: it has nothing in the graph to take back, and a
+   * cancel must not wait behind another episode's LLM calls. One already
+   * forgotten is returned as it is; one processed, or being processed right
+   * now (the same text was sent again), is left alone with a conflict.
+   */
+  async cancelEpisode(episodeUuid: string, input: ForgetEpisodeInput): Promise<EpisodicNode> {
+    return this.saveLocks.run(input.groupId, async () => {
+      const found = await this.store.getEpisode(episodeUuid);
+      if (!found || found.groupId !== input.groupId) throw new InvalidationError('episode not found', 'not_found');
+      if (found.status === 'forgotten') return found;
+      const id = found.uuid.slice(0, 8);
+      if (isProcessed(found) || this.processing.has(found.uuid)) {
+        throw new InvalidationError(
+          `episode ${id} was ${isProcessed(found) ? 'processed' : 'taken up'} by another write of the same text; ` +
+            'forget_episode it if it is not wanted',
+          'conflict',
+        );
+      }
+      const episode: EpisodicNode = { ...found, status: 'forgotten', error: input.reason.slice(0, 120) };
+      await this.store.addEpisode(episode);
+      return episode;
+    });
+  }
+
   /** Only ever executed while holding the group's save lock. */
   private async saveLocked(
     input: EpisodeInput,
@@ -641,18 +749,25 @@ export class IngestPipeline {
 
   /**
    * Only ever executed while holding the group's lock. A cancelled run
-   * (`signal`, see RetryOptions.background) throws the signal's reason and
-   * leaves the episode as it was.
+   * (`signal`: a background retry giving way, see RetryOptions.background,
+   * or a cancelled job) throws the signal's reason and leaves the episode as
+   * it was.
    */
-  private async processLocked(episode: EpisodicNode, signal?: AbortSignal): Promise<IngestResult> {
+  private async processLocked(
+    episode: EpisodicNode,
+    signal?: AbortSignal,
+    onProgress?: ProcessOptions['onProgress'],
+  ): Promise<IngestResult> {
     const attempts = episode.attempts;
     // counted when the attempt starts, stored with its outcome below
     episode.attempts = (attempts ?? 0) + 1;
+    this.processing.add(episode.uuid);
     try {
       signal?.throwIfAborted();
       // the 'processed' mark commits with the graph writes: a retry must never
       // find half an episode already in the graph
-      const outcome = await new EpisodeRun(this.store, this.llm, this.embedder, episode, signal).execute(async (store) => {
+      const run = new EpisodeRun(this.store, this.llm, this.embedder, episode, signal, onProgress);
+      const outcome = await run.execute(async (store) => {
         episode.status = 'processed';
         episode.error = undefined;
         await store.addEpisode(episode);
@@ -670,6 +785,8 @@ export class IngestPipeline {
       episode.error = ((err as Error)?.message ?? String(err)).slice(0, 500);
       await this.store.addEpisode(episode);
       return { ...emptyResult(episode), status: 'failed', failed: true, error: episode.error };
+    } finally {
+      this.processing.delete(episode.uuid);
     }
   }
 }
@@ -978,8 +1095,10 @@ class EpisodeRun {
    * as a known date.
    */
   private readonly datedWhenWritten: boolean;
-  /** names the episode in the LLM provider's log lines, and cancels its calls */
+  /** names the episode in the LLM provider's log lines, cancels its calls and counts its requests */
   private readonly callContext: LLMCallContext;
+  /** the stage reported last, and the LLM requests sent in it */
+  private stage?: IngestProgress & { requests: number };
 
   constructor(
     private store: GraphStore,
@@ -988,14 +1107,34 @@ class EpisodeRun {
     private episode: EpisodicNode,
     /** cancels the run until its writes begin (see IngestPipeline.processLocked) */
     private signal?: AbortSignal,
+    private onProgress?: ProcessOptions['onProgress'],
   ) {
     this.groupId = episode.groupId;
-    this.callContext = { episodeId: episode.uuid, groupId: episode.groupId, ...(signal ? { signal } : {}) };
+    this.callContext = {
+      episodeId: episode.uuid,
+      groupId: episode.groupId,
+      ...(signal ? { signal } : {}),
+      ...(onProgress ? { onRequest: (maxTokens: number) => this.requested(maxTokens) } : {}),
+    };
     this.datedWhenWritten = Math.abs(episode.validAt.getTime() - episode.createdAt.getTime()) < DAY_MS;
+  }
+
+  private report(stage: IngestProgress['stage'], detail?: string): void {
+    this.stage = { stage, detail, requests: 0 };
+    this.onProgress?.({ stage, detail });
+  }
+
+  /** An LLM request of the current stage goes out (retries included): which one, with what budget. */
+  private requested(maxTokens: number): void {
+    const at = this.stage;
+    if (!at) return;
+    const llm = `LLM attempt ${++at.requests}, max_tokens=${maxTokens}`;
+    this.onProgress?.({ stage: at.stage, detail: at.detail ? `${at.detail}, ${llm}` : llm });
   }
 
   /** `finish` runs in the same transaction as the graph writes (when the store has one). */
   async execute(finish?: (store: GraphStore) => Promise<void>): Promise<Omit<IngestResult, 'episode' | 'status'>> {
+    this.report('extracting');
     const extraction = await this.extract();
     this.signal?.throwIfAborted();
 
@@ -1016,6 +1155,7 @@ class EpisodeRun {
 
     // every vector before any write: an embedding outage must not leave half
     // an episode in the graph
+    this.report('embedding');
     for (const node of this.dirtyEntities) {
       if (!node.nameEmbedding?.length) node.nameEmbedding = await this.vector(node.name);
     }
@@ -1026,12 +1166,17 @@ class EpisodeRun {
     // written empties that note first (see applyInvalidation), so none of this
     // episode's facts runs into it; the others are applied after them
     for (const inv of extraction.invalidations ?? []) await this.applyInvalidation(inv, true);
-    for (const plan of this.collapseRepeats(plans)) await this.resolveFact(plan);
+    const resolving = this.collapseRepeats(plans);
+    for (const [i, plan] of resolving.entries()) {
+      this.report('judging', `${i + 1}/${resolving.length} facts`);
+      await this.resolveFact(plan);
+    }
     for (const inv of extraction.invalidations ?? []) await this.applyInvalidation(inv);
 
     await this.repairStaleVectors();
     // the last point to give way: the writes below are not cut short
     this.signal?.throwIfAborted();
+    this.report('writing');
     const commit = async (store: GraphStore) => {
       await this.write(store);
       await finish?.(store);
@@ -1068,6 +1213,8 @@ class EpisodeRun {
 
     const known: KnownEntity[] = relevant.map((e) => ({ name: e.name, summary: e.summary }));
     const knownFacts = await this.knownFacts(relevant.slice(0, MAX_FACT_ENTITIES), all);
+    // a run cancelled meanwhile starts no LLM call
+    this.signal?.throwIfAborted();
     return this.llm.extract(
       content,
       known.map((e) => e.name),
@@ -1385,6 +1532,7 @@ class EpisodeRun {
           (connects(f, src, tgt) || (sameSlot(f) && f.targetNodeUuid !== tgt.uuid && exclusive(f))),
       );
       if (shown.length > 0) {
+        this.signal?.throwIfAborted();
         const answer: unknown = await this.llm.detectContradiction(
           { sourceName: src.name, targetName: tgt.name, fact: text, relation, validAt, replacesPrevious: flagged },
           shown.map((f) => ({ fact: f.fact, validAt: f.validAt, invalidAt: f.invalidAt })),

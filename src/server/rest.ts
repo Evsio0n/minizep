@@ -163,6 +163,13 @@ function routes(ctx: RestContext): Route[] {
     },
     {
       method: 'POST',
+      pattern: /^\/v1\/memories\/jobs\/([^/]+)\/cancel$/,
+      handler: async ({ p, params }) => ({
+        body: await s.cancelJob(p, parse(shapes.cancelJob, { job_id: pathParam(params[0]) })),
+      }),
+    },
+    {
+      method: 'POST',
       pattern: /^\/v1\/search$/,
       handler: async ({ p, body }) => ({ body: await s.search(p, parse(shapes.search, asObject(await body()))) }),
     },

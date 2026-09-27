@@ -52,7 +52,7 @@ A disabled user, a revoked or an expired token all get 403 `invalid token`, like
 | May…                                                                 | reader | writer | owner | admin |
 |----------------------------------------------------------------------|:------:|:------:|:-----:|:-----:|
 | read: `search_facts`, `facts_about`, `facts_at`, `list_entities`, `list_episodes`, `get_episode`, `graph_stats`, `memory_job_status`, `list_groups`, `memory_guide`; REST `GET`s and `POST /v1/search` | ✓ | ✓ | ✓ | ✓ |
-| write: `add_memory`, `invalidate_fact`, `reopen_fact`, `forget_episode`, `retry_failed` |  | ✓ | ✓ | ✓ |
+| write: `add_memory`, `cancel_job`, `invalidate_fact`, `reopen_fact`, `forget_episode`, `retry_failed` |  | ✓ | ✓ | ✓ |
 | manage the members of the group (`/v1/groups/:g/members`)            |        |        | ✓     | ✓     |
 | manage users, tokens and any grant (`/v1/admin/*`, `minizep-admin`)  |        |        |       | ✓     |
 

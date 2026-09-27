@@ -167,7 +167,8 @@ later) and `revised_later` (`expired_at > as_of`: a later correction exists).
 
 **Episode**: `{uuid, group_id, name, source, source_description, content, valid_at, created_at,
 status, error, attempts}`. `status` is `pending` (saved, not processed yet), `processed`, `failed`
-(with `error`) or `forgotten` (see [forget](#post-v1episodesidforget); `error` holds the reason).
+(with `error`) or `forgotten` (see [forget](#post-v1episodesidforget) and
+[cancel](#post-v1memoriesjobsidcancel); `error` holds the reason).
 Records written before statuses were stored report `processed`. `attempts` counts the times
 processing was started, automatic and manual retries included.
 
@@ -240,7 +241,7 @@ Other outcomes:
 | Status | `status`    | Meaning |
 |--------|-------------|---------|
 | 200    | `duplicate` | this episode was already processed in this group; nothing changed |
-| 202    | `queued`    | `async: true`: the episode is **stored as pending before** this answer; poll `job_id` |
+| 202    | `queued`    | `async: true`: the episode is **stored as pending before** this answer; poll `job_id` (typically 1-2 minutes with a reasoning model), or [cancel](#post-v1memoriesjobsidcancel) it |
 | 502    | `failed`    | extraction failed; the episode is kept with status `failed` and [retried](#durability-and-shutdown) |
 
 ```json
@@ -265,22 +266,68 @@ Status of an async ingestion (`id`: full job id, or a prefix of at least 8 chara
 ```json
 {
   "id": "504315e4-c667-4fe4-82bf-ca2de4e022c8",
-  "status": "succeeded",
+  "status": "running",
+  "stage": "extracting",
+  "stage_detail": "LLM attempt 2, max_tokens=16000",
   "label": "add_memory:teamA",
   "group_id": "teamA",
   "episode_uuid": "f5c9d7f3-2c4a-453b-ad2b-8d17cf7464b3",
   "created_at": "2026-09-25T06:14:54.427Z",
   "started_at": "2026-09-25T06:14:54.427Z",
-  "finished_at": "2026-09-25T06:14:54.433Z",
+  "finished_at": null,
+  "elapsed_ms": 47210,
   "error": null,
-  "result": { "status": "processed", "…": "same shape as POST /v1/memories" }
+  "result": null
 }
 ```
 
-`status` is `queued`, `running`, `succeeded` or `failed`. A failed extraction fails the job, with
-`error` like `extraction failed: … (episode stored for retry)`; the episode can then be retried.
-Jobs live in memory (up to 200, unfinished ones are never dropped); the episode itself is durable. A job of
-another group is 404.
+`status` is `queued`, `running`, `succeeded`, `failed` or `cancelled`. A failed extraction fails the
+job, with `error` like `extraction failed: … (episode stored for retry)`; the episode can then be
+retried. A succeeded job's `result` has the same shape as `POST /v1/memories`.
+
+A write typically takes 1-2 minutes with a reasoning model; `stage` says where it is (in memory
+only, for display):
+
+| `stage` | `stage_detail` |
+|---|---|
+| `queued` | waiting for a free job slot (`MINIZEP_JOB_CONCURRENCY`) |
+| `waiting_for_group_lock` | what holds the group: `held by job 1a2b3c4d`, `held by the background retry of episode e3c08882`, a synchronous write or a correction |
+| `extracting` | the extraction call: `LLM attempt 2, max_tokens=16000` (retries, raised budgets and a repair round count) |
+| `embedding` | |
+| `judging` | each new fact resolved against the graph, with the contradiction judge where needed: `3/7 facts` (plus the LLM attempt from the second) |
+| `writing` | |
+| `done`, `failed`, `cancelled` | |
+
+`started_at` is when the job left the queue (it may still wait for the group); `elapsed_ms` runs
+from `created_at` to `finished_at`, or to now. Jobs live in memory (up to 200, unfinished ones are
+never dropped); the episode itself is durable. A job of another group is 404.
+
+### POST /v1/memories/jobs/:id/cancel
+
+Stop an async write that has not finished (`id` as above), e.g. one sent to the wrong group. Needs
+write permission on the job's group (a reader gets 403). No body.
+
+- A `queued` job leaves the queue and never runs.
+- A `running` job is aborted: a job still waiting for the group's lock gives up its place at once;
+  one past it has its LLM request cancelled, and the pipeline writes nothing after that (its writes
+  are one transaction).
+
+Either way the answer comes when the job has stopped, and the episode is kept as `forgotten` (its
+text stays, like [forget](#post-v1episodesidforget)) with `error` `cancelled before processing`
+(no LLM call had started) or `cancelled while processing`:
+
+```json
+{
+  "group_id": "teamA",
+  "job": { "id": "504315e4-…", "status": "cancelled", "stage": "cancelled", "error": "cancelled while processing", "…": "as GET /v1/memories/jobs/:id" },
+  "episode": { "uuid": "f5c9d7f3-…", "status": "forgotten", "error": "cancelled while processing", "…": "as GET /v1/episodes" }
+}
+```
+
+**409** for a job that has finished (`job 504315e4 already succeeded: a finished job cannot be
+cancelled; forget_episode f5c9d7f3 takes back what it wrote`), also one whose writes were already
+under way when the cancel came, and for an episode that another write of the same text is
+processing.
 
 ### POST /v1/search
 
@@ -672,7 +719,7 @@ A model that connects needs no client-side instructions:
   group has nothing. On a [bound](#groups) connection they begin with
   `This connection is bound to group "<g>"`.
 - A connection that may write nowhere (every group read-only) is not offered the write tools
-  (`add_memory`, `invalidate_fact`, `reopen_fact`, `forget_episode`, `retry_failed`). A session
+  (`add_memory`, `cancel_job`, `invalidate_fact`, `reopen_fact`, `forget_episode`, `retry_failed`). A session
   follows grant and token changes at its next request: a revoked token gets 403, a group that became
   read-only a tool error.
 - The `memory_guide` tool returns the full method, [docs/MEMORY-GUIDE.md](MEMORY-GUIDE.md), also
@@ -681,7 +728,7 @@ A model that connects needs no client-side instructions:
 - Every tool description says when to use the tool and ends with "See memory_guide."
 - Tool annotations let a client run reads without asking and ask before corrections:
   `readOnlyHint` on the read tools; `add_memory` is not destructive and idempotent; `retry_failed`
-  is not destructive; `invalidate_fact`, `reopen_fact` and `forget_episode` are destructive
+  and `cancel_job` are not destructive; `invalidate_fact`, `reopen_fact` and `forget_episode` are destructive
   (history is kept, but what the memory holds true changes). `openWorldHint` is false everywhere.
 
 ### Tools
@@ -693,6 +740,7 @@ rendering and the same JSON as the REST API in `structuredContent`.
 |---------------------|-----------|-----------------|------|
 | `add_memory`        | `content`, `group_id?`, `valid_at?`, `source?`, `name?`, `idempotency_key?`, `async?` | `POST /v1/memories` | write |
 | `memory_job_status` | `job_id?` (omit to list recent jobs), `limit?` | `GET /v1/memories/jobs/:id` | read |
+| `cancel_job`        | `job_id` (uuid or 8+ char prefix) | `POST /v1/memories/jobs/:id/cancel` | write |
 | `search_facts`      | `query`, `group_id?`, `limit?`, `at?`, `as_of?`, `include_historical?` | `POST /v1/search` | read |
 | `facts_about`       | `entity`, `group_id?`, `at?`, `as_of?`, `include_historical?`, `limit?` | `GET /v1/entities/:name/facts` | read |
 | `facts_at`          | `timestamp?` (valid time, default now), `as_of?`, `group_id?`, `limit?` (default 100) | `GET /v1/facts` | read |
@@ -708,7 +756,9 @@ rendering and the same JSON as the REST API in `structuredContent`.
 | `memory_guide`      | none | `GET /v1/guide` | read |
 
 `add_memory` reports `processed`, `duplicate`, `queued` or `failed`; a failed extraction is a tool
-error (`isError: true`) whose text says the episode is stored for retry. Fact lines look like
+error (`isError: true`) whose text says the episode is stored for retry. `queued` says the write
+typically takes 1-2 minutes, to poll `memory_job_status` every 15 s and that `cancel_job` stops it;
+`memory_job_status` prints the stage, `started` and `elapsed`. Fact lines look like
 
 ```
 [160f2ea7] Alice --WORKS_AT--> Acme | "Alice works at Acme" | since 2024-03-01 | ep 6eeafffa
