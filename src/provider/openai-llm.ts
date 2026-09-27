@@ -32,7 +32,7 @@ export interface LLMConfig {
   maxTokens?: number;
   /** a reply cut off by max_tokens is asked again with the budget doubled, up to this (default 4 × maxTokens) */
   maxTokensCap?: number;
-  /** per request (default 120000) */
+  /** per request at maxTokens, in proportion for a larger budget (default 120000) */
   timeoutMs?: number;
   /** attempts in all for transient failures (default 3) */
   retries?: number;
@@ -59,6 +59,12 @@ export interface LLMConfig {
 }
 
 const DEFAULT_MAX_TOKENS = 8000;
+
+/** The longest delay a Node timer takes: a longer AbortSignal.timeout fires after 1 ms. */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/** No model answers with more; a larger max_tokens is a typo. */
+const MAX_TOKENS_LIMIT = 1_000_000;
 
 /** Empty content from a reply that used this share of max_tokens: the budget ran out, most likely on reasoning. */
 const NEAR_BUDGET = 0.9;
@@ -203,12 +209,14 @@ export class OpenAICompatLLM implements LLMProvider {
   private readonly jsonMode: boolean;
   private readonly maxTokens: number;
   private readonly maxTokensCap: number;
+  private readonly timeoutMs: number;
 
   constructor(private cfg: LLMConfig) {
     this.timeZone = cfg.timeZone ?? process.env.MINIZEP_TIMEZONE ?? localTimeZone();
     this.jsonMode = cfg.jsonMode ?? envFlag('MINIZEP_LLM_JSON_MODE', true);
     this.maxTokens = cfg.maxTokens ?? DEFAULT_MAX_TOKENS;
     this.maxTokensCap = Math.max(cfg.maxTokensCap ?? 4 * this.maxTokens, this.maxTokens);
+    this.timeoutMs = cfg.timeoutMs ?? 120_000;
     // an unknown zone would fail every extraction; fail at construction instead
     try {
       formatReferenceTime(new Date(), this.timeZone);
@@ -225,19 +233,25 @@ export class OpenAICompatLLM implements LLMProvider {
    * and empty content. A reply cut off by max_tokens is not: a reasoning
    * model that spent the budget thinking would spend it again, so the request
    * goes again with the budget doubled, up to maxTokensCap, and fails there.
-   * Returns the reply and the budget it took.
+   * A request has time in proportion to its budget (see timeoutFor); one with
+   * a raised budget that times out all the same is not sent again, as another
+   * try would take as long. A call the caller aborts (`signal`) stops at once
+   * with the signal's reason. Returns the reply and the budget it took.
    */
   private async chat(
     messages: ChatMessage[],
     maxTokens: number,
     label: string,
+    signal?: AbortSignal,
   ): Promise<{ content: string; maxTokens: number }> {
     const attempts = this.cfg.retries ?? 3;
     let failures = 0;
     for (;;) {
+      signal?.throwIfAborted();
       try {
-        return { content: await this.chatOnce(messages, maxTokens, label), maxTokens };
+        return { content: await this.chatOnce(messages, maxTokens, label, signal), maxTokens };
       } catch (err) {
+        if (signal?.aborted) throw signal.reason;
         if (err instanceof BudgetExhaustedError) {
           if (maxTokens >= this.maxTokensCap) {
             throw new BudgetExhaustedError(
@@ -249,14 +263,31 @@ export class OpenAICompatLLM implements LLMProvider {
           continue;
         }
         const e = err as Error;
+        // (AbortSignal.timeout rejects fetch with a TimeoutError)
+        if (e?.name === 'TimeoutError' && maxTokens > this.maxTokens) {
+          throw new Error(
+            `LLM request timed out after ${this.timeoutFor(maxTokens)}ms at max_tokens=${maxTokens}, a budget raised ` +
+              'after a cut-off reply; not sent again: raise MINIZEP_LLM_TIMEOUT_MS (the time a request at ' +
+              'MINIZEP_LLM_MAX_TOKENS gets, in proportion above it) or lower MINIZEP_LLM_MAX_TOKENS_CAP',
+          );
+        }
         failures++;
         const retryable = /empty content|HTTP (429|5\d\d)|fetch failed|timeout|aborted/i.test(e.message);
         if (!retryable || failures >= attempts) throw e;
         const backoff = (this.cfg.backoffMs ?? 500) * 2 ** (failures - 1);
         console.error(`[minizep] LLM attempt ${failures}/${attempts} failed (${e.message.slice(0, 80)}); retrying in ${backoff}ms`);
-        await new Promise((r) => setTimeout(r, backoff));
+        await sleep(backoff, signal);
       }
     }
+  }
+
+  /**
+   * A request's timeout: timeoutMs at the first budget, and in proportion
+   * above it, since a reply that uses its budget takes time in proportion to
+   * it (a doubled budget gets twice as long).
+   */
+  private timeoutFor(maxTokens: number): number {
+    return Math.min(Math.round((this.timeoutMs * maxTokens) / this.maxTokens), MAX_TIMEOUT_MS);
   }
 
   /**
@@ -265,12 +296,14 @@ export class OpenAICompatLLM implements LLMProvider {
    * reply took; a second bad reply throws, which fails the episode like any
    * other extraction error. A cut-off reply never gets here (see chat()).
    */
-  private async chatJson(system: string, userPrompt: string, label: string): Promise<unknown> {
+  private async chatJson(system: string, userPrompt: string, kind: string, context?: LLMCallContext): Promise<unknown> {
     const messages: ChatMessage[] = [
       { role: 'system', content: system },
       { role: 'user', content: userPrompt },
     ];
-    const first = await this.chat(messages, this.maxTokens, label);
+    const label = callLabel(kind, context);
+    const signal = context?.signal;
+    const first = await this.chat(messages, this.maxTokens, label, signal);
     try {
       return parseJsonObject(first.content);
     } catch (err) {
@@ -289,13 +322,14 @@ export class OpenAICompatLLM implements LLMProvider {
         ],
         first.maxTokens,
         `${label} (repair)`,
+        signal,
       );
       return parseJsonObject(again.content);
     }
   }
 
   /** One request, logged in one line: what it was for, how long it took, what the budget went to. */
-  private async chatOnce(messages: ChatMessage[], maxTokens: number, label: string): Promise<string> {
+  private async chatOnce(messages: ChatMessage[], maxTokens: number, label: string, signal?: AbortSignal): Promise<string> {
     const started = Date.now();
     let outcome = '';
     try {
@@ -313,7 +347,9 @@ export class OpenAICompatLLM implements LLMProvider {
           messages,
           max_tokens: maxTokens,
         }),
-        signal: AbortSignal.timeout(this.cfg.timeoutMs ?? 120_000),
+        signal: signal
+          ? AbortSignal.any([AbortSignal.timeout(this.timeoutFor(maxTokens)), signal])
+          : AbortSignal.timeout(this.timeoutFor(maxTokens)),
       });
       if (!res.ok) throw new Error(`LLM HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
       const data = (await res.json()) as {
@@ -335,7 +371,12 @@ export class OpenAICompatLLM implements LLMProvider {
       if (!content.trim()) throw new Error(`empty content (reasoning_tokens=${reasoning ?? '?'})`);
       return content;
     } catch (err) {
-      outcome += err instanceof BudgetExhaustedError ? ' cut off' : ` failed: ${((err as Error)?.message ?? String(err)).slice(0, 120)}`;
+      outcome +=
+        err instanceof BudgetExhaustedError
+          ? ' cut off'
+          : signal?.aborted
+            ? ' cancelled'
+            : ` failed: ${((err as Error)?.message ?? String(err)).slice(0, 120)}`;
       throw err;
     } finally {
       const secs = ((Date.now() - started) / 1000).toFixed(1);
@@ -354,7 +395,8 @@ export class OpenAICompatLLM implements LLMProvider {
     const parsed = (await this.chatJson(
       EXTRACTION_SYSTEM,
       buildExtractionPrompt(content, knownEntityNames, knownFacts, opts, this.timeZone),
-      callLabel('extract', options.context),
+      'extract',
+      options.context,
     )) as {
       entities?: { name: string; labels?: string[]; summary?: string }[];
       facts?: {
@@ -453,7 +495,8 @@ export class OpenAICompatLLM implements LLMProvider {
       CONTRADICTION_SYSTEM,
       `New fact${candidate.replacesPrevious ? ' (it replaces an earlier value)' : ''}: ` +
         `${candidate.fact}${since(candidate.validAt, this.timeZone)}\n\nExisting facts:\n${list}`,
-      callLabel('judge', context),
+      'judge',
+      context,
     );
     const same = parseSame(parsed, existing.length);
     return { ended: parseContradiction(parsed, existing.length), ...(same ? { same } : {}) };
@@ -577,6 +620,19 @@ function callLabel(kind: string, context?: LLMCallContext): string {
  */
 class BudgetExhaustedError extends Error {}
 
+/** Wait `ms`, or less when `signal` aborts (the caller then stops). */
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener('abort', done, { once: true });
+  });
+}
+
 /** A reply that holds no parseable JSON object; `problem` says why, without the reply. */
 class JsonReplyError extends Error {
   constructor(
@@ -651,15 +707,15 @@ export function buildLLM(): { llm: LLMProvider; label: string } {
  */
 export function llmSettingsFromEnv(): Pick<LLMConfig, 'maxTokens' | 'maxTokensCap' | 'timeoutMs' | 'retries' | 'extraBody'> {
   // each name spelled out at its read, where deploy/test/install.test.sh looks for them
-  const positive = (name: string, value: string | undefined): number | undefined => {
+  const positive = (name: string, value: string | undefined, max: number): number | undefined => {
     const raw = value?.trim();
     if (!raw) return undefined;
     const n = Number(raw);
-    if (!Number.isInteger(n) || n < 1) throw new Error(`${name} must be a positive integer, got "${raw}"`);
+    if (!Number.isInteger(n) || n < 1 || n > max) throw new Error(`${name} must be an integer from 1 to ${max}, got "${raw}"`);
     return n;
   };
-  const maxTokens = positive('MINIZEP_LLM_MAX_TOKENS', process.env.MINIZEP_LLM_MAX_TOKENS);
-  const maxTokensCap = positive('MINIZEP_LLM_MAX_TOKENS_CAP', process.env.MINIZEP_LLM_MAX_TOKENS_CAP);
+  const maxTokens = positive('MINIZEP_LLM_MAX_TOKENS', process.env.MINIZEP_LLM_MAX_TOKENS, MAX_TOKENS_LIMIT);
+  const maxTokensCap = positive('MINIZEP_LLM_MAX_TOKENS_CAP', process.env.MINIZEP_LLM_MAX_TOKENS_CAP, MAX_TOKENS_LIMIT);
   if (maxTokensCap !== undefined && maxTokensCap < (maxTokens ?? DEFAULT_MAX_TOKENS)) {
     throw new Error(
       `MINIZEP_LLM_MAX_TOKENS_CAP (${maxTokensCap}) is below MINIZEP_LLM_MAX_TOKENS (${maxTokens ?? DEFAULT_MAX_TOKENS})`,
@@ -682,8 +738,9 @@ export function llmSettingsFromEnv(): Pick<LLMConfig, 'maxTokens' | 'maxTokensCa
   return {
     maxTokens,
     maxTokensCap,
-    timeoutMs: positive('MINIZEP_LLM_TIMEOUT_MS', process.env.MINIZEP_LLM_TIMEOUT_MS),
-    retries: positive('MINIZEP_LLM_RETRIES', process.env.MINIZEP_LLM_RETRIES),
+    timeoutMs: positive('MINIZEP_LLM_TIMEOUT_MS', process.env.MINIZEP_LLM_TIMEOUT_MS, MAX_TIMEOUT_MS),
+    // (the backoff doubles per attempt: past ten it would outgrow a timer too)
+    retries: positive('MINIZEP_LLM_RETRIES', process.env.MINIZEP_LLM_RETRIES, 10),
     extraBody,
   };
 }

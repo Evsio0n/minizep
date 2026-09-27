@@ -412,6 +412,38 @@ test('temporal: an older, differently worded statement before an ended stint doe
   assert.equal(res.facts[0].invalidAt?.getTime(), d('2025-01-01').getTime(), 'it runs into the later record');
   assert.equal((await zep.factsAt(new Date(), 'g')).length, 0, 'Bob is not at Initech today');
   assert.equal((await zep.factsAt(d('2024-09-01'), 'g')).length, 1);
+
+  // nor in a relation that holds several values: the judge is shown the ended record, and the older
+  // statement ends where it begins when the judge ends it or calls it the same, else with it
+  const libfoo = [entity('Bob'), entity('libfoo', ['Product'])];
+  for (const judge of [false, true, 'same', 'alongside'] as const) {
+    const { zep: z, llm } = scripted(
+      {
+        maintains: scenario(libfoo, [says('Bob', 'libfoo', 'MAINTAINS', 'Bob maintains libfoo')]),
+        stopped: scenario([], [], [invalidation('Bob', 'libfoo', 'MAINTAINS', d('2025-06-01'))]),
+        lead: scenario(libfoo, [says('Bob', 'libfoo', 'MAINTAINS', 'Bob is the lead maintainer of the libfoo project')]),
+        'handed over': scenario([], [], [invalidation('Bob', 'libfoo', 'MAINTAINS', d('2024-09-01'))]),
+      },
+      judge === 'same' ? () => ({ ended: [], same: [0] }) : judge === 'alongside' ? () => ({ ended: [], same: [] }) : judge,
+    );
+    const [later] = (await z.ingest.addEpisode({ groupId: 'g', content: 'maintains', validAt: d('2025-01-01') })).facts;
+    await z.ingest.addEpisode({ groupId: 'g', content: 'stopped', validAt: d('2025-07-01') });
+    const [older] = (await z.ingest.addEpisode({ groupId: 'g', content: 'lead', validAt: d('2024-06-01') })).facts;
+    assert.deepEqual(llm.contradictionCalls.map((c) => c.existing.map((e) => e.fact)), [['Bob maintains libfoo']]);
+    const runsInto = judge === true || judge === 'same';
+    assert.deepEqual(
+      [older.invalidAt, older.attributes.invalidatedBy],
+      [d(runsInto ? '2025-01-01' : '2025-06-01'), `${runsInto ? 'runs into' : 'ends with'} ${later.uuid.slice(0, 8)}: Bob maintains libfoo`],
+      `judge: ${judge}`,
+    );
+    assert.equal((await z.factsAt(new Date(), 'g')).length, 0, `Bob does not maintain libfoo today (judge: ${judge})`);
+    if (judge !== true) continue;
+    // an end a text states later takes the place of that reason; forgetting the text brings it back
+    const cut = await z.ingest.addEpisode({ groupId: 'g', content: 'handed over', validAt: d('2025-08-01') });
+    assert.deepEqual(cut.invalidated.map((f) => [f.uuid, f.invalidAt]), [[older.uuid, d('2024-09-01')]]);
+    const [{ fact: copy }] = (await z.ingest.forgetEpisode(cut.episode.uuid, { groupId: 'g', reason: 'x' })).reopened;
+    assert.deepEqual([copy.invalidAt, copy.attributes.invalidatedBy], [older.invalidAt, older.attributes.invalidatedBy]);
+  }
 });
 
 test('temporal: an older mention of the same fact extends its start back instead of adding an edge', async () => {
@@ -541,17 +573,17 @@ test('temporal: a statement the judge says holds alongside a fact of the same pa
   ]);
 });
 
-test('temporal: a result dated only by its day, before that day\'s other record of a relation that holds several, stays open unless the judge ends it there', async () => {
+test('temporal: a result dated only by its day, before that day\'s other record of a relation that holds several, stays open unless the judge ends it there or calls it the same', async () => {
   const pair = [entity('KEEP', ['Concept']), entity('dev2', ['Concept'])];
   const RULE = '在最終評測中，KEEP 取 dev2 逐字 F1 最高的 margin。';
   const RESULT = 'unified U 在 dev2 上 margin -0.50 的逐字 F1 為 0.9403';
-  for (const contradicts of [false, true]) {
+  for (const contradicts of [false, true, 'same'] as const) {
     const { zep } = scripted(
       {
         rule: scenario(pair, [says('KEEP', 'dev2', 'EVALUATED_ON', RULE)]),
         result: scenario(pair, [says('KEEP', 'dev2', 'EVALUATED_ON', RESULT, { validAt: d('2026-09-26T00:00:00+08:00') })]),
       },
-      contradicts,
+      contradicts === 'same' ? () => ({ ended: [], same: [0] }) : contradicts,
     );
     const [rule] = (await zep.ingest.addEpisode({ groupId: 'g', content: 'rule', validAt: d('2026-09-26T00:35:15+08:00') })).facts;
     // written later, its start (midnight) is earlier than the rule's
@@ -559,13 +591,28 @@ test('temporal: a result dated only by its day, before that day\'s other record 
 
     const now = (await zep.factsAt(new Date(), 'g')).map((r) => r.fact.fact).sort();
     if (contradicts) {
-      assert.deepEqual([result.invalidAt, result.attributes.invalidatedBy], [rule.validAt, `runs into ${rule.uuid.slice(0, 8)}: ${RULE}`]);
+      assert.deepEqual([result.invalidAt, result.attributes.invalidatedBy], [rule.validAt, `runs into ${rule.uuid.slice(0, 8)}: ${RULE}`], `judge: ${contradicts}`);
       assert.deepEqual(now, [RULE]);
     } else {
       assert.deepEqual([result.invalidAt, result.attributes.invalidatedBy], [undefined, undefined], 'not cut off at the rule');
       assert.deepEqual(now, [RESULT, RULE].sort());
     }
   }
+
+  // a later record that replaces the earlier value ends it where it begins, also behind a nearer
+  // one that does not (the judge ends nothing and calls nothing the same)
+  const { zep } = scripted(
+    {
+      run: scenario(pair, [says('KEEP', 'dev2', 'EVALUATED_ON', 'KEEP was evaluated on dev2 with margin -0.5')]),
+      rule: scenario(pair, [says('KEEP', 'dev2', 'EVALUATED_ON', 'KEEP now selects its margin on dev2 by exact F1', { replacesPrevious: true })]),
+      old: scenario(pair, [says('KEEP', 'dev2', 'EVALUATED_ON', 'KEEP selected its margin on dev2 by CER')]),
+    },
+    () => ({ ended: [], same: [] }),
+  );
+  await zep.ingest.addEpisode({ groupId: 'g', content: 'run', validAt: d('2026-03-01') });
+  const [flagged] = (await zep.ingest.addEpisode({ groupId: 'g', content: 'rule', validAt: d('2026-06-01') })).facts;
+  const [old] = (await zep.ingest.addEpisode({ groupId: 'g', content: 'old', validAt: d('2026-01-01') })).facts;
+  assert.deepEqual([old.invalidAt, old.attributes.invalidatedBy], [flagged.validAt, `runs into ${flagged.uuid.slice(0, 8)}: ${flagged.fact}`]);
 });
 
 test('temporal: regression R1 — a backfilled document worded differently does not resurrect the relation either', async () => {

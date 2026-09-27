@@ -6,19 +6,32 @@ import { HashEmbedder, type Embedder } from '../src/provider/interfaces.js';
 
 type ChatBody = { messages: { role: string; content: string }[]; response_format?: unknown; max_tokens?: number; thinking?: unknown };
 
+/** A reply that never comes: only the request's signal (its timeout) ends it. */
+const NO_ANSWER = Symbol('no answer');
+
 /**
  * Replaces global fetch with a chat-completions stub for the duration of `fn`.
  * `reply` sees the parsed request body and returns the assistant's content
- * (a string as it is, anything else as JSON) or the whole Response. Nothing
- * leaves the process.
+ * (a string as it is, anything else as JSON), the whole Response, or
+ * NO_ANSWER. Nothing leaves the process.
  */
 async function withChatStub<T>(reply: (body: ChatBody) => unknown, fn: (requests: ChatBody[]) => Promise<T>): Promise<T> {
   const requests: ChatBody[] = [];
   const realFetch = globalThis.fetch;
-  globalThis.fetch = (async (_url: unknown, init?: { body?: unknown }) => {
+  globalThis.fetch = (async (_url: unknown, init?: { body?: unknown; signal?: AbortSignal }) => {
     const body = JSON.parse(String(init?.body));
     requests.push(body);
     const answer = reply(body);
+    if (answer === NO_ANSWER) {
+      // a pending request keeps the process alive, as an open socket does (AbortSignal.timeout does not)
+      const alive = setInterval(() => undefined, 1000);
+      return new Promise((_, reject) =>
+        init?.signal?.addEventListener('abort', () => {
+          clearInterval(alive);
+          reject(init.signal!.reason);
+        }),
+      );
+    }
     if (answer instanceof Response) return answer;
     const content = typeof answer === 'string' ? answer : JSON.stringify(answer);
     return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
@@ -141,8 +154,8 @@ test('provider: start dates are shown as calendar days of the configured zone, l
   );
 });
 
-test('provider: buildLLM fails on an invalid MINIZEP_TIMEZONE or MINIZEP_LLM_EXTRA_BODY instead of falling back to the mock extractor', () => {
-  const keys = ['MINIZEP_LLM_API_KEY', 'MINIZEP_LLM_BASE_URL', 'MINIZEP_TIMEZONE', 'MINIZEP_REQUIRE_REAL_PROVIDERS', 'MINIZEP_LLM_EXTRA_BODY'] as const;
+test('provider: buildLLM fails on an invalid MINIZEP_TIMEZONE, MINIZEP_LLM_EXTRA_BODY or MINIZEP_LLM_TIMEOUT_MS instead of falling back to the mock extractor', () => {
+  const keys = ['MINIZEP_LLM_API_KEY', 'MINIZEP_LLM_BASE_URL', 'MINIZEP_TIMEZONE', 'MINIZEP_REQUIRE_REAL_PROVIDERS', 'MINIZEP_LLM_EXTRA_BODY', 'MINIZEP_LLM_TIMEOUT_MS'] as const;
   const saved = Object.fromEntries(keys.map((k) => [k, process.env[k]]));
   try {
     process.env.MINIZEP_LLM_API_KEY = 'test';
@@ -154,6 +167,10 @@ test('provider: buildLLM fails on an invalid MINIZEP_TIMEZONE or MINIZEP_LLM_EXT
     process.env.MINIZEP_LLM_EXTRA_BODY = '{thinking: off}';
     assert.throws(() => buildLLM(), /MINIZEP_LLM_EXTRA_BODY is not valid JSON/);
     process.env.MINIZEP_LLM_EXTRA_BODY = '{"thinking": {"type": "disabled"}}';
+    // beyond what a Node timer takes, every request would time out after 1 ms
+    process.env.MINIZEP_LLM_TIMEOUT_MS = '3000000000';
+    assert.throws(() => buildLLM(), /MINIZEP_LLM_TIMEOUT_MS must be an integer from 1 to 2147483647/);
+    process.env.MINIZEP_LLM_TIMEOUT_MS = '300000';
     assert.ok(buildLLM().llm instanceof OpenAICompatLLM);
   } finally {
     for (const k of keys) {
@@ -257,6 +274,12 @@ test('provider: JSON mode is asked for, and a reply that does not parse is sent 
       assert.deepEqual(larger.messages, cut.messages, 'no repair round');
       assert.deepEqual([cut.max_tokens, larger.max_tokens], [8000, 16000]);
       assert.deepEqual([cut.thinking, larger.thinking], [thinking, thinking]);
+
+      // the larger budget has twice the time; timed out all the same, it is not asked again
+      replies = [new Response(JSON.stringify(cutOff)), NO_ANSWER, 'unused'];
+      const slow = new OpenAICompatLLM({ baseUrl: 'http://llm.invalid', apiKey: 'test', model: 'stub', timeZone: 'UTC', retries: 3, timeoutMs: 20 });
+      await assert.rejects(slow.extract('Alice is an engineer.', []), /timed out after 40ms at max_tokens=16000, .*not sent again/);
+      assert.deepEqual(requests.slice(6).map((r) => r.max_tokens), [8000, 16000]);
     },
   );
 
