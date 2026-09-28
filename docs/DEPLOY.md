@@ -123,6 +123,24 @@ systemd-analyze security minizep              # 查看沙箱评分
   sudo ss -ltnp | grep 8787      # 只应看到 127.0.0.1:8787 和 100.64.0.10:8787
   ```
 
+- 用 VPN 的 ACL 再收紧一层：只有需要的设备能连 8787。Tailscale 策略文件示例（给主机打上
+  `tag:minizep`，`group:agents` 是允许访问的用户组）：
+
+  ```jsonc
+  {
+    "tagOwners": { "tag:minizep": ["autogroup:admin"] },
+    "acls": [
+      { "action": "accept", "src": ["group:agents"], "dst": ["tag:minizep:8787"] }
+      // ……其余规则。定义了 acls 之后，没有列出的访问一律拒绝
+    ]
+  }
+  ```
+
+  主机防火墙可以作为补充，例如 ufw：`sudo ufw allow in on tailscale0 to any port 8787 proto tcp`，
+  其余入站默认拒绝。
+- Postgres 容器只绑定回环（`setup.sh` 的 `-p 127.0.0.1:5433:5432`），不要把它发布到 VPN 上。
+- embedding 网关上的 `embed-proxy.py` 默认监听 `0.0.0.0`，在网关主机上用 `PROXY_LISTEN_HOST` 设成它的 VPN 地址。
+
 ### 加 HTTPS（同机的 TLS 反向代理）
 
 浏览器只在 https（或 localhost）下提供剪贴板等 API，一些 MCP 客户端也只接 https。在同一台机器上放一个
@@ -147,24 +165,6 @@ minizep.tailnet.example {
 - 代理必须和 minizep 在同一台机器上：只有来自回环的请求，`X-Forwarded-Proto: https` 才会让 UI 接受
   `https://<主机名>` 的 Origin 并给会话 cookie 加 `Secure`，`X-Forwarded-For` 的最后一项才会被当作
   登录限流的客户端地址。外部请求带这些头一律忽略。
-
-- 用 VPN 的 ACL 再收紧一层：只有需要的设备能连 8787。Tailscale 策略文件示例（给主机打上
-  `tag:minizep`，`group:agents` 是允许访问的用户组）：
-
-  ```jsonc
-  {
-    "tagOwners": { "tag:minizep": ["autogroup:admin"] },
-    "acls": [
-      { "action": "accept", "src": ["group:agents"], "dst": ["tag:minizep:8787"] }
-      // ……其余规则。定义了 acls 之后，没有列出的访问一律拒绝
-    ]
-  }
-  ```
-
-  主机防火墙可以作为补充，例如 ufw：`sudo ufw allow in on tailscale0 to any port 8787 proto tcp`，
-  其余入站默认拒绝。
-- Postgres 容器只绑定回环（`setup.sh` 的 `-p 127.0.0.1:5433:5432`），不要把它发布到 VPN 上。
-- embedding 网关上的 `embed-proxy.py` 默认监听 `0.0.0.0`，在网关主机上用 `PROXY_LISTEN_HOST` 设成它的 VPN 地址。
 
 ## 4. Token 与 group
 
