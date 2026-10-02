@@ -305,15 +305,18 @@ const asOf = instant('what the graph knew at that time (knowledge time, default 
 /**
  * Bounded: a source_ref names a record, it does not hold it. One line: it is
  * printed into the fact lines every reader of the group gets, where a line
- * break would let a writer add a fact line of its own.
+ * break would let a writer add a fact line of its own. Checked with refine,
+ * not regex: a regex becomes a JSON Schema "pattern" in the tool list, and
+ * OpenAI refuses every tool when one pattern uses \p{...}.
  */
+const ONE_LINE = /[\p{Cc}\p{Zl}\p{Zp}]/u;
 const refField = (max: number, what: string) =>
   z
     .string()
     .trim()
     .min(1)
     .max(max)
-    .regex(/^[^\p{Cc}\p{Zl}\p{Zp}]*$/u, 'no line breaks or control characters')
+    .refine((v) => !ONE_LINE.test(v), 'no line breaks or control characters')
     .optional()
     .describe(what);
 const sourceRef = z

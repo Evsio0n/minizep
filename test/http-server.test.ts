@@ -801,6 +801,9 @@ test('mcp: the server explains itself: instructions, the guide of docs/MEMORY-GU
     for (const t of tools) {
       assert.equal(t.annotations?.openWorldHint, false, t.name);
       assert.equal(t.annotations?.readOnlyHint, reads.includes(t.name), t.name);
+      // clients pass inputSchema on to their model provider as is, and OpenAI rejects every
+      // tool over one "pattern" its regex dialect cannot parse: validate on the server instead
+      assert.doesNotMatch(JSON.stringify(t.inputSchema), /"pattern"/, `${t.name} publishes no regex`);
       if (t.name === 'memory_guide') continue;
       assert.match(t.description ?? '', /^Use .* See memory_guide\.$/s, t.name);
       assert.ok(guide.includes(`\`${t.name}\``), `the guide covers ${t.name}`);
